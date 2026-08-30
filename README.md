@@ -1,11 +1,12 @@
 # cvelab
 
-`cvelab` creates local-only, marker-based labs for defensive CVE research. The
+`cvelab` creates local-only, source-backed labs for defensive CVE research. The
 MVP supports CWE-22, CWE-78, CWE-89, CWE-284, CWE-434, and CWE-918.
 
-Generated labs contain vulnerable and patched services. Validation succeeds only
-when the marker is observable on the vulnerable service and blocked by the
-patched service.
+Generated source labs contain vulnerable and patched revisions. Validation succeeds
+only when an actual security effect is observed on the vulnerable revision and
+blocked by the patched revision. A marker may be used as a harmless canary, but
+marker reflection alone never qualifies as a PoC.
 
 ## Important distinction
 
@@ -37,9 +38,17 @@ $env:CVELAB_MODEL = "gpt-5.6-sol"
 ```
 
 `auto` is strict: it attempts a real `SOURCE_REPRODUCTION` and writes PoC
-deliverables only after validation against real source revisions. If sufficient
+deliverables only after executing the vulnerable code path and observing the
+declared security effect against real source revisions. If sufficient
 source provenance cannot be resolved, it returns `POC_NOT_GENERATED`. It does not
 fabricate a patched variant or silently fall back to a synthetic CWE lab.
+
+Curated CVEs with an upstream deployment profile use `END_TO_END_REPRODUCTION`.
+For CVE-2026-66788 this creates two disposable `kind` clusters through the
+upstream Shipyard workflow, runs the crafted object from a compromised spoke
+through the real Lighthouse agent and Broker, observes injection into the peer
+`kube-system` namespace, and repeats against the fixed revision. The source-level
+Go test is not accepted as the final PoC for this profile.
 
 After successful validation it writes:
 
@@ -125,7 +134,7 @@ generated lab, or repository.
 
 - Services bind only to `127.0.0.1`.
 - Runtime traffic stays on an internal Docker network.
-- Payloads use unique markers and avoid shells, persistence, and credential access.
+- Payloads use non-destructive canaries and avoid shells, persistence, and credential access.
 - Containers use unprivileged users, resource limits, and `no-new-privileges`.
 - The validator has no option for remote targets.
 - Source adapters are rejected if they request host networking, host ports,
