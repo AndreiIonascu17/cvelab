@@ -19,7 +19,11 @@ from .core import collect_cve, normalize_cve, write_text
 SOURCE_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["cwe", "confidence", "rationale", "exploit_contract", "files"],
+    "required": [
+        "cwe", "confidence", "rationale", "exploit_contract", "docker_compose",
+        "dockerignore", "vulnerable_dockerfile", "patched_dockerfile",
+        "validator_dockerfile", "validator_py", "adapter_files",
+    ],
     "properties": {
         "cwe": {"type": "string"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
@@ -42,10 +46,15 @@ SOURCE_SCHEMA = {
                 },
             },
         },
-        "files": {
+        "docker_compose": {"type": "string", "minLength": 1},
+        "dockerignore": {"type": "string"},
+        "vulnerable_dockerfile": {"type": "string", "minLength": 1},
+        "patched_dockerfile": {"type": "string", "minLength": 1},
+        "validator_dockerfile": {"type": "string", "minLength": 1},
+        "validator_py": {"type": "string", "minLength": 1},
+        "adapter_files": {
             "type": "array",
-            "minItems": 5,
-            "maxItems": 16,
+            "maxItems": 10,
             "items": {
                 "type": "object",
                 "additionalProperties": False,
@@ -936,7 +945,8 @@ def generate_source_lab(
         max_output_tokens=14000,
         instructions=(
             "Create a reproducible adapter for an authorized, local-only defensive CVE lab from the supplied "
-            "security patch and source metadata. Return only adapter files, never vendor source. The two Docker "
+            "security patch and source metadata. Populate every required Docker, Compose, and validator field; "
+            "put only additional files under adapter_files with adapter/ paths. Never return vendor source. The two Docker "
             "builds must use source/vulnerable and source/patched, run as non-root, have no host ports or host "
             "mounts, and share an internal Docker network. Compose services must be named vulnerable, patched, "
             "and validator. The validator must execute the actual vulnerable code path and demonstrate a concrete "
@@ -953,12 +963,21 @@ def generate_source_lab(
         ),
         input_text=context,
     )
-    _validate_generated(generation["files"])
+    generated_files = [
+        {"path": "docker-compose.yml", "content": generation["docker_compose"]},
+        {"path": ".dockerignore", "content": generation["dockerignore"]},
+        {"path": "vulnerable/Dockerfile", "content": generation["vulnerable_dockerfile"]},
+        {"path": "patched/Dockerfile", "content": generation["patched_dockerfile"]},
+        {"path": "validator/Dockerfile", "content": generation["validator_dockerfile"]},
+        {"path": "validator/validator.py", "content": generation["validator_py"]},
+        *generation["adapter_files"],
+    ]
+    _validate_generated(generated_files)
 
     lab_dir = output_root.resolve() / cve
     _snapshot(repository, vulnerable, lab_dir / "source" / "vulnerable")
     _snapshot(repository, fixed, lab_dir / "source" / "patched")
-    for item in generation["files"]:
+    for item in generated_files:
         write_text(lab_dir / item["path"], item["content"])
     plan = {
         "cve": cve,
