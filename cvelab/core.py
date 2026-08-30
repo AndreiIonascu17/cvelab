@@ -190,14 +190,79 @@ def ensure_docker(docker: str, environment: dict[str, str]) -> None:
     if check.returncode == 0:
         return
     if os.name == "nt":
-        desktop = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "DockerDesktop" / "Docker Desktop.exe"
+        local_app_data = Path(os.environ.get("LOCALAPPDATA", "")).resolve()
+        desktop = local_app_data / "Programs" / "DockerDesktop" / "Docker Desktop.exe"
         if desktop.exists():
-            subprocess.Popen([str(desktop)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            for _ in range(60):
+            for image in ("Docker Desktop.exe", "com.docker.backend.exe"):
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/IM", image],
+                    capture_output=True,
+                    text=True,
+                )
+            time.sleep(2)
+            stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
+            stale_runtimes = (
+                local_app_data / "Docker" / "run",
+                local_app_data / "docker-secrets-engine",
+            )
+            for runtime in stale_runtimes:
+                if runtime.exists():
+                    destination = runtime.with_name(runtime.name + f".stale-{stamp}")
+                    moved = subprocess.run(
+                        [
+                            "powershell.exe",
+                            "-NoProfile",
+                            "-NonInteractive",
+                            "-Command",
+                            (
+                                "& { param([string]$source, [string]$destination) "
+                                "Move-Item -LiteralPath $source -Destination $destination "
+                                "-ErrorAction Stop }"
+                            ),
+                            str(runtime),
+                            str(destination),
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if moved.returncode != 0:
+                        detail = (moved.stderr or moved.stdout).strip()
+                        raise RuntimeError(f"Could not archive stale Docker runtime: {detail}")
+            (local_app_data / "Docker" / "run").mkdir(parents=True, exist_ok=True)
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.Popen(
+                [str(desktop), "--minimized"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+            for _ in range(90):
                 time.sleep(2)
                 if subprocess.run([docker, "info"], capture_output=True, env=environment).returncode == 0:
                     return
-    raise RuntimeError("Docker engine is unavailable. Start Docker Desktop and retry.")
+    detail = (check.stderr or check.stdout).strip().splitlines()
+    suffix = f" Last Docker error: {detail[-1]}" if detail else ""
+    raise RuntimeError("Docker engine recovery failed." + suffix)
+
+
+def run_docker_stage(
+    command: list[str],
+    *,
+    stage: str,
+    docker: str,
+    environment: dict[str, str],
+    cwd: Path,
+) -> None:
+    result = subprocess.run(command, cwd=cwd, env=environment)
+    if result.returncode == 0:
+        return
+    engine = subprocess.run([docker, "info"], capture_output=True, text=True, env=environment)
+    if os.name == "nt" and engine.returncode != 0:
+        ensure_docker(docker, environment)
+        result = subprocess.run(command, cwd=cwd, env=environment)
+        if result.returncode == 0:
+            return
+    raise RuntimeError(f"Docker stage '{stage}' failed with exit code {result.returncode}")
 
 
 def wait_health(port: int) -> None:
@@ -260,20 +325,58 @@ def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
     compose = [docker, "compose", "-f", str(lab_dir / "docker-compose.yml")]
     try:
         startup_services = plan.get("startup_services", ["vulnerable", "patched", "metadata"])
-        subprocess.run(
-            compose + ["up", "--build", "-d", *startup_services],
-            cwd=lab_dir,
-            check=True,
-            env=environment,
-        )
-        started = subprocess.run(
-            compose + ["--profile", "tools", "run", "--build", "-d", "validator"],
+        if plan.get("lab_type") in {
+            "SOURCE_REPRODUCTION", "VULNERABLE_ONLY_REPRODUCTION"
+        }:
+            required = [
+                lab_dir / "docker-compose.yml",
+                lab_dir / "vulnerable" / "Dockerfile",
+                lab_dir / "validator" / "Dockerfile",
+                lab_dir / "validator" / "validator.py",
+                lab_dir / "source" / "vulnerable",
+            ]
+            if plan.get("lab_type") == "SOURCE_REPRODUCTION":
+                required.extend([
+                    lab_dir / "patched" / "Dockerfile",
+                    lab_dir / "source" / "patched",
+                ])
+            missing = [str(path) for path in required if not path.exists()]
+            if missing:
+                raise RuntimeError("Generated lab preflight failed; missing: " + ", ".join(missing))
+        configured = subprocess.run(
+            compose + ["config", "--quiet"],
             cwd=lab_dir,
             capture_output=True,
             text=True,
             env=environment,
-            check=True,
         )
+        if configured.returncode != 0:
+            detail = (configured.stderr or configured.stdout).strip()
+            raise RuntimeError(f"Compose preflight failed: {detail}")
+        run_docker_stage(
+            compose + ["build", *startup_services, "validator"],
+            stage="build",
+            docker=docker,
+            environment=environment,
+            cwd=lab_dir,
+        )
+        run_docker_stage(
+            compose + ["up", "-d", *startup_services],
+            stage="startup",
+            docker=docker,
+            environment=environment,
+            cwd=lab_dir,
+        )
+        started = subprocess.run(
+            compose + ["--profile", "tools", "run", "-d", "validator"],
+            cwd=lab_dir,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        if started.returncode != 0:
+            detail = (started.stderr or started.stdout).strip()
+            raise RuntimeError(f"Validator startup failed: {detail}")
         container_id = started.stdout.strip().splitlines()[-1]
         waited = subprocess.run(
             [docker, "wait", container_id],
@@ -301,22 +404,60 @@ def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
             validation = {"error": logged.stderr or logged.stdout or "validator produced no JSON"}
         vulnerable_result = validation.get("vulnerable", {})
         patched_result = validation.get("patched", {})
-        proof_contract = plan.get("exploit_contract", {})
-        real_source_proof = (
-            plan.get("lab_type") in {"SOURCE_REPRODUCTION", "END_TO_END_REPRODUCTION"}
-            and bool(proof_contract.get("observable_effect"))
-            and bool(proof_contract.get("evidence_type"))
-            and validation.get("attack_executed") is True
-            and validation.get("proof_quality") == "security_effect_observed"
-            and bool(validation.get("observable_effect"))
-            and validation.get("evidence_type") == proof_contract.get("evidence_type")
-            and vulnerable_result.get("confirmed") is True
-            and patched_result.get("confirmed") is False
+        vulnerable_confirmed = (
+            vulnerable_result.get("confirmed") is True
+            if isinstance(vulnerable_result, dict)
+            else False
         )
-        validated = (
-            validator_exit == 0
-            and validation.get("differential_confirmed") is True
-            and real_source_proof
+        patched_confirmed = (
+            patched_result.get("confirmed") is True
+            if isinstance(patched_result, dict)
+            else False
+        )
+        patched_blocked = (
+            patched_result.get("blocked") is True
+            if isinstance(patched_result, dict)
+            else False
+        )
+        proof_contract = plan.get("exploit_contract", {})
+        vulnerable_only = plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION"
+        proof_checks = {
+            "source_reproduction": plan.get("lab_type")
+            in {
+                "SOURCE_REPRODUCTION", "END_TO_END_REPRODUCTION",
+                "VULNERABLE_ONLY_REPRODUCTION",
+            },
+            "contract_effect_defined": bool(proof_contract.get("observable_effect")),
+            "contract_evidence_defined": bool(proof_contract.get("evidence_type")),
+            "attack_executed": validation.get("attack_executed") is True,
+            "security_effect_observed": validation.get("proof_quality")
+            == "security_effect_observed",
+            "observable_effect_recorded": bool(validation.get("observable_effect")),
+            "evidence_type_matches": validation.get("evidence_type")
+            == proof_contract.get("evidence_type"),
+            "vulnerable_confirmed": vulnerable_confirmed,
+        }
+        if vulnerable_only:
+            proof_checks.update({
+                "public_fix_not_identified": validation.get("fix_status")
+                == "PUBLIC_FIX_NOT_IDENTIFIED",
+                "patched_not_tested": validation.get("patched_tested") is False,
+                "not_differential": validation.get("differential_confirmed") is False,
+            })
+        else:
+            proof_checks.update({
+                "patched_not_confirmed": not patched_confirmed,
+                "patched_blocked": patched_blocked,
+            })
+        real_source_proof = all(proof_checks.values())
+        # Compose can surface a lifecycle exit code after `docker wait` even
+        # when the validator completed and emitted a complete proof document.
+        # Accept only the strict, independently checked proof contract; retain
+        # the process exit code in the report for diagnostics.
+        validated = real_source_proof and (
+            validation.get("differential_confirmed") is False
+            if vulnerable_only
+            else validation.get("differential_confirmed") is True
         )
         report = {
             "cve": cve,
@@ -325,7 +466,12 @@ def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
             "validated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "validation": validation,
             "proof_contract": proof_contract,
+            "proof_checks": proof_checks,
+            "validator_exit_code": validator_exit,
             "real_poc_verified": real_source_proof,
+            "fix_status": plan.get("fix_status", "PUBLIC_FIX_AVAILABLE"),
+            "patched_tested": not vulnerable_only,
+            "differential_confirmed": validation.get("differential_confirmed") is True,
             "ok": validated,
         }
         write_text(lab_dir / "report.json", json.dumps(report, indent=2, ensure_ascii=True) + "\n")

@@ -42,7 +42,7 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument("--ai", choices=("off", "auto", "on"), default="auto")
     add_ai_credentials(build)
 
-    source = sub.add_parser("source", help="Generate a lab from vulnerable and fixed source revisions")
+    source = sub.add_parser("source", help="Generate from vulnerable source, with a fixed revision when public")
     source.add_argument("cve")
     source.add_argument("--repo", help="Public GitHub or GitLab HTTPS repository")
     source.add_argument("--fixed-ref", help="Commit containing the security fix")
@@ -77,7 +77,7 @@ def parser() -> argparse.ArgumentParser:
     auto.add_argument("--keep", action="store_true", help="Keep containers running")
     add_ai_credentials(auto)
 
-    run = sub.add_parser("run", help="Build containers and validate both variants")
+    run = sub.add_parser("run", help="Build containers and validate the available source variants")
     run.add_argument("cve")
     run.add_argument("--keep", action="store_true", help="Keep containers running")
 

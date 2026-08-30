@@ -86,7 +86,11 @@ def create_deliverables(
     artifacts = lab_dir / "artifacts"
     real_poc_verified = (
         result.get("ok") is True
-        and plan.get("lab_type") == "END_TO_END_REPRODUCTION"
+        and plan.get("lab_type")
+        in {
+            "SOURCE_REPRODUCTION", "END_TO_END_REPRODUCTION",
+            "VULNERABLE_ONLY_REPRODUCTION",
+        }
         and report.get("real_poc_verified") is True
         and validation.get("attack_executed") is True
         and validation.get("proof_quality") in {
@@ -197,10 +201,19 @@ The patched control succeeds only when it prints `BLOCKED` and no attacker-contr
 
     source_note = (
         "This is a vendor-source reproduction using the revisions recorded below."
-        if plan["lab_type"] in {"SOURCE_REPRODUCTION", "END_TO_END_REPRODUCTION"}
+        if plan["lab_type"] in {
+            "SOURCE_REPRODUCTION", "END_TO_END_REPRODUCTION",
+            "VULNERABLE_ONLY_REPRODUCTION",
+        }
         else "This is a synthetic CWE-class demonstration, not a vendor-source reproduction."
     )
     revisions = plan.get("revisions", {})
+    vulnerable_only = plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION"
+    if vulnerable_only:
+        source_note = (
+            "This is a vendor-source vulnerable-only reproduction. No public fixed revision "
+            "was identified at generation time, so no patched behavior is claimed."
+        )
     scenario = plan.get("scenario", "default")
     scenario_details = (
         "A crafted EndpointSlice from compromised cluster2 declares kube-system as its source namespace. "
@@ -212,7 +225,12 @@ The patched control succeeds only when it prints `BLOCKED` and no attacker-contr
         "destination of `kube-system`. The vulnerable variant creates it there; the patched "
         "model rejects cross-namespace injection."
         if scenario == "namespace_injection"
-        else "The validator exercises the marker-only scenario recorded in plan.json."
+        else (
+            "The validator executes the real vulnerable source path and records the declared "
+            "security effect. No synthetic patched variant is created."
+            if vulnerable_only
+            else "The validator exercises the marker-only scenario recorded in plan.json."
+        )
     )
     if analysis:
         scenario_details = analysis["mechanism"]
@@ -231,16 +249,28 @@ The patched control succeeds only when it prints `BLOCKED` and no attacker-contr
             fidelity = "This is an end-to-end reproduction using recorded upstream source revisions and the real agent/broker flow."
         else:
             prerequisites = "- Consult the CVE dossier and generated plan."
-            attack_path = (
-            "1. The validator acts as a compromised, low-trust source namespace.\n"
-            "2. It supplies a protected destination namespace with a unique marker.\n"
-            "3. It checks whether the marker-backed object appears in that destination.\n"
-            "4. It repeats the request against the patched model and expects rejection."
-        )
-            fidelity = (
-            "This synthetic lab does not deploy the vendor product or its complete environment. "
-            "It validates only the modeled trust-boundary failure."
-        )
+            if vulnerable_only:
+                attack_path = (
+                    "1. Build and start the recorded vulnerable upstream revision.\n"
+                    "2. Execute the generated local-only attack with a unique canary.\n"
+                    "3. Verify the concrete security effect using an independent observation.\n"
+                    "4. Record that no patched control was tested because no public fix was identified."
+                )
+                fidelity = (
+                    "This is a source-backed vulnerable-only reproduction. It proves the observed "
+                    "effect for the recorded revision but makes no remediation claim."
+                )
+            else:
+                attack_path = (
+                    "1. The validator acts as a compromised, low-trust source namespace.\n"
+                    "2. It supplies a protected destination namespace with a unique marker.\n"
+                    "3. It checks whether the marker-backed object appears in that destination.\n"
+                    "4. It repeats the request against the patched model and expects rejection."
+                )
+                fidelity = (
+                    "This synthetic lab does not deploy the vendor product or its complete environment. "
+                    "It validates only the modeled trust-boundary failure."
+                )
     walkthrough = f"""# {cve} Walkthrough
 
 ## Scope
@@ -274,7 +304,7 @@ For an inspectable, step-by-step reproduction that keeps the lab running, follow
 
 ## Components
 
-- `../docker-compose.yml`: isolated vulnerable, patched, and validator services.
+- `../docker-compose.yml`: isolated vulnerable{'' if vulnerable_only else ', patched'}, and validator services.
 - `../validator/validator.py`: executable real-effect validator.
 - `{poc_name}`: source-backed local PoC executed against the vulnerable revision.
 - `REPORT.md`: validation result and limitations.
@@ -283,12 +313,11 @@ For an inspectable, step-by-step reproduction that keeps the lab running, follow
 
 - Repository: `{plan.get('repository', 'not applicable')}`
 - Vulnerable: `{revisions.get('vulnerable', 'synthetic variant')}`
-- Patched: `{revisions.get('patched', 'synthetic variant')}`
+- Patched: `{revisions.get('patched') or 'not tested; no public fixed revision identified'}`
 
 ## Success condition
 
-The run succeeds only when the declared security effect is observed on `vulnerable`,
-blocked on `patched`, and `differential_confirmed` is `true`.
+{('The run succeeds only when the declared security effect is independently observed on `vulnerable`. No patched behavior or differential confirmation is claimed.' if vulnerable_only else 'The run succeeds only when the declared security effect is observed on `vulnerable`, blocked on `patched`, and `differential_confirmed` is `true`.')}
 
 ## Fidelity boundary
 
@@ -300,10 +329,12 @@ blocked on `patched`, and `differential_confirmed` is `true`.
     description = descriptions[0] if descriptions else "No public description available."
     vulnerable_result = validation.get("vulnerable", {})
     patched_result = validation.get("patched", {})
-    if result.get("ok") and plan["lab_type"] == "END_TO_END_REPRODUCTION":
+    if result.get("ok") and vulnerable_only:
+        status = "REAL_VULNERABLE_ONLY_POC_VALIDATED"
+    elif result.get("ok") and plan["lab_type"] == "END_TO_END_REPRODUCTION":
         status = "REAL_END_TO_END_POC_VALIDATED"
     elif result.get("ok"):
-        status = "CLASS_MODEL_VALIDATED_CVE_UNCONFIRMED"
+        status = "REAL_SOURCE_POC_VALIDATED"
     else:
         status = "NOT_VALIDATED"
     if analysis:
@@ -326,15 +357,23 @@ blocked on `patched`, and `differential_confirmed` is `true`.
             limitations = "- Validation is restricted to the isolated two-cluster local environment and recorded revisions."
             confidence = "High confidence for the executed local upstream revisions because both positive exploit evidence and explicit negative-control rejection were captured."
         else:
-            interpretation = "The differential result applies only to the generated lab."
-            remediation = "Not established by the generated lab."
-            limitations = "- Vendor-product behavior was not exercised."
-            confidence = "Confidence is limited to the observed local class model."
+            if vulnerable_only:
+                interpretation = "The declared effect was observed on the recorded vulnerable source revision; no patched control was available."
+                remediation = "No public fixed revision was identified at generation time. Re-run differential validation when a fix becomes public."
+                limitations = "- Patched behavior and remediation effectiveness were not tested."
+                confidence = "Confidence applies to the observed vulnerable revision only; there is no differential confirmation."
+            else:
+                interpretation = "The differential result applies only to the generated lab."
+                remediation = "Not established by the generated lab."
+                limitations = "- Vendor-product behavior was not exercised."
+                confidence = "Confidence is limited to the observed local class model."
     markdown_report = f"""# {cve} Validation Report
 
 ## Result
 
 - Status: **{status}**
+- Fix status: `{plan.get('fix_status', 'PUBLIC_FIX_AVAILABLE')}`
+- Patched tested: `{not vulnerable_only}`
 - Differential confirmed: `{validation.get('differential_confirmed', False)}`
 - Attack executed: `{validation.get('attack_executed', False)}`
 - Proof quality: `{validation.get('proof_quality', 'not observed')}`
@@ -382,7 +421,7 @@ blocked on `patched`, and `differential_confirmed` is `true`.
 - CVE source: `{dossier.get('source', 'unknown')}`
 - Repository: `{plan.get('repository', 'not applicable')}`
 - Vulnerable revision: `{revisions.get('vulnerable', 'synthetic variant')}`
-- Patched revision: `{revisions.get('patched', 'synthetic variant')}`
+- Patched revision: `{revisions.get('patched') or 'not available / not tested'}`
 
 ## Safety and limitations
 
@@ -400,9 +439,9 @@ blocked on `patched`, and `differential_confirmed` is `true`.
 
 ## Interpretation
 
-`REAL_POC_VALIDATED` means the recorded vulnerable upstream revision executed the
-declared security-sensitive path inside the isolated lab and the fixed revision
-blocked it. It does not authorize or establish exploitability of any remote deployment.
+{('`REAL_VULNERABLE_ONLY_POC_VALIDATED` means the recorded vulnerable upstream revision executed the declared security-sensitive path inside the isolated lab. No public fix was identified and no patched behavior is claimed.' if vulnerable_only else '`REAL_POC_VALIDATED` means the recorded vulnerable upstream revision executed the declared security-sensitive path inside the isolated lab and the fixed revision blocked it.')}
+
+This result does not authorize or establish exploitability of any remote deployment.
 """
     write_text(artifacts / "REPORT.md", markdown_report)
     write_text(artifacts / "report.json", json.dumps(report, indent=2, ensure_ascii=True) + "\n")

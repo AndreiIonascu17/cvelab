@@ -68,6 +68,24 @@ SOURCE_SCHEMA = {
     },
 }
 
+VULNERABLE_ONLY_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "cwe", "confidence", "rationale", "exploit_contract", "docker_compose",
+        "dockerignore", "vulnerable_dockerfile", "validator_dockerfile",
+        "validator_py", "adapter_files",
+    ],
+    "properties": {
+        key: SOURCE_SCHEMA["properties"][key]
+        for key in (
+            "cwe", "confidence", "rationale", "exploit_contract", "docker_compose",
+            "dockerignore", "vulnerable_dockerfile", "validator_dockerfile",
+            "validator_py", "adapter_files",
+        )
+    },
+}
+
 DISCOVERY_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -702,12 +720,54 @@ def _source_context(repository: Path, vulnerable_ref: str, fixed_ref: str, dossi
     return json.dumps(material, ensure_ascii=True, indent=2) + "\n\n--- SECURITY PATCH ---\n" + diff[:90000] + "".join(excerpts)
 
 
-def _validate_generated(files: list[dict]) -> None:
+def _canonicalize_compose_builds(content: str, vulnerable_only: bool = False) -> str:
+    """Pin AI-generated Compose builds to the generated adapter layout."""
+    layouts = {
+        "vulnerable": (".", "vulnerable/Dockerfile"),
+        "validator": ("./validator", "Dockerfile"),
+    }
+    if not vulnerable_only:
+        layouts["patched"] = (".", "patched/Dockerfile")
+    for service, (context, dockerfile) in layouts.items():
+        service_pattern = re.compile(
+            rf"(?ms)(^  {re.escape(service)}:\s*\n)(.*?)(?=^  [A-Za-z0-9_.-]+:\s*$|^networks:\s*$|\Z)"
+        )
+        service_match = service_pattern.search(content)
+        if not service_match:
+            raise RuntimeError(f"Compose service is missing: {service}")
+        block = service_match.group(2)
+        build_pattern = re.compile(r"(?m)^(    build:\s*\n)((?:      .*\n)*)")
+        build_match = build_pattern.search(block)
+        if not build_match:
+            raise RuntimeError(f"Compose build block is missing for service: {service}")
+        body = build_match.group(2)
+        if re.search(r"(?m)^      context\s*:", body):
+            body = re.sub(r"(?m)^      context\s*:.*$", f"      context: {context}", body, count=1)
+        else:
+            body = f"      context: {context}\n" + body
+        if re.search(r"(?m)^      dockerfile\s*:", body):
+            body = re.sub(
+                r"(?m)^      dockerfile\s*:.*$",
+                f"      dockerfile: {dockerfile}",
+                body,
+                count=1,
+            )
+        else:
+            body = f"      dockerfile: {dockerfile}\n" + body
+        canonical_build = build_match.group(1) + body
+        block = block[:build_match.start()] + canonical_build + block[build_match.end():]
+        content = content[:service_match.start(2)] + block + content[service_match.end(2):]
+    return content
+
+
+def _validate_generated(files: list[dict], vulnerable_only: bool = False) -> None:
     paths = {item["path"].replace("\\", "/") for item in files}
     required = {
-        "docker-compose.yml", "vulnerable/Dockerfile", "patched/Dockerfile",
+        "docker-compose.yml", "vulnerable/Dockerfile",
         "validator/Dockerfile", "validator/validator.py",
     }
+    if not vulnerable_only:
+        required.add("patched/Dockerfile")
     missing = required - paths
     if missing:
         raise RuntimeError(f"Generated adapter is missing: {', '.join(sorted(missing))}")
@@ -720,21 +780,44 @@ def _validate_generated(files: list[dict]) -> None:
         for needle, reason in FORBIDDEN.items():
             if needle in lowered:
                 raise RuntimeError(f"Generated adapter rejected: {reason} in {path}")
+        if path in {"vulnerable/Dockerfile", "patched/Dockerfile"}:
+            if "./gradlew" in item["content"] and not (
+                "sed -i" in lowered and "\\r$" in item["content"]
+            ):
+                raise RuntimeError(
+                    f"Generated Gradle Dockerfile must normalize Windows CRLF before execution: {path}"
+                )
         if path == "docker-compose.yml":
             if "internal: true" not in lowered:
                 raise RuntimeError("Compose network must be internal")
             if re.search(r"(?m)^\s*ports\s*:", lowered) or re.search(r"(?m)^\s*volumes\s*:", lowered):
                 raise RuntimeError("Compose ports and volume mounts are not allowed in source labs")
+            required_builds = ["dockerfile: vulnerable/dockerfile", "context: ./validator"]
+            if not vulnerable_only:
+                required_builds.append("dockerfile: patched/dockerfile")
+            for required_build in required_builds:
+                if required_build not in lowered:
+                    raise RuntimeError(f"Compose build layout is invalid: missing {required_build}")
         if path == "validator/validator.py":
             required_contract = {
                 "attack_executed", "proof_quality", "observable_effect", "evidence_type",
-                "vulnerable", "patched", "differential_confirmed",
+                "vulnerable", "differential_confirmed",
             }
+            if vulnerable_only:
+                required_contract.update({"patched_tested", "fix_status"})
+            else:
+                required_contract.add("patched")
             missing_contract = {field for field in required_contract if field not in item["content"]}
             if missing_contract:
                 raise RuntimeError(
                     "Validator is missing real-PoC evidence fields: "
                     + ", ".join(sorted(missing_contract))
+                )
+            if "confirmed" not in item["content"] or (
+                not vulnerable_only and "blocked" not in item["content"]
+            ):
+                raise RuntimeError(
+                    "Validator must emit nested vulnerable/patched evidence with confirmed and blocked fields"
                 )
             if re.search(
                 r"['\"](?:attack_executed|confirmed|differential_confirmed)['\"]\s*:\s*True\b",
@@ -742,7 +825,10 @@ def _validate_generated(files: list[dict]) -> None:
             ):
                 raise RuntimeError("Validator contains a hard-coded successful exploit result")
             for url in re.findall(r"https?://([^/'\"\s:]+)", lowered):
-                if url not in {"vulnerable", "patched", "127.0.0.1", "localhost"}:
+                allowed_hosts = {"vulnerable", "127.0.0.1", "localhost"}
+                if not vulnerable_only:
+                    allowed_hosts.add("patched")
+                if url not in allowed_hosts:
                     raise RuntimeError(f"Validator external target rejected: {url}")
 
 
@@ -875,6 +961,9 @@ def generate_source_lab(
     cve = normalize_cve(cve_value)
     dossier = collect_cve(cve)
     resolved = resolve_source(dossier, repo, fixed_ref)
+    vulnerable_only_resolved = None
+    if repo and vulnerable_ref and not fixed_ref:
+        vulnerable_only_resolved = (_safe_repo_url(repo), vulnerable_ref)
     discovery = None
     effective_key = api_key or os.getenv("OPENAI_API_KEY")
     effective_model = model or os.getenv("CVELAB_MODEL")
@@ -886,7 +975,14 @@ def generate_source_lab(
             if candidate_repo and candidate_fixed:
                 resolved = (_safe_repo_url(candidate_repo), candidate_fixed)
                 vulnerable_ref = vulnerable_ref or discovery.get("vulnerable_ref")
-    if not resolved:
+        elif discovery["status"] == "VULNERABLE_ONLY":
+            candidate_repo = discovery.get("repository_url")
+            candidate_vulnerable = discovery.get("vulnerable_ref")
+            if candidate_repo and candidate_vulnerable:
+                vulnerable_only_resolved = (
+                    _safe_repo_url(candidate_repo), candidate_vulnerable
+                )
+    if not resolved and not vulnerable_only_resolved:
         status = discovery.get("status") if discovery else "INSUFFICIENT_DATA"
         if status == "VENDOR_ARTIFACT_REQUIRED":
             return {
@@ -897,16 +993,6 @@ def generate_source_lab(
                 "required": [discovery.get("vendor_artifact") or "Authorized affected vendor artifact"],
                 "evidence_urls": discovery.get("evidence_urls", []),
             }
-        if status == "VULNERABLE_ONLY":
-            return {
-                "ok": False,
-                "status": "VULNERABLE_ONLY_PROFILE_REQUIRED",
-                "cve": cve,
-                "reason": discovery["rationale"],
-                "repository": discovery.get("repository_url"),
-                "vulnerable_ref": discovery.get("vulnerable_ref"),
-                "evidence_urls": discovery.get("evidence_urls", []),
-            }
         return {
             "ok": False,
             "status": "ARTIFACT_REQUIRED",
@@ -915,7 +1001,12 @@ def generate_source_lab(
             "required": ["Verified public repository and immutable affected/fixed revisions"],
             "evidence_urls": discovery.get("evidence_urls", []) if discovery else [],
         }
-    repo_url, fixed = resolved
+    vulnerable_only = resolved is None
+    if vulnerable_only:
+        repo_url, vulnerable = vulnerable_only_resolved
+        fixed = None
+    else:
+        repo_url, fixed = resolved
     curated = CURATED_SOURCES.get(cve)
     if curated and not vulnerable_ref:
         vulnerable_ref = curated["vulnerable_ref"]
@@ -926,12 +1017,100 @@ def generate_source_lab(
         _run_git(["clone", "--filter=blob:none", "--no-checkout", repo_url, str(repository)])
     else:
         _run_git(["fetch", "--force", "origin"], cwd=repository)
-    _run_git(["fetch", "--force", "origin", fixed], cwd=repository)
-    _run_git(["rev-parse", "--verify", f"{fixed}^{{commit}}"], cwd=repository)
-    vulnerable = vulnerable_ref or f"{fixed}^"
+    if fixed:
+        _run_git(["fetch", "--force", "origin", fixed], cwd=repository)
+        _run_git(["rev-parse", "--verify", f"{fixed}^{{commit}}"], cwd=repository)
+        vulnerable = vulnerable_ref or f"{fixed}^"
+    else:
+        _run_git(["fetch", "--force", "origin", vulnerable], cwd=repository)
     _run_git(["rev-parse", "--verify", f"{vulnerable}^{{commit}}"], cwd=repository)
 
     marker = "CVELAB-" + uuid.uuid4().hex
+    if vulnerable_only:
+        context = _source_context(repository, vulnerable, vulnerable, dossier)
+        context += (
+            "\n\n--- FIX STATUS ---\nNo public fixed revision was identified at generation time. "
+            "Generate and validate only the authentic vulnerable source. Do not invent a patched service."
+        )
+        generation = structured_response(
+            api_key=api_key,
+            model=model,
+            schema=VULNERABLE_ONLY_SCHEMA,
+            schema_name="cvelab_vulnerable_only_adapter",
+            max_output_tokens=12000,
+            instructions=(
+                "Create a reproducible vulnerable-only adapter for an authorized, local-only defensive CVE lab. "
+                "Populate every required field and put additional files only under adapter/. Never invent a fix, "
+                "patched source tree, patched image, or patched service. Compose must contain services named "
+                "vulnerable and validator on an internal Docker network, with no host ports or host mounts. The "
+                "vulnerable image must build source/vulnerable, run non-root, and expose only the application path "
+                "needed by the validator. The validator must execute the actual vulnerable path and prove a concrete "
+                "security effect, not marker reflection. It must print JSON containing attack_executed, proof_quality "
+                "set to security_effect_observed, observable_effect, evidence_type, vulnerable as an object with a "
+                "computed confirmed field and raw observations, patched_tested set to false, differential_confirmed "
+                "set to false, and fix_status set to PUBLIC_FIX_NOT_IDENTIFIED. Exit zero only when the vulnerable "
+                "security effect is genuinely observed. Never hard-code attack_executed or vulnerable.confirmed. A "
+                f"harmless canary ({marker}) may identify affected data. No reverse shells, callbacks, persistence, "
+                "credential access, destructive operations, Docker socket, privileged mode, capabilities, or remote "
+                "target option. If command execution is intrinsic, restrict it to a canary file inside the vulnerable "
+                "container. Normalize CRLF for copied scripts. Source archives contain no .git directory, so initialize "
+                "a local repository with no remote only if the build requires git. Healthchecks must verify the final "
+                "application route without accepting redirects."
+            ),
+            input_text=context,
+        )
+        generated_files = [
+            {
+                "path": "docker-compose.yml",
+                "content": _canonicalize_compose_builds(
+                    generation["docker_compose"], vulnerable_only=True
+                ),
+            },
+            {"path": ".dockerignore", "content": generation["dockerignore"]},
+            {"path": "vulnerable/Dockerfile", "content": generation["vulnerable_dockerfile"]},
+            {"path": "validator/Dockerfile", "content": generation["validator_dockerfile"]},
+            {"path": "validator/validator.py", "content": generation["validator_py"]},
+            *generation["adapter_files"],
+        ]
+        _validate_generated(generated_files, vulnerable_only=True)
+        lab_dir = output_root.resolve() / cve
+        _snapshot(repository, vulnerable, lab_dir / "source" / "vulnerable")
+        for item in generated_files:
+            write_text(lab_dir / item["path"], item["content"])
+        plan = {
+            "cve": cve,
+            "cwe": generation["cwe"],
+            "lab_type": "VULNERABLE_ONLY_REPRODUCTION",
+            "marker": marker,
+            "repository": repo_url,
+            "revisions": {"vulnerable": vulnerable, "patched": None},
+            "fix_status": "PUBLIC_FIX_NOT_IDENTIFIED",
+            "patched_tested": False,
+            "startup_services": ["vulnerable"],
+            "source_provenance": "Public vulnerable source resolved from CVE discovery or explicit override",
+            "safety": {
+                "target_scope": "internal_docker_network_only",
+                "payload": "non_destructive_exploit_canary",
+                "limitations": "No public fixed revision was identified; remediation behavior was not tested.",
+            },
+            "exploit_contract": generation["exploit_contract"],
+            "generation": {
+                "model": model,
+                "confidence": generation["confidence"],
+                "rationale": generation["rationale"],
+                "discovery_evidence_urls": discovery.get("evidence_urls", []) if discovery else [],
+            },
+        }
+        write_text(lab_dir / "dossier.json", json.dumps(dossier, indent=2, ensure_ascii=True) + "\n")
+        write_text(lab_dir / "plan.json", json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
+        write_text(lab_dir / "validator" / "plan.json", json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
+        return {
+            "ok": True,
+            "status": "GENERATED_UNVALIDATED",
+            "fix_status": "PUBLIC_FIX_NOT_IDENTIFIED",
+            "lab_dir": str(lab_dir),
+            "plan": plan,
+        }
     if cve == "CVE-2026-66788":
         return _generate_curated_lighthouse(
             cve, dossier, repository, repo_url, vulnerable, fixed, marker, output_root
@@ -954,17 +1133,31 @@ def generate_source_lab(
             "command execution. It must print JSON containing attack_executed, proof_quality set to "
             "security_effect_observed, observable_effect, evidence_type, vulnerable, patched, and "
             "differential_confirmed, exiting zero only when the effect occurs on vulnerable and is blocked on "
-            "patched. Never hard-code a successful result. A harmless canary marker "
+            "patched. vulnerable and patched must each be JSON objects. vulnerable.confirmed is true only when "
+            "the security effect is observed. patched.confirmed is false and patched.blocked is true only when "
+            "the same attack is demonstrably blocked. Include raw observations in those objects. Never hard-code "
+            "a successful result. A harmless canary marker "
             f"({marker}) may identify affected data, but marker reflection alone is not proof. No reverse shells, callbacks, persistence, "
             "credential access, destructive operations, Docker socket, privileged mode, extra capabilities, or "
             "remote target option. If command execution is intrinsic to the CVE, restrict it to creating a canary "
             "file inside the vulnerable container and verify that file as the observable effect. Dockerfiles may install build dependencies from normal package "
-            "registries. Include USER and no-new-privileges controls."
+            "registries. Source snapshots are materialized on Windows, so normalize CRLF on copied shell scripts "
+            "before executing them (including gradlew and entrypoints). Before using a Gradle wrapper, verify from "
+            "the repository tree that gradle/wrapper/gradle-wrapper.jar is versioned. If it is absent, install the "
+            "exact Gradle version declared by gradle-wrapper.properties and invoke gradle directly. Include USER "
+            "and no-new-privileges controls. Source archives intentionally contain no .git directory; if build "
+            "logic invokes git or configures git hooks, install git and initialize a local repository with no remote "
+            "before running the build. Apply the same Gradle decision to runtime entrypoint scripts; they must not "
+            "invoke ./gradlew when the wrapper JAR is absent. Healthchecks must reach the final application route "
+            "without treating an HTTP redirect as healthy, and the validator must use the same final scheme/port."
         ),
         input_text=context,
     )
     generated_files = [
-        {"path": "docker-compose.yml", "content": generation["docker_compose"]},
+        {
+            "path": "docker-compose.yml",
+            "content": _canonicalize_compose_builds(generation["docker_compose"]),
+        },
         {"path": ".dockerignore", "content": generation["dockerignore"]},
         {"path": "vulnerable/Dockerfile", "content": generation["vulnerable_dockerfile"]},
         {"path": "patched/Dockerfile", "content": generation["patched_dockerfile"]},
