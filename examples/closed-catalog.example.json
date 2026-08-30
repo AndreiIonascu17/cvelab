@@ -1,0 +1,37 @@
+{
+  "cves": {
+    "CVE-YYYY-NNNN": {
+      "status": "READY",
+      "reason": "Licensed images registered by the authorized lab owner",
+      "vulnerable_image": "vendor/app:vulnerable",
+      "fixed_image": "vendor/app:fixed",
+      "container_port": 8080,
+      "health_path": "/health",
+      "sources": [
+        "https://vendor.example/security/advisory"
+      ],
+      "contract": {
+        "attack": [
+          {
+            "method": "POST",
+            "path": "/api/import",
+            "headers": {
+              "Content-Type": "application/json"
+            },
+            "body": "{\"name\":\"cvelab-canary\"}"
+          }
+        ],
+        "observe": {
+          "request": {
+            "method": "GET",
+            "path": "/api/items/cvelab-canary"
+          },
+          "match": {
+            "status": 200,
+            "body_contains": "cvelab-canary"
+          }
+        }
+      }
+    }
+  }
+}

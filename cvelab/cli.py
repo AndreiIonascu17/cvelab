@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .core import build_lab, run_lab
 from .closed import run_closed_lab
+from .closed_auto import run_closed_auto
 from .deliverables import create_deliverables
 from .sourcegen import generate_source_lab
 
@@ -91,6 +92,13 @@ def parser() -> argparse.ArgumentParser:
     closed.add_argument("--health-path", default="/", help="Relative readiness path")
     closed.add_argument("--contract", required=True, type=Path, help="Inspectable HTTP attack contract JSON")
 
+    closed_auto = sub.add_parser(
+        "closed-auto",
+        help="Resolve and validate a closed software HTTP PoC from only a CVE identifier",
+    )
+    closed_auto.add_argument("cve")
+    add_ai_credentials(closed_auto)
+
     all_cmd = sub.add_parser("all", help="Generate and validate a lab")
     all_cmd.add_argument("cve")
     all_cmd.add_argument("--cwe", help="Override CWE when public metadata is incomplete")
@@ -131,6 +139,8 @@ def main(argv: list[str] | None = None) -> int:
                     )
             else:
                 result = generated
+        elif args.command == "closed-auto":
+            result = run_closed_auto(args.cve, args.output_root, api_key, model)
         elif args.command == "closed":
             result = run_closed_lab(
                 args.cve,

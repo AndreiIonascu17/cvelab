@@ -1,0 +1,35 @@
+{
+  "cves": {
+    "CVE-2099-9999": {
+      "status": "READY",
+      "reason": "Local autonomous resolver integration fixture",
+      "vulnerable_image": "cvelab/closed-demo:vulnerable",
+      "fixed_image": "cvelab/closed-demo:fixed",
+      "container_port": 8080,
+      "health_path": "/health",
+      "sources": [],
+      "contract": {
+        "attack": [
+          {
+            "method": "POST",
+            "path": "/api/import",
+            "headers": {
+              "Content-Type": "application/json"
+            },
+            "body": "{\"name\":\"cvelab-canary\",\"role\":\"admin\"}"
+          }
+        ],
+        "observe": {
+          "request": {
+            "method": "GET",
+            "path": "/api/users/cvelab-canary"
+          },
+          "match": {
+            "status": 200,
+            "body_contains": "\"role\":\"admin\""
+          }
+        }
+      }
+    }
+  }
+}

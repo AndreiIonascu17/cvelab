@@ -41,6 +41,18 @@ $env:CVELAB_MODEL = "gpt-5.6-sol"
 
 ## Closed software Docker/HTTP workflow
 
+Fully automatic resolution uses only the CVE at run time:
+
+```powershell
+$env:OPENAI_API_KEY = "..."
+$env:CVELAB_MODEL = "gpt-5.6-sol"
+cvelab closed-auto CVE-YYYY-NNNN
+```
+
+The resolver checks `closed-catalog.json`, then public CVE metadata and AI web research.
+It validates all proposed behavior locally and returns `ARTIFACT_REQUIRED` rather than
+inventing an unavailable proprietary image or unsupported PoC.
+
 For legally supplied proprietary images, CVELab can execute an inspectable HTTP attack
 contract against loopback-only vulnerable and fixed containers:
 
