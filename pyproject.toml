@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cvelab"
-version = "0.3.0"
-description = "Local-only source-backed CVE reproduction and PoC generator"
+version = "0.4.0"
+description = "Local-only CVE reproduction and PoC generator"
 requires-python = ">=3.11"
 dependencies = []
 

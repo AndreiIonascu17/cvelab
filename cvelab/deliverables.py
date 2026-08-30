@@ -248,7 +248,8 @@ The patched control succeeds only when it prints `BLOCKED` and no attacker-contr
 {source_note}
 
 The lab is restricted to an internal Docker network and uses a non-destructive exploit canary.
-The PoC has no remote-target option and is executed by the validator container.
+The PoC has no remote-target option. The E2E runner executes the attack, writes
+`e2e/result.json`, and the validator container can independently verify that evidence afterward.
 
 ## Reproduction
 

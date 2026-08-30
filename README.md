@@ -38,6 +38,23 @@ $env:CVELAB_MODEL = "gpt-5.6-sol"
 ```
 
 `auto` is strict: it attempts a real `SOURCE_REPRODUCTION` and writes PoC
+
+## Closed software Docker/HTTP workflow
+
+For legally supplied proprietary images, CVELab can execute an inspectable HTTP attack
+contract against loopback-only vulnerable and fixed containers:
+
+```powershell
+cvelab closed CVE-YYYY-NNNN `
+  --vulnerable-image vendor/app:vulnerable `
+  --fixed-image vendor/app:fixed `
+  --container-port 8080 `
+  --health-path /health `
+  --contract .\contract.json
+```
+
+The contract contains `attack` request steps and an `observe` request with explicit
+matching predicates. If `--fixed-image` is omitted, CVELab makes no patched claim.
 deliverables only after executing the vulnerable code path and observing the
 declared security effect against real source revisions. If sufficient
 source provenance cannot be resolved, it returns `POC_NOT_GENERATED`. It does not

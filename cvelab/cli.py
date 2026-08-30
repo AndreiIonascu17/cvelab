@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from .core import build_lab, run_lab
+from .closed import run_closed_lab
 from .deliverables import create_deliverables
 from .sourcegen import generate_source_lab
 
@@ -79,6 +80,17 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("cve")
     run.add_argument("--keep", action="store_true", help="Keep containers running")
 
+    closed = sub.add_parser(
+        "closed",
+        help="Validate a user-supplied closed software Docker image through loopback HTTP",
+    )
+    closed.add_argument("cve")
+    closed.add_argument("--vulnerable-image", required=True, help="User-supplied vulnerable image")
+    closed.add_argument("--fixed-image", help="Optional user-supplied fixed image")
+    closed.add_argument("--container-port", required=True, type=int, help="HTTP port inside the image")
+    closed.add_argument("--health-path", default="/", help="Relative readiness path")
+    closed.add_argument("--contract", required=True, type=Path, help="Inspectable HTTP attack contract JSON")
+
     all_cmd = sub.add_parser("all", help="Generate and validate a lab")
     all_cmd.add_argument("cve")
     all_cmd.add_argument("--cwe", help="Override CWE when public metadata is incomplete")
@@ -119,6 +131,16 @@ def main(argv: list[str] | None = None) -> int:
                     )
             else:
                 result = generated
+        elif args.command == "closed":
+            result = run_closed_lab(
+                args.cve,
+                args.output_root,
+                args.vulnerable_image,
+                args.fixed_image,
+                args.container_port,
+                args.health_path,
+                args.contract,
+            )
         elif args.command == "run":
             validated = run_lab(args.cve, args.output_root, args.keep)
             result = create_deliverables(

@@ -260,10 +260,28 @@ LAB_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK_ROOT="/tmp/cvelab-CVE-2026-66788-e2e"
 RESULT="$LAB_ROOT/e2e/result.json"
 export PATH="$HOME/.local/bin:$PATH"
+OWNERSHIP_FILE=""
 
 safe_cleanup() {
-  docker rm -fv cluster1-control-plane cluster2-control-plane kind-registry >/dev/null 2>&1 || true
-  docker network rm kind >/dev/null 2>&1 || true
+  test -n "$OWNERSHIP_FILE" && test -s "$OWNERSHIP_FILE" || return 0
+  while IFS='|' read -r kind name expected_id; do
+    if [[ "$kind" == "container" ]]; then
+      current_id="$(docker inspect --format '{{.Id}}' "$name" 2>/dev/null || true)"
+      if [[ -n "$current_id" && "$current_id" == "$expected_id" ]]; then
+        docker rm -fv "$current_id" >/dev/null 2>&1 || true
+      elif [[ -n "$current_id" ]]; then
+        echo "Skipping foreign container $name: Docker ID changed." >&2
+      fi
+    elif [[ "$kind" == "network" ]]; then
+      current_id="$(docker network inspect --format '{{.Id}}' "$name" 2>/dev/null || true)"
+      if [[ -n "$current_id" && "$current_id" == "$expected_id" ]]; then
+        docker network rm "$current_id" >/dev/null 2>&1 || true
+      elif [[ -n "$current_id" ]]; then
+        echo "Skipping foreign network $name: Docker ID changed." >&2
+      fi
+    fi
+  done < "$OWNERSHIP_FILE"
+  rm -f "$OWNERSHIP_FILE"
 }
 
 rm -rf "$WORK_ROOT"
@@ -273,6 +291,17 @@ run_variant() {
   local variant="$1"
   local expected="$2"
   local work="$WORK_ROOT/$variant"
+  local network_preexisted=false
+  OWNERSHIP_FILE="$work/.cvelab-owned-resources"
+  for name in cluster1-control-plane cluster2-control-plane kind-registry; do
+    if docker inspect "$name" >/dev/null 2>&1; then
+      echo "Refusing to start: Docker container name $name is already in use." >&2
+      return 4
+    fi
+  done
+  if docker network inspect kind >/dev/null 2>&1; then
+    network_preexisted=true
+  fi
   cp -a "$LAB_ROOT/source/$variant/." "$work"
   chown -R root:root "$work"
   while IFS= read -r -d '' text_file; do
@@ -296,6 +325,18 @@ YAML
   git commit -qm "CVE lab source snapshot"
 
   make deploy USING=wireguard
+
+  : > "$OWNERSHIP_FILE"
+  for name in cluster1-control-plane cluster2-control-plane kind-registry; do
+    resource_id="$(docker inspect --format '{{.Id}}' "$name" 2>/dev/null || true)"
+    test -n "$resource_id" || { echo "Unable to establish ownership of $name" >&2; return 4; }
+    printf 'container|%s|%s\n' "$name" "$resource_id" >> "$OWNERSHIP_FILE"
+  done
+  if [[ "$network_preexisted" == "false" ]]; then
+    resource_id="$(docker network inspect --format '{{.Id}}' kind 2>/dev/null || true)"
+    test -n "$resource_id" || { echo "Unable to establish ownership of kind network" >&2; return 4; }
+    printf 'network|kind|%s\n' "$resource_id" >> "$OWNERSHIP_FILE"
+  fi
 
   kubectl_tool() {
     docker run --rm --network kind \
@@ -398,10 +439,28 @@ WORK_ROOT="/tmp/cvelab-CVE-2026-66788-manual"
 STATE="$WORK_ROOT/active-variant"
 POC_FILE="$LAB_ROOT/artifacts/PoC.yaml"
 export PATH="$HOME/.local/bin:$PATH"
+OWNERSHIP_FILE="$WORK_ROOT/owned-resources"
 
 safe_cleanup() {
-  docker rm -fv cluster1-control-plane cluster2-control-plane kind-registry >/dev/null 2>&1 || true
-  docker network rm kind >/dev/null 2>&1 || true
+  test -s "$OWNERSHIP_FILE" || return 0
+  while IFS='|' read -r kind name expected_id; do
+    if [[ "$kind" == "container" ]]; then
+      current_id="$(docker inspect --format '{{.Id}}' "$name" 2>/dev/null || true)"
+      if [[ -n "$current_id" && "$current_id" == "$expected_id" ]]; then
+        docker rm -fv "$current_id" >/dev/null 2>&1 || true
+      elif [[ -n "$current_id" ]]; then
+        echo "Skipping foreign container $name: Docker ID changed." >&2
+      fi
+    elif [[ "$kind" == "network" ]]; then
+      current_id="$(docker network inspect --format '{{.Id}}' "$name" 2>/dev/null || true)"
+      if [[ -n "$current_id" && "$current_id" == "$expected_id" ]]; then
+        docker network rm "$current_id" >/dev/null 2>&1 || true
+      elif [[ -n "$current_id" ]]; then
+        echo "Skipping foreign network $name: Docker ID changed." >&2
+      fi
+    fi
+  done < "$OWNERSHIP_FILE"
+  rm -f "$OWNERSHIP_FILE"
 }
 
 active_variant() {
@@ -412,6 +471,16 @@ active_variant() {
 prepare_source() {
   local variant="$1"
   local work="$WORK_ROOT/$variant"
+  local network_preexisted=false
+  for name in cluster1-control-plane cluster2-control-plane kind-registry; do
+    if docker inspect "$name" >/dev/null 2>&1; then
+      echo "Refusing to start: Docker container name $name is already in use." >&2
+      return 4
+    fi
+  done
+  if docker network inspect kind >/dev/null 2>&1; then
+    network_preexisted=true
+  fi
   test ! -e "$STATE" || { echo "A manual lab is already active. Run cleanup first." >&2; exit 2; }
   rm -rf "$work"
   mkdir -p "$work"
@@ -435,6 +504,17 @@ YAML
   git add -A
   git commit -qm "CVE manual PoC source snapshot"
   make deploy USING=wireguard
+  : > "$OWNERSHIP_FILE"
+  for name in cluster1-control-plane cluster2-control-plane kind-registry; do
+    resource_id="$(docker inspect --format '{{.Id}}' "$name" 2>/dev/null || true)"
+    test -n "$resource_id" || { echo "Unable to establish ownership of $name" >&2; return 4; }
+    printf 'container|%s|%s\n' "$name" "$resource_id" >> "$OWNERSHIP_FILE"
+  done
+  if [[ "$network_preexisted" == "false" ]]; then
+    resource_id="$(docker network inspect --format '{{.Id}}' kind 2>/dev/null || true)"
+    test -n "$resource_id" || { echo "Unable to establish ownership of kind network" >&2; return 4; }
+    printf 'network|kind|%s\n' "$resource_id" >> "$OWNERSHIP_FILE"
+  fi
   mkdir -p "$WORK_ROOT"
   printf '%s' "$variant" > "$STATE"
   echo "Manual $variant lab is ready and will remain running."
@@ -734,6 +814,8 @@ CMD ["python", "/validator/validator.py"]
       patched: {condition: service_healthy}
     networks: [labnet]
     security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ./e2e:/e2e:ro
 networks:
   labnet:
     internal: true
