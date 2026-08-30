@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
 import urllib.request
 
 
@@ -67,8 +68,12 @@ def structured_response(
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=180) as response:
-        payload = json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI API HTTP {exc.code}: {detail[:4000]}") from exc
 
     for item in payload.get("output", []):
         if item.get("type") != "message":

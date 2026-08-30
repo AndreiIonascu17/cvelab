@@ -18,7 +18,18 @@ _REQUEST_SCHEMA: dict[str, Any] = {
     "properties": {
         "method": {"type": "string"},
         "path": {"type": "string"},
-        "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+        "headers": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["name", "value"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "value": {"type": "string"},
+                },
+            },
+        },
         "body": {"type": ["string", "null"]},
     },
 }
@@ -86,7 +97,8 @@ def _ai_plan(cve: str, dossier: dict[str, Any], api_key: str | None, model: str 
             "and non-destructive marker-only HTTP reproduction are documented. Never guess image names, "
             "tags, endpoints, credentials, or patched behavior. Do not produce command execution, shells, "
             "persistence, credential theft, destructive payloads, or remote-target instructions. "
-            "Use relative HTTP paths only. Use null for optional match predicates that do not apply. "
+            "Use relative HTTP paths only and express headers as name/value list items. "
+            "Use null for optional match predicates that do not apply. "
             "If proprietary artifacts, authentication, a license, non-HTTP interaction, or missing technical "
             "details prevent a faithful reproduction, return ARTIFACT_REQUIRED or UNSUPPORTED."
         ),
@@ -99,15 +111,37 @@ def _ai_plan(cve: str, dossier: dict[str, Any], api_key: str | None, model: str 
     )
 
 
+def _normalize_request(request: dict[str, Any] | None) -> dict[str, Any] | None:
+    if request is None:
+        return None
+    normalized = dict(request)
+    headers = normalized.get("headers", {})
+    if isinstance(headers, list):
+        normalized["headers"] = {
+            str(item["name"]): str(item["value"]) for item in headers
+        }
+    return normalized
+
+
 def _normalize_plan(entry: dict[str, Any]) -> dict[str, Any]:
     if "contract" in entry:
-        contract = entry["contract"]
+        source_contract = entry["contract"]
+        contract = {
+            "attack": [_normalize_request(item) for item in source_contract.get("attack", [])],
+            "observe": {
+                "request": _normalize_request(source_contract.get("observe", {}).get("request")),
+                "match": source_contract.get("observe", {}).get("match", {}),
+            },
+        }
     else:
         match = entry.get("observe_match") or {}
         match = {key: value for key, value in match.items() if value is not None}
         contract = {
-            "attack": entry.get("attack", []),
-            "observe": {"request": entry.get("observe_request"), "match": match},
+            "attack": [_normalize_request(item) for item in entry.get("attack", [])],
+            "observe": {
+                "request": _normalize_request(entry.get("observe_request")),
+                "match": match,
+            },
         }
     return {
         "status": entry.get("status", "READY"),
