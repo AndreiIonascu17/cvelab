@@ -114,6 +114,69 @@ def create_deliverables(
     if plan.get("scenario") == "lighthouse_broker_namespace_injection_e2e":
         poc_path = artifacts / "PoC.yaml"
         write_text(poc_path, (lab_dir / "e2e" / "poc.yaml").read_text(encoding="utf-8"))
+        write_text(
+            artifacts / "manual.sh",
+            (lab_dir / "e2e" / "manual.sh").read_text(encoding="utf-8"),
+        )
+        manual_wrapper = r'''param(
+    [Parameter(Mandatory=$true)]
+    [ValidateSet("setup", "exploit", "verify", "cleanup")]
+    [string]$Action,
+    [ValidateSet("vulnerable", "patched")]
+    [string]$Variant = "vulnerable"
+)
+$script = Join-Path $PSScriptRoot "manual.sh"
+$wslScript = (& wsl -d kali-linux -u root -- wslpath -a $script).Trim()
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+& wsl -d kali-linux -u root -- bash $wslScript $Action $Variant
+exit $LASTEXITCODE
+'''
+        write_text(artifacts / "PoC.ps1", manual_wrapper)
+        manual_guide = fr'''# {cve} Manual PoC
+
+This kit reproduces the real authorization-bypass effect in a disposable local two-cluster lab.
+The lab stays active between steps so every resource and command can be inspected.
+
+## Vulnerable reproduction
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+Set-Location "{artifacts}"
+Get-Content .\PoC.yaml
+.\PoC.ps1 setup vulnerable
+.\PoC.ps1 exploit
+.\PoC.ps1 verify
+```
+
+Successful reproduction prints `REPRODUCED` and displays an `EndpointSlice` in
+`cluster1/kube-system` containing the attacker-controlled TEST-NET address `198.51.100.77`.
+
+## Cleanup
+
+```powershell
+.\PoC.ps1 cleanup
+```
+
+## Patched control
+
+```powershell
+.\PoC.ps1 setup patched
+.\PoC.ps1 exploit
+.\PoC.ps1 verify
+.\PoC.ps1 cleanup
+```
+
+The patched control succeeds only when it prints `BLOCKED` and no attacker-controlled
+`EndpointSlice` appears in `cluster1/kube-system`.
+
+## Files
+
+- `PoC.yaml`: inspectable attack payload.
+- `PoC.ps1`: Windows entry point with separate setup, exploit, verify, and cleanup actions.
+- `manual.sh`: WSL/Kali implementation used by the PowerShell entry point.
+- `REPORT.md`: evidence captured by the automatic differential validation.
+'''
+        write_text(artifacts / "MANUAL-POC.md", manual_guide)
         poc_name = "PoC.yaml"
     elif plan.get("scenario") == "lighthouse_namespace_injection":
         poc_path = artifacts / "PoC.go"
@@ -177,6 +240,9 @@ The PoC has no remote-target option and is executed by the validator container.
 ```powershell
 & \"$env:LOCALAPPDATA\\Programs\\Python\\Python313\\Scripts\\cvelab.exe\" run {cve}
 ```
+
+For an inspectable, step-by-step reproduction that keeps the lab running, follow
+`MANUAL-POC.md` and use `PoC.ps1`.
 
 ## Modeled attack path
 
@@ -325,6 +391,12 @@ blocked it. It does not authorize or establish exploitability of any remote depl
         "report_markdown": str(artifacts / "REPORT.md"),
         "report_json": str(artifacts / "report.json"),
     }
+    if plan.get("scenario") == "lighthouse_broker_namespace_injection_e2e":
+        result["deliverables"].update({
+            "manual_poc": str(artifacts / "PoC.ps1"),
+            "manual_guide": str(artifacts / "MANUAL-POC.md"),
+            "manual_runner": str(artifacts / "manual.sh"),
+        })
     if analysis:
         result["deliverables"]["analysis"] = str(artifacts / "analysis.json")
     return result
