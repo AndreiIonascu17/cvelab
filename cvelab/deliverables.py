@@ -203,6 +203,11 @@ The patched control succeeds only when it prints `BLOCKED` and no attacker-contr
     revisions = plan.get("revisions", {})
     scenario = plan.get("scenario", "default")
     scenario_details = (
+        "A crafted EndpointSlice from compromised cluster2 declares kube-system as its source namespace. "
+        "The real vulnerable Lighthouse agent and broker propagate it into cluster1/kube-system; the fixed "
+        "agent rejects the same object before local creation."
+        if scenario == "lighthouse_broker_namespace_injection_e2e"
+        else
         "The synthetic model submits an object from `tenant-a` with an attacker-selected "
         "destination of `kube-system`. The vulnerable variant creates it there; the patched "
         "model rejects cross-namespace injection."
@@ -215,14 +220,24 @@ The patched control succeeds only when it prints `BLOCKED` and no attacker-contr
         attack_path = _steps(analysis["attack_path"])
         fidelity = analysis["fidelity"]
     else:
-        prerequisites = "- Consult the CVE dossier and generated plan."
-        attack_path = (
+        if scenario == "lighthouse_broker_namespace_injection_e2e":
+            prerequisites = "- Docker Desktop and Kali WSL.\n- A disposable two-cluster local lab created by the supplied PoC kit."
+            attack_path = (
+                "1. Deploy the recorded vulnerable upstream revision to two local kind clusters.\n"
+                "2. Apply PoC.yaml in cluster2/cvelab-source and force a fresh update with a nonce.\n"
+                "3. Observe address 198.51.100.77 in an EndpointSlice under cluster1/kube-system.\n"
+                "4. Repeat on the fixed revision and require both object absence and the explicit agent rejection log."
+            )
+            fidelity = "This is an end-to-end reproduction using recorded upstream source revisions and the real agent/broker flow."
+        else:
+            prerequisites = "- Consult the CVE dossier and generated plan."
+            attack_path = (
             "1. The validator acts as a compromised, low-trust source namespace.\n"
             "2. It supplies a protected destination namespace with a unique marker.\n"
             "3. It checks whether the marker-backed object appears in that destination.\n"
             "4. It repeats the request against the patched model and expects rejection."
         )
-        fidelity = (
+            fidelity = (
             "This synthetic lab does not deploy the vendor product or its complete environment. "
             "It validates only the modeled trust-boundary failure."
         )
@@ -304,10 +319,16 @@ blocked on `patched`, and `differential_confirmed` is `true`.
         mechanism = scenario_details
         impacts = "- Consult the public CVE description."
         components = "- Consult dossier.json."
-        interpretation = "The differential result applies only to the generated lab."
-        remediation = "Not established by the generated lab."
-        limitations = "- Vendor-product behavior was not exercised."
-        confidence = "Confidence is limited to the observed local class model."
+        if scenario == "lighthouse_broker_namespace_injection_e2e":
+            interpretation = "The vulnerable upstream revision propagated the canary into kube-system; the fixed revision kept it absent and logged an explicit rejection."
+            remediation = "The recorded fixed upstream revision enforces namespace validation for remote EndpointSlices."
+            limitations = "- Validation is restricted to the isolated two-cluster local environment and recorded revisions."
+            confidence = "High confidence for the executed local upstream revisions because both positive exploit evidence and explicit negative-control rejection were captured."
+        else:
+            interpretation = "The differential result applies only to the generated lab."
+            remediation = "Not established by the generated lab."
+            limitations = "- Vendor-product behavior was not exercised."
+            confidence = "Confidence is limited to the observed local class model."
     markdown_report = f"""# {cve} Validation Report
 
 ## Result
