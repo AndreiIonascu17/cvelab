@@ -31,9 +31,9 @@ ANALYSIS_SCHEMA = {
 }
 
 
-def _evidence(value: object) -> str:
+def _evidence(value: object, limit: int = 6000) -> str:
     text = json.dumps(value, ensure_ascii=True) if not isinstance(value, str) else value
-    return text.replace("`", "'")[:1200]
+    return text.replace("`", "'")[:limit]
 
 
 def _bullets(items: list[str]) -> str:
@@ -42,6 +42,151 @@ def _bullets(items: list[str]) -> str:
 
 def _steps(items: list[str]) -> str:
     return "\n".join(f"{index}. {item}" for index, item in enumerate(items, 1)) or "1. Date insuficiente."
+
+
+def _variant_evidence(value: object) -> object:
+    if not isinstance(value, dict):
+        return value
+    if "evidence" in value:
+        return value["evidence"]
+    if "raw_observations" in value:
+        return value["raw_observations"]
+    return value
+
+
+def _fidelity(plan: dict) -> dict:
+    fidelity = plan.get("fidelity")
+    if isinstance(fidelity, dict):
+        return fidelity
+    if plan.get("lab_type") == "END_TO_END_REPRODUCTION":
+        return {
+            "execution_level": "product_end_to_end",
+            "vendor_product_started": True,
+            "exercised_vendor_components": ["vendor product"],
+            "simulated_components": [],
+            "rationale": "Legacy curated end-to-end profile.",
+        }
+    return {
+        "execution_level": "source_component",
+        "vendor_product_started": False,
+        "exercised_vendor_components": [],
+        "simulated_components": ["unspecified adapter components"],
+        "rationale": "Legacy generated lab without explicit fidelity metadata.",
+    }
+
+
+def _write_generic_manual_assets(
+    cve: str,
+    lab_dir: Path,
+    artifacts: Path,
+    vulnerable_only: bool,
+) -> None:
+    allowed_variants = '"vulnerable"' if vulnerable_only else '"vulnerable"|"patched"'
+    patched_note = (
+        "No patched target is available for this CVE."
+        if vulnerable_only
+        else "Repeat the same steps with `patched`; successful verification prints `BLOCKED`."
+    )
+    manual_runner = f'''#!/usr/bin/env bash
+set -euo pipefail
+
+LAB_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+STATE="$LAB_ROOT/artifacts/.manual-state"
+COMPOSE=(docker compose -f "$LAB_ROOT/docker-compose.yml" --project-directory "$LAB_ROOT")
+
+usage() {{
+  echo "Usage: bash manual.sh <setup|exploit|verify|cleanup> [vulnerable{'|patched' if not vulnerable_only else ''}]" >&2
+  exit 2
+}}
+
+target() {{
+  local requested="${{1:-}}"
+  if [[ -z "$requested" && -s "$STATE" ]]; then requested="$(<"$STATE")"; fi
+  case "$requested" in
+    {allowed_variants}) printf '%s' "$requested" ;;
+    *) echo "Choose a valid target and run setup first." >&2; exit 2 ;;
+  esac
+}}
+
+action="${{1:-}}"
+if [[ "$action" == "cleanup" ]]; then
+  "${{COMPOSE[@]}}" down --volumes --remove-orphans
+  rm -f "$STATE"
+  exit 0
+fi
+variant="$(target "${{2:-}}")"
+case "$action" in
+  setup)
+    [[ ! -e "$STATE" ]] || {{ echo "A manual lab is already active; run cleanup first." >&2; exit 2; }}
+    "${{COMPOSE[@]}}" build "$variant" validator
+    "${{COMPOSE[@]}}" up -d --build "$variant"
+    printf '%s' "$variant" > "$STATE"
+    echo "Manual lab ready: $variant"
+    ;;
+  exploit|verify)
+    [[ -s "$STATE" ]] || {{ echo "Run setup first." >&2; exit 2; }}
+    [[ "$(<"$STATE")" == "$variant" ]] || {{ echo "Target differs from the active manual lab." >&2; exit 2; }}
+    "${{COMPOSE[@]}}" --profile tools run --rm --no-deps \
+      -e "CVELAB_MANUAL_ACTION=$action" -e "CVELAB_TARGET=$variant" validator
+    ;;
+  *) usage ;;
+esac
+'''
+    write_text(artifacts / "manual.sh", manual_runner)
+    manual_wrapper = r'''param(
+    [Parameter(Mandatory=$true)]
+    [ValidateSet("setup", "exploit", "verify", "cleanup")]
+    [string]$Action,
+    [ValidateSet("vulnerable", "patched")]
+    [string]$Variant = "vulnerable"
+)
+$script = Join-Path $PSScriptRoot "manual.sh"
+$wslScript = (& wsl -- wslpath -a $script).Trim()
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+& wsl -- bash $wslScript $Action $Variant
+exit $LASTEXITCODE
+'''
+    write_text(artifacts / "PoC.ps1", manual_wrapper)
+    patched_section = "" if vulnerable_only else '''## Patched control
+
+```bash
+bash manual.sh setup patched
+bash manual.sh exploit patched
+bash manual.sh verify patched
+bash manual.sh cleanup
+```
+
+Successful verification of the fixed revision prints `BLOCKED`.
+
+'''
+    manual_guide = f'''# {cve} Manual PoC
+
+The manual runner uses the same isolated images and exact request as automatic validation,
+but leaves setup, exploitation, evidence verification, and cleanup as separate inspectable steps.
+
+## Kali/Linux
+
+```bash
+cd "{artifacts}"
+sed -n '1,260p' PoC.py
+bash manual.sh setup vulnerable
+bash manual.sh exploit vulnerable
+bash manual.sh verify vulnerable
+bash manual.sh cleanup
+```
+
+A confirmed vulnerable reproduction prints `REPRODUCED`. {patched_note}
+
+{patched_section}## What each step does
+
+- `setup` builds the selected source revision and starts only that target.
+- `exploit` sends the exact local attack and prints the raw observation without deciding the result.
+- `verify` repeats the controls and evaluates the declared security effect.
+- `cleanup` removes this Compose project's containers, network, and volumes.
+
+Targets are Docker service names only; this PoC has no arbitrary or remote target option.
+'''
+    write_text(artifacts / "MANUAL-POC.md", manual_guide)
 
 
 def _automatic_analysis(
@@ -62,6 +207,8 @@ def _automatic_analysis(
             "Write a technically precise Romanian defensive-research analysis for the supplied CVE and local lab. "
             "Use only facts present in the input. Clearly distinguish CVE metadata, model inference, and observed "
             "lab evidence. Never claim the vendor product was validated when lab_type is SYNTHETIC_CLASS_LAB. "
+            "Treat lab_plan.fidelity as authoritative: never describe source_component as product end-to-end, and "
+            "name simulated components when explaining limitations. "
             "Explain the actual vulnerability mechanism and prerequisites, not merely the CWE definition. "
             "For attack_path, describe the executed local exploit path and its observed security effect, not remote "
             "targeting instructions. Do not add shells, persistence, credential access, destructive actions, or "
@@ -83,7 +230,9 @@ def create_deliverables(
     dossier = json.loads((lab_dir / "dossier.json").read_text(encoding="utf-8"))
     report = result.get("report", {})
     validation = report.get("validation", {})
+    automation = report.get("automation", {})
     artifacts = lab_dir / "artifacts"
+    fidelity_record = _fidelity(plan)
     real_poc_verified = (
         result.get("ok") is True
         and plan.get("lab_type")
@@ -111,9 +260,18 @@ def create_deliverables(
             "validation": validation,
         }
     analysis = None
+    analysis_error = None
     if api_key and model:
-        analysis = _automatic_analysis(dossier, plan, report, api_key, model)
-        write_text(artifacts / "analysis.json", json.dumps(analysis, indent=2, ensure_ascii=True) + "\n")
+        try:
+            analysis = _automatic_analysis(dossier, plan, report, api_key, model)
+        except Exception as exc:
+            # The evidence-backed deterministic report is still complete. A
+            # prose-analysis API failure must not discard a validated PoC.
+            analysis_error = str(exc)
+        else:
+            write_text(artifacts / "analysis.json", json.dumps(analysis, indent=2, ensure_ascii=True) + "\n")
+    elif (artifacts / "analysis.json").is_file():
+        analysis = json.loads((artifacts / "analysis.json").read_text(encoding="utf-8"))
 
     if plan.get("scenario") == "lighthouse_broker_namespace_injection_e2e":
         poc_path = artifacts / "PoC.yaml"
@@ -141,7 +299,17 @@ exit $LASTEXITCODE
 This kit reproduces the real authorization-bypass effect in a disposable local two-cluster lab.
 The lab stays active between steps so every resource and command can be inspected.
 
-## Vulnerable reproduction
+## Vulnerable reproduction on Linux
+
+```bash
+cd "{artifacts}"
+cat PoC.yaml
+bash manual.sh setup vulnerable
+bash manual.sh exploit
+bash manual.sh verify
+```
+
+## Vulnerable reproduction on Windows/WSL
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
@@ -157,11 +325,26 @@ Successful reproduction prints `REPRODUCED` and displays an `EndpointSlice` in
 
 ## Cleanup
 
+```bash
+bash manual.sh cleanup
+```
+
+On Windows/WSL:
+
 ```powershell
 .\PoC.ps1 cleanup
 ```
 
 ## Patched control
+
+```bash
+bash manual.sh setup patched
+bash manual.sh exploit
+bash manual.sh verify
+bash manual.sh cleanup
+```
+
+On Windows/WSL:
 
 ```powershell
 .\PoC.ps1 setup patched
@@ -177,7 +360,7 @@ The patched control succeeds only when it prints `BLOCKED` and no attacker-contr
 
 - `PoC.yaml`: inspectable attack payload.
 - `PoC.ps1`: Windows entry point with separate setup, exploit, verify, and cleanup actions.
-- `manual.sh`: WSL/Kali implementation used by the PowerShell entry point.
+- `manual.sh`: native Linux entry point, also used by the Windows/WSL wrapper.
 - `REPORT.md`: evidence captured by the automatic differential validation.
 '''
         write_text(artifacts / "MANUAL-POC.md", manual_guide)
@@ -197,10 +380,17 @@ The patched control succeeds only when it prints `BLOCKED` and no attacker-contr
         poc_path = artifacts / "PoC.py"
         write_text(poc_path, poc_header + validator)
         poc_name = "PoC.py"
+        _write_generic_manual_assets(
+            cve,
+            lab_dir,
+            artifacts,
+            plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION",
+        )
     write_text(artifacts / "plan.json", json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
 
     source_note = (
-        "This is a vendor-source reproduction using the revisions recorded below."
+        "This is a vendor-source reproduction using the revisions recorded below. "
+        "Its fidelity level is recorded separately and must not be inferred from source use alone."
         if plan["lab_type"] in {
             "SOURCE_REPRODUCTION", "END_TO_END_REPRODUCTION",
             "VULNERABLE_ONLY_REPRODUCTION",
@@ -215,6 +405,7 @@ The patched control succeeds only when it prints `BLOCKED` and no attacker-contr
             "was identified at generation time, so no patched behavior is claimed."
         )
     scenario = plan.get("scenario", "default")
+    contract = plan.get("exploit_contract", {})
     scenario_details = (
         "A crafted EndpointSlice from compromised cluster2 declares kube-system as its source namespace. "
         "The real vulnerable Lighthouse agent and broker propagate it into cluster1/kube-system; the fixed "
@@ -229,24 +420,31 @@ The patched control succeeds only when it prints `BLOCKED` and no attacker-contr
             "The validator executes the real vulnerable source path and records the declared "
             "security effect. No synthetic patched variant is created."
             if vulnerable_only
-            else "The validator exercises the marker-only scenario recorded in plan.json."
+            else contract.get(
+                "attack_summary",
+                "The validator executes the source-backed scenario recorded in plan.json.",
+            )
         )
     )
     if analysis:
         scenario_details = analysis["mechanism"]
         prerequisites = _bullets(analysis["prerequisites"])
         attack_path = _steps(analysis["attack_path"])
-        fidelity = analysis["fidelity"]
+        analyst_fidelity = analysis["fidelity"]
     else:
         if scenario == "lighthouse_broker_namespace_injection_e2e":
-            prerequisites = "- Docker Desktop and Kali WSL.\n- A disposable two-cluster local lab created by the supplied PoC kit."
+            prerequisites = (
+                "- Docker Engine on Linux, or Docker Desktop with Kali WSL on Windows.\n"
+                "- Bash, Git, Make, and curl available in the execution environment.\n"
+                "- A disposable two-cluster local lab created by the supplied PoC kit."
+            )
             attack_path = (
                 "1. Deploy the recorded vulnerable upstream revision to two local kind clusters.\n"
                 "2. Apply PoC.yaml in cluster2/cvelab-source and force a fresh update with a nonce.\n"
                 "3. Observe address 198.51.100.77 in an EndpointSlice under cluster1/kube-system.\n"
                 "4. Repeat on the fixed revision and require both object absence and the explicit agent rejection log."
             )
-            fidelity = "This is an end-to-end reproduction using recorded upstream source revisions and the real agent/broker flow."
+            analyst_fidelity = "This is an end-to-end reproduction using recorded upstream source revisions and the real agent/broker flow."
         else:
             prerequisites = "- Consult the CVE dossier and generated plan."
             if vulnerable_only:
@@ -256,32 +454,44 @@ The patched control succeeds only when it prints `BLOCKED` and no attacker-contr
                     "3. Verify the concrete security effect using an independent observation.\n"
                     "4. Record that no patched control was tested because no public fix was identified."
                 )
-                fidelity = (
+                analyst_fidelity = (
                     "This is a source-backed vulnerable-only reproduction. It proves the observed "
                     "effect for the recorded revision but makes no remediation claim."
                 )
             else:
+                prerequisites = _bullets(contract.get("preconditions", []))
                 attack_path = (
-                    "1. The validator acts as a compromised, low-trust source namespace.\n"
-                    "2. It supplies a protected destination namespace with a unique marker.\n"
-                    "3. It checks whether the marker-backed object appears in that destination.\n"
-                    "4. It repeats the request against the patched model and expects rejection."
+                    "1. Build and start both recorded source revisions.\n"
+                    "2. Execute the exact local attack declared in plan.json against the vulnerable target.\n"
+                    "3. Capture the raw response and independently check the declared security effect.\n"
+                    "4. Repeat the identical attack against the patched target and require it to be blocked."
                 )
-                fidelity = (
-                    "This synthetic lab does not deploy the vendor product or its complete environment. "
-                    "It validates only the modeled trust-boundary failure."
-                )
+                analyst_fidelity = fidelity_record.get("rationale", "See plan.json.")
+    fidelity = (
+        f"Execution level: `{fidelity_record.get('execution_level', 'unknown')}`. "
+        f"Vendor product started: `{fidelity_record.get('vendor_product_started', False)}`. "
+        f"{fidelity_record.get('rationale', analyst_fidelity)}"
+    )
     walkthrough = f"""# {cve} Walkthrough
 
 ## Scope
 
 {source_note}
 
-The lab is restricted to an internal Docker network and uses a non-destructive exploit canary.
-The PoC has no remote-target option. The E2E runner executes the attack, writes
-`e2e/result.json`, and the validator container can independently verify that evidence afterward.
+The lab is restricted to a disposable local environment and uses a non-destructive exploit canary.
+The PoC has no arbitrary remote-target option. Automatic evidence is stored in
+`report.json` and `artifacts/EVIDENCE.json`{'; the Shipyard profile also writes `e2e/result.json`' if scenario == 'lighthouse_broker_namespace_injection_e2e' else ''}.
 
-## Reproduction
+## Reproduction on Linux
+
+```bash
+cvelab run {cve}
+```
+
+For an inspectable, step-by-step reproduction that keeps the lab running, follow
+`MANUAL-POC.md` and use `manual.sh`.
+
+## Reproduction on Windows/WSL
 
 ```powershell
 & \"$env:LOCALAPPDATA\\Programs\\Python\\Python313\\Scripts\\cvelab.exe\" run {cve}
@@ -307,6 +517,9 @@ For an inspectable, step-by-step reproduction that keeps the lab running, follow
 - `../docker-compose.yml`: isolated vulnerable{'' if vulnerable_only else ', patched'}, and validator services.
 - `../validator/validator.py`: executable real-effect validator.
 - `{poc_name}`: source-backed local PoC executed against the vulnerable revision.
+- `manual.sh`: Linux runner with separate setup, exploit, verify, and cleanup actions.
+- `MANUAL-POC.md`: inspectable manual reproduction instructions.
+- `EVIDENCE.json`: normalized evidence, proof checks, provenance, and fidelity metadata.
 - `REPORT.md`: validation result and limitations.
 
 ## Revisions
@@ -322,6 +535,9 @@ For an inspectable, step-by-step reproduction that keeps the lab running, follow
 ## Fidelity boundary
 
 {fidelity}
+
+- Exercised vendor components: `{_evidence(fidelity_record.get('exercised_vendor_components', []))}`
+- Simulated components: `{_evidence(fidelity_record.get('simulated_components', []))}`
 """
     write_text(artifacts / "WALKTHROUGH.md", walkthrough)
 
@@ -379,6 +595,12 @@ For an inspectable, step-by-step reproduction that keeps the lab running, follow
 - Proof quality: `{validation.get('proof_quality', 'not observed')}`
 - Observable effect: `{_evidence(validation.get('observable_effect', 'none'))}`
 - Lab type: `{plan['lab_type']}`
+- Fidelity level: `{fidelity_record.get('execution_level', 'unknown')}`
+- Vendor product started: `{fidelity_record.get('vendor_product_started', False)}`
+- Product E2E verified: `{report.get('product_e2e_verified', False)}`
+- Manual PoC verified: `{report.get('proof_checks', {}).get('manual_poc_verified', 'separate curated runner')}`
+- Autonomous validation attempts: `{automation.get('validation_attempts', 1)}`
+- Autonomous adapter repairs: `{automation.get('repair_calls', 0)}`
 - CWE: `{plan.get('cwe', 'unknown')}`
 - Scenario: `{scenario}`
 - Validated at: `{report.get('validated_at', 'not completed')}`
@@ -406,11 +628,29 @@ For an inspectable, step-by-step reproduction that keeps the lab running, follow
 ## Evidence
 
 - Vulnerable confirmed: `{vulnerable_result.get('confirmed', False)}`
-- Vulnerable evidence: `{_evidence(vulnerable_result.get('evidence', 'none'))}`
 - Patched confirmed: `{patched_result.get('confirmed', False)}`
-- Patched evidence: `{_evidence(patched_result.get('evidence', 'none'))}`
+
+### Vulnerable raw evidence
+
+```json
+{json.dumps(_variant_evidence(vulnerable_result), indent=2, ensure_ascii=True)[:12000]}
+```
+
+### Patched raw evidence
+
+```json
+{json.dumps(_variant_evidence(patched_result), indent=2, ensure_ascii=True)[:12000]}
+```
 
 {interpretation}
+
+## Fidelity
+
+- Execution level: `{fidelity_record.get('execution_level', 'unknown')}`
+- Vendor product started: `{fidelity_record.get('vendor_product_started', False)}`
+- Exercised vendor components: `{_evidence(fidelity_record.get('exercised_vendor_components', []))}`
+- Simulated components: `{_evidence(fidelity_record.get('simulated_components', []))}`
+- Boundary: {fidelity_record.get('rationale', 'Not recorded.')}
 
 ## Remediation status
 
@@ -445,19 +685,47 @@ This result does not authorize or establish exploitability of any remote deploym
 """
     write_text(artifacts / "REPORT.md", markdown_report)
     write_text(artifacts / "report.json", json.dumps(report, indent=2, ensure_ascii=True) + "\n")
+    evidence_document = {
+        "schema_version": 1,
+        "cve": cve,
+        "status": status,
+        "lab_type": plan.get("lab_type"),
+        "fidelity": fidelity_record,
+        "validated_at": report.get("validated_at"),
+        "validation": validation,
+        "proof_contract": report.get("proof_contract", plan.get("exploit_contract", {})),
+        "proof_checks": report.get("proof_checks", {}),
+        "manual_poc_checks": report.get("manual_poc_checks", {}),
+        "automation": automation,
+        "provenance": {
+            "cve_source": dossier.get("source", "unknown"),
+            "repository": plan.get("repository"),
+            "vulnerable_revision": revisions.get("vulnerable"),
+            "patched_revision": revisions.get("patched"),
+        },
+    }
+    write_text(
+        artifacts / "EVIDENCE.json",
+        json.dumps(evidence_document, indent=2, ensure_ascii=True) + "\n",
+    )
 
     result["deliverables"] = {
         "poc": str(poc_path),
         "walkthrough": str(artifacts / "WALKTHROUGH.md"),
         "report_markdown": str(artifacts / "REPORT.md"),
         "report_json": str(artifacts / "report.json"),
+        "evidence": str(artifacts / "EVIDENCE.json"),
     }
-    if plan.get("scenario") == "lighthouse_broker_namespace_injection_e2e":
-        result["deliverables"].update({
-            "manual_poc": str(artifacts / "PoC.ps1"),
-            "manual_guide": str(artifacts / "MANUAL-POC.md"),
-            "manual_runner": str(artifacts / "manual.sh"),
-        })
+    optional_deliverables = {
+        "manual_poc": artifacts / "PoC.ps1",
+        "manual_guide": artifacts / "MANUAL-POC.md",
+        "manual_runner": artifacts / "manual.sh",
+    }
+    result["deliverables"].update({
+        name: str(path) for name, path in optional_deliverables.items() if path.is_file()
+    })
     if analysis:
         result["deliverables"]["analysis"] = str(artifacts / "analysis.json")
+    if analysis_error:
+        result["analysis_warning"] = analysis_error
     return result

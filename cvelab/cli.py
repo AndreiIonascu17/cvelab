@@ -6,6 +6,7 @@ import json
 import sys
 from pathlib import Path
 
+from .autoflow import run_auto_workflow
 from .core import build_lab, run_lab
 from .closed import run_closed_lab
 from .closed_auto import run_closed_auto
@@ -75,6 +76,12 @@ def parser() -> argparse.ArgumentParser:
         help="AI generation is always enabled for the automatic workflow",
     )
     auto.add_argument("--keep", action="store_true", help="Keep containers running")
+    auto.add_argument(
+        "--max-attempts",
+        type=int,
+        default=4,
+        help="Maximum automatic E2E validation attempts (default: 4)",
+    )
     add_ai_credentials(auto)
 
     run = sub.add_parser("run", help="Build containers and validate the available source variants")
@@ -117,7 +124,19 @@ def main(argv: list[str] | None = None) -> int:
         model = getattr(args, "model", None)
         if args.command == "build":
             result = build_lab(args.cve, args.output_root, args.cwe, args.ai, api_key, model)
-        elif args.command in {"source", "source-all", "auto"}:
+        elif args.command == "auto":
+            result = run_auto_workflow(
+                args.cve,
+                args.output_root,
+                args.repo,
+                args.fixed_ref,
+                args.vulnerable_ref,
+                api_key,
+                model,
+                args.keep,
+                args.max_attempts,
+            )
+        elif args.command in {"source", "source-all"}:
             generated = generate_source_lab(
                 args.cve,
                 args.output_root,
@@ -127,16 +146,8 @@ def main(argv: list[str] | None = None) -> int:
                 api_key,
                 model,
             )
-            if args.command in {"source-all", "auto"} and generated.get("ok"):
+            if args.command == "source-all" and generated.get("ok"):
                 result = run_lab(args.cve, args.output_root, args.keep)
-                if args.command == "auto":
-                    result = create_deliverables(
-                        args.cve.upper(),
-                        args.output_root.resolve() / args.cve.upper(),
-                        result,
-                        api_key,
-                        model,
-                    )
             else:
                 result = generated
         elif args.command == "closed-auto":

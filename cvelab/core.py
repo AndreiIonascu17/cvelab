@@ -253,16 +253,34 @@ def run_docker_stage(
     environment: dict[str, str],
     cwd: Path,
 ) -> None:
-    result = subprocess.run(command, cwd=cwd, env=environment)
+    result = subprocess.run(
+        command,
+        cwd=cwd,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
     if result.returncode == 0:
         return
     engine = subprocess.run([docker, "info"], capture_output=True, text=True, env=environment)
     if os.name == "nt" and engine.returncode != 0:
         ensure_docker(docker, environment)
-        result = subprocess.run(command, cwd=cwd, env=environment)
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
         if result.returncode == 0:
             return
-    raise RuntimeError(f"Docker stage '{stage}' failed with exit code {result.returncode}")
+    detail = "\n".join(
+        part.strip() for part in (result.stdout, result.stderr) if part and part.strip()
+    )[-16000:]
+    suffix = f"\nDocker output:\n{detail}" if detail else ""
+    raise RuntimeError(
+        f"Docker stage '{stage}' failed with exit code {result.returncode}{suffix}"
+    )
 
 
 def wait_health(port: int) -> None:
@@ -277,6 +295,116 @@ def wait_health(port: int) -> None:
     raise RuntimeError(f"Lab service did not become healthy on port {port}")
 
 
+def run_shipyard_script(lab_dir: Path, runner: dict) -> None:
+    script = lab_dir / runner["script"]
+    if not script.is_file():
+        raise RuntimeError(f"Shipyard runner script was not found: {script}")
+
+    if os.name == "nt":
+        distribution = runner.get("distribution", "kali-linux")
+        converted = subprocess.run(
+            ["wsl", "-d", distribution, "--", "wslpath", "-a", str(script)],
+            capture_output=True,
+            text=True,
+        )
+        if converted.returncode != 0:
+            detail = (converted.stderr or converted.stdout).strip()
+            raise RuntimeError(f"Could not resolve the Shipyard script in WSL: {detail}")
+        command = [
+            "wsl", "-d", distribution, "-u", "root", "--", "bash",
+            converted.stdout.strip(),
+        ]
+        environment = None
+    else:
+        required = ("bash", "curl", "docker", "git", "make")
+        missing = [name for name in required if not shutil.which(name)]
+        if missing:
+            raise RuntimeError(
+                "Native Shipyard runner is missing required commands: "
+                + ", ".join(missing)
+            )
+        docker = docker_executable()
+        environment = docker_environment(docker)
+        ensure_docker(docker, environment)
+        command = [shutil.which("bash") or "bash", str(script)]
+
+    completed = subprocess.run(
+        command,
+        cwd=lab_dir,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        hint = (
+            " Inspect the Shipyard output above for the first Docker error; "
+            "exit 125 normally means Docker could not create or start a "
+            "container. VPN/firewall rules are relevant only when that output "
+            "shows failed access to localhost:5000 or a Docker bridge address."
+            if os.name != "nt"
+            else ""
+        )
+        detail = "\n".join(
+            part.strip()
+            for part in (completed.stdout, completed.stderr)
+            if part and part.strip()
+        )[-16000:]
+        output = f"\nRunner output:\n{detail}" if detail else ""
+        raise RuntimeError(
+            f"Shipyard E2E runner failed with exit code {completed.returncode}."
+            + hint
+            + output
+        )
+
+
+def shipyard_report(cve: str, lab_dir: Path, plan: dict) -> dict:
+    result_path = lab_dir / "e2e" / "result.json"
+    if not result_path.is_file():
+        raise RuntimeError(f"Shipyard runner did not produce evidence: {result_path}")
+    validation = json.loads(result_path.read_text(encoding="utf-8"))
+    vulnerable_result = validation.get("vulnerable", {})
+    patched_result = validation.get("patched", {})
+    proof_contract = plan.get("exploit_contract", {})
+    proof_checks = {
+        "source_reproduction": plan.get("lab_type") == "END_TO_END_REPRODUCTION",
+        "contract_effect_defined": bool(proof_contract.get("observable_effect")),
+        "contract_evidence_defined": bool(proof_contract.get("evidence_type")),
+        "attack_executed": validation.get("attack_executed") is True,
+        "security_effect_observed": validation.get("proof_quality")
+        == "end_to_end_security_effect_observed",
+        "observable_effect_recorded": bool(validation.get("observable_effect")),
+        "evidence_type_matches": validation.get("evidence_type")
+        == proof_contract.get("evidence_type"),
+        "vulnerable_confirmed": vulnerable_result.get("confirmed") is True,
+        "patched_not_confirmed": patched_result.get("confirmed") is False,
+        "patched_blocked": patched_result.get("rejection_logged") is True,
+        "differential_confirmed": validation.get("differential_confirmed") is True,
+    }
+    validated = all(proof_checks.values())
+    fidelity = plan.get("fidelity", {})
+    product_e2e_verified = (
+        validated and fidelity.get("execution_level") == "product_end_to_end"
+    )
+    report = {
+        "cve": cve,
+        "cwe": plan["cwe"],
+        "lab_type": plan["lab_type"],
+        "validated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "validation": validation,
+        "proof_contract": proof_contract,
+        "fidelity": fidelity,
+        "proof_checks": proof_checks,
+        "real_poc_verified": validated,
+        "product_e2e_verified": product_e2e_verified,
+        "fix_status": plan.get("fix_status", "PUBLIC_FIX_AVAILABLE"),
+        "patched_tested": True,
+        "differential_confirmed": validation.get("differential_confirmed") is True,
+        "ok": validated,
+    }
+    write_text(lab_dir / "report.json", json.dumps(report, indent=2, ensure_ascii=True) + "\n")
+    return {"ok": validated, "lab_dir": str(lab_dir), "report": report}
+
+
 def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
     cve = normalize_cve(cve_value)
     lab_dir = output_root.resolve() / cve
@@ -284,49 +412,20 @@ def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
     if not plan_path.exists():
         raise RuntimeError(f"Lab not generated: {lab_dir}")
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    if plan.get("runner", {}).get("type") == "wsl_shipyard":
-        if os.name != "nt":
-            raise RuntimeError("The curated Shipyard runner currently requires Windows with WSL")
+    if plan.get("runner", {}).get("type") in {"shipyard", "wsl_shipyard"}:
         runner = plan["runner"]
-        script = lab_dir / runner["script"]
-        converted = subprocess.run(
-            ["wsl", "-d", runner["distribution"], "--", "wslpath", "-a", str(script)],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-        subprocess.run(
-            ["wsl", "-d", runner["distribution"], "-u", "root", "--", "bash", converted],
-            cwd=lab_dir, check=True,
-        )
-        validation = json.loads((lab_dir / "e2e" / "result.json").read_text(encoding="utf-8"))
-        vulnerable_result = validation.get("vulnerable", {})
-        patched_result = validation.get("patched", {})
-        validated = (
-            validation.get("attack_executed") is True
-            and validation.get("proof_quality") == "end_to_end_security_effect_observed"
-            and validation.get("differential_confirmed") is True
-            and vulnerable_result.get("confirmed") is True
-            and patched_result.get("confirmed") is False
-        )
-        report = {
-            "cve": cve,
-            "cwe": plan["cwe"],
-            "lab_type": plan["lab_type"],
-            "validated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "validation": validation,
-            "proof_contract": plan.get("exploit_contract", {}),
-            "real_poc_verified": validated,
-            "ok": validated,
-        }
-        write_text(lab_dir / "report.json", json.dumps(report, indent=2, ensure_ascii=True) + "\n")
-        return {"ok": validated, "lab_dir": str(lab_dir), "report": report}
+        run_shipyard_script(lab_dir, runner)
+        return shipyard_report(cve, lab_dir, plan)
     docker = docker_executable()
     environment = docker_environment(docker)
     ensure_docker(docker, environment)
     compose = [docker, "compose", "-f", str(lab_dir / "docker-compose.yml")]
+    validated_run = False
     try:
         startup_services = plan.get("startup_services", ["vulnerable", "patched", "metadata"])
         if plan.get("lab_type") in {
-            "SOURCE_REPRODUCTION", "VULNERABLE_ONLY_REPRODUCTION"
+            "SOURCE_REPRODUCTION", "END_TO_END_REPRODUCTION",
+            "VULNERABLE_ONLY_REPRODUCTION",
         }:
             required = [
                 lab_dir / "docker-compose.yml",
@@ -335,7 +434,7 @@ def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
                 lab_dir / "validator" / "validator.py",
                 lab_dir / "source" / "vulnerable",
             ]
-            if plan.get("lab_type") == "SOURCE_REPRODUCTION":
+            if plan.get("lab_type") != "VULNERABLE_ONLY_REPRODUCTION":
                 required.extend([
                     lab_dir / "patched" / "Dockerfile",
                     lab_dir / "source" / "patched",
@@ -449,15 +548,63 @@ def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
                 "patched_not_confirmed": not patched_confirmed,
                 "patched_blocked": patched_blocked,
             })
+        automatic_proof = all(proof_checks.values()) and (
+            validation.get("differential_confirmed") is False
+            if vulnerable_only
+            else validation.get("differential_confirmed") is True
+        )
+        manual_poc_checks = {}
+        if automatic_proof:
+            targets = ["vulnerable"] if vulnerable_only else ["vulnerable", "patched"]
+            for target in targets:
+                for action in ("exploit", "verify"):
+                    checked = subprocess.run(
+                        compose + [
+                            "--profile", "tools", "run", "--rm", "--no-deps",
+                            "-e", f"CVELAB_MANUAL_ACTION={action}",
+                            "-e", f"CVELAB_TARGET={target}",
+                            "validator",
+                        ],
+                        cwd=lab_dir,
+                        capture_output=True,
+                        text=True,
+                        env=environment,
+                    )
+                    output = checked.stdout.strip()
+                    expected_verdict = (
+                        "REPRODUCED" if target == "vulnerable" else "BLOCKED"
+                    )
+                    passed = checked.returncode == 0 and bool(output)
+                    if action == "verify":
+                        passed = passed and expected_verdict in output
+                    manual_poc_checks[f"{target}_{action}"] = {
+                        "passed": passed,
+                        "exit_code": checked.returncode,
+                        "expected_verdict": expected_verdict if action == "verify" else None,
+                        "output": output[:6000],
+                        "stderr": checked.stderr.strip()[:2000],
+                    }
+        proof_checks["manual_poc_verified"] = bool(manual_poc_checks) and all(
+            item["passed"] for item in manual_poc_checks.values()
+        )
         real_source_proof = all(proof_checks.values())
         # Compose can surface a lifecycle exit code after `docker wait` even
         # when the validator completed and emitted a complete proof document.
         # Accept only the strict, independently checked proof contract; retain
         # the process exit code in the report for diagnostics.
-        validated = real_source_proof and (
-            validation.get("differential_confirmed") is False
-            if vulnerable_only
-            else validation.get("differential_confirmed") is True
+        validated = real_source_proof
+        fidelity = plan.get("fidelity", {
+            "execution_level": "source_component",
+            "vendor_product_started": False,
+            "exercised_vendor_components": [],
+            "simulated_components": ["unspecified adapter components"],
+            "rationale": "Legacy generated lab without explicit fidelity metadata.",
+        })
+        product_e2e_verified = (
+            real_source_proof
+            and plan.get("lab_type") == "END_TO_END_REPRODUCTION"
+            and fidelity.get("execution_level") == "product_end_to_end"
+            and fidelity.get("vendor_product_started") is True
         )
         report = {
             "cve": cve,
@@ -466,18 +613,41 @@ def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
             "validated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "validation": validation,
             "proof_contract": proof_contract,
+            "fidelity": fidelity,
             "proof_checks": proof_checks,
+            "manual_poc_checks": manual_poc_checks,
             "validator_exit_code": validator_exit,
             "real_poc_verified": real_source_proof,
+            "product_e2e_verified": product_e2e_verified,
             "fix_status": plan.get("fix_status", "PUBLIC_FIX_AVAILABLE"),
             "patched_tested": not vulnerable_only,
             "differential_confirmed": validation.get("differential_confirmed") is True,
             "ok": validated,
         }
         write_text(lab_dir / "report.json", json.dumps(report, indent=2, ensure_ascii=True) + "\n")
+        validated_run = report["ok"]
         return {"ok": report["ok"], "lab_dir": str(lab_dir), "report": report}
+    except Exception as exc:
+        diagnostics = []
+        for arguments in (("ps", "-a"), ("logs", "--no-color", "--tail", "200")):
+            inspected = subprocess.run(
+                compose + list(arguments),
+                cwd=lab_dir,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            output = "\n".join(
+                part.strip()
+                for part in (inspected.stdout, inspected.stderr)
+                if part and part.strip()
+            )
+            if output:
+                diagnostics.append(f"docker compose {' '.join(arguments)}:\n{output[-12000:]}")
+        suffix = "\n\nCompose diagnostics:\n" + "\n\n".join(diagnostics) if diagnostics else ""
+        raise RuntimeError(str(exc) + suffix) from exc
     finally:
-        if not keep:
+        if not keep or not validated_run:
             subprocess.run(
                 compose + ["down", "--volumes", "--remove-orphans"],
                 cwd=lab_dir,

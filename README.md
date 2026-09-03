@@ -14,17 +14,34 @@ Generatorul nu considera simpla reflectare a unui marker drept dovada. Un rezult
 
 ## Cerinte
 
-- Windows 10 sau Windows 11.
+- Linux sau Windows 10/11.
 - Python 3.11 sau mai nou.
-- Docker Desktop functional pentru laboratoarele Docker.
+- Docker Engine pe Linux sau Docker Desktop pe Windows.
 - Git disponibil in `PATH`.
-- WSL si Kali Linux pentru profilele E2E care folosesc Shipyard/Kind.
+- Bash, Make si curl pentru profilele E2E care folosesc Shipyard/Kind.
+- WSL cu o distributie Kali este necesar pentru Shipyard numai pe Windows.
 - Un API key OpenAI si un model compatibil pentru generarea automata a adaptoarelor.
 - Acces legal la produs si licenta necesara pentru software closed source.
 
 ## Instalare
 
-Din PowerShell:
+Pe Kali/Debian:
+
+```bash
+sudo apt update
+sudo apt install -y docker.io docker-compose python3-venv git make curl
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"
+newgrp docker
+
+cd cvelab
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install .
+cvelab --help
+```
+
+Pe Windows, din PowerShell:
 
 ```powershell
 cd "C:\OffSec Lab\cvelab"
@@ -40,7 +57,13 @@ Daca folderul de scripturi Python nu este in `PATH`:
 
 ## Pornire rapida
 
-Comanda recomandata pentru un CVE open source este:
+Comanda recomandata pentru un CVE open source pe Linux este:
+
+```bash
+cvelab --output-root "$PWD/generated-labs" auto CVE-YYYY-NNNNN --ai on --key --model gpt-5.6-sol
+```
+
+Pe Windows:
 
 ```powershell
 cvelab --output-root "C:\OffSec Lab\cvelab\generated-labs" auto CVE-YYYY-NNNNN --ai on --key --model gpt-5.6-sol
@@ -64,7 +87,20 @@ Fluxul `auto`:
 6. Valideaza structura adaptorului inainte de Docker.
 7. Construieste si porneste laboratorul local.
 8. Executa PoC-ul si verifica efectul autentic.
-9. Scrie dovezile, walkthrough-ul si raportul final.
+9. Ruleaza automat si forma manuala a PoC-ului (`exploit` si `verify`) pe fiecare varianta.
+10. Daca build-ul, pornirea sau dovada esueaza, captureaza logurile, regenereaza adaptorul pe baza
+    cauzei observate si repeta validarea (maximum 4 incercari implicit).
+11. Scrie dovezile, walkthrough-ul si raportul final numai dupa validare.
+
+Nu este necesara interventie intre incercari. Numarul maxim poate fi schimbat, de exemplu:
+
+```bash
+cvelab --output-root "$PWD/generated-labs" auto CVE-YYYY-NNNNN \
+  --key --model gpt-5.6-sol --max-attempts 6
+```
+
+Istoricul generarii, erorilor, reparatiilor si validarilor este pastrat in
+`generated-labs/CVE-YYYY-NNNNN/automation.json`.
 
 ## CVE cu fix public
 
@@ -168,6 +204,9 @@ Fisiere importante:
 - `e2e/result.json`: rezultatul verificabil si statusurile reproducerii.
 - `e2e/`: runnerul si probele E2E specifice produsului, daca profilul le foloseste.
 - `validator/validator.py`: PoC-ul/validatorul executabil pentru adaptorul generat.
+- `artifacts/PoC.py` (sau payload-ul specific profilului): PoC-ul local inspectabil.
+- `artifacts/manual.sh`: runnerul Linux cu actiuni separate `setup`, `exploit`, `verify`, `cleanup`.
+- `artifacts/MANUAL-POC.md`: instructiunile reproducerii manuale.
 - `artifacts/EVIDENCE.json`: dovezi structurate si provenienta.
 - `artifacts/WALKTHROUGH.md`: pasii pentru reproducere manuala.
 - `artifacts/REPORT.md`: raportul tehnic, limitele si concluzia.
@@ -175,6 +214,24 @@ Fisiere importante:
 - `source/`: snapshot-urile Git folosite de laborator.
 
 Pentru reproducerea manuala se urmeaza `artifacts/WALKTHROUGH.md`. Un PoC acceptat trebuie sa contina comanda sau cererea exacta, efectul observabil si metoda de verificare. Simplul camp `ok: true` nu este suficient fara dovezile din rezultat.
+
+Pe Kali/Linux, dupa o rulare `auto` reusita:
+
+```bash
+cd generated-labs/CVE-YYYY-NNNNN/artifacts
+bash manual.sh setup vulnerable
+bash manual.sh exploit vulnerable
+bash manual.sh verify vulnerable
+bash manual.sh cleanup
+```
+
+Pentru un CVE cu fix public, aceiasi pasi se repeta cu `patched`; verdictul asteptat este
+`BLOCKED`. Pentru `VULNERABLE_ONLY_REPRODUCTION`, varianta `patched` nu este oferita.
+
+Fiecare raport foloseste acelasi contract si include nivelul de fidelitate, componentele vendor
+executate, componentele simulate, dovada bruta pentru vulnerable/patched, contractul probei si
+provenienta. `source_component` nu inseamna E2E al produsului; numai
+`product_end_to_end` impreuna cu `product_e2e_verified: true` confirma acel nivel.
 
 ## Software closed source
 
@@ -214,11 +271,29 @@ docker context show
 docker info
 ```
 
+Daca Shipyard esueaza la push catre `localhost:5000` cu `EOF` sau `connection reset`,
+verifica temporar fara VPN. Unele politici VPN blocheaza accesul daemonului Docker la
+porturile publicate si la subretelele bridge, chiar daca registry-ul este sanatos intre
+containere. Testul trebuie reluat numai dupa ce `curl http://127.0.0.1:5000/v2/` poate
+ajunge la un registry local publicat de Docker.
+
 Runnerul trateaza erorile tranzitorii cunoscute ale contextului Docker si ale socket-urilor Docker Desktop. Daca backend-ul Docker Desktop se inchide complet, laboratorul nu poate continua pana cand engine-ul este din nou disponibil.
 
 Erori precum `Dockerfile.vulnerable: no such file or directory` trebuie detectate in preflight. Un adaptor AI incomplet este respins, nu lansat partial.
 
 Cleanup-ul elimina numai resursele laboratorului curent. Proiectul nu foloseste `docker system prune --volumes` pentru curatarea normala.
+
+## Docker Engine pe Linux
+
+Runnerul Shipyard este lansat direct prin Bash si foloseste Docker Engine-ul utilizatorului
+curent. Nu sunt necesare WSL, Docker Desktop, `kubectl`, Kind sau Helm instalate separat pe
+host; uneltele Kubernetes ale profilului sunt furnizate de mediul Shipyard. Verificare:
+
+```bash
+docker version
+docker compose version
+docker info
+```
 
 ## Limite
 

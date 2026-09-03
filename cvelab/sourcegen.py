@@ -20,14 +20,36 @@ SOURCE_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "required": [
-        "cwe", "confidence", "rationale", "exploit_contract", "docker_compose",
+        "cwe", "confidence", "rationale", "fidelity", "exploit_contract", "docker_compose",
         "dockerignore", "vulnerable_dockerfile", "patched_dockerfile",
-        "validator_dockerfile", "validator_py", "adapter_files",
+        "validator_dockerfile", "validator_py", "support_services", "adapter_files",
     ],
     "properties": {
         "cwe": {"type": "string"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "rationale": {"type": "string"},
+        "fidelity": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "execution_level", "vendor_product_started",
+                "exercised_vendor_components", "simulated_components", "rationale",
+            ],
+            "properties": {
+                "execution_level": {
+                    "type": "string",
+                    "enum": ["source_component", "vendor_service", "product_end_to_end"],
+                },
+                "vendor_product_started": {"type": "boolean"},
+                "exercised_vendor_components": {
+                    "type": "array", "items": {"type": "string"},
+                },
+                "simulated_components": {
+                    "type": "array", "items": {"type": "string"},
+                },
+                "rationale": {"type": "string"},
+            },
+        },
         "exploit_contract": {
             "type": "object",
             "additionalProperties": False,
@@ -52,6 +74,11 @@ SOURCE_SCHEMA = {
         "patched_dockerfile": {"type": "string", "minLength": 1},
         "validator_dockerfile": {"type": "string", "minLength": 1},
         "validator_py": {"type": "string", "minLength": 1},
+        "support_services": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,31}$"},
+        },
         "adapter_files": {
             "type": "array",
             "maxItems": 10,
@@ -72,16 +99,16 @@ VULNERABLE_ONLY_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "required": [
-        "cwe", "confidence", "rationale", "exploit_contract", "docker_compose",
+        "cwe", "confidence", "rationale", "fidelity", "exploit_contract", "docker_compose",
         "dockerignore", "vulnerable_dockerfile", "validator_dockerfile",
-        "validator_py", "adapter_files",
+        "validator_py", "support_services", "adapter_files",
     ],
     "properties": {
         key: SOURCE_SCHEMA["properties"][key]
         for key in (
-            "cwe", "confidence", "rationale", "exploit_contract", "docker_compose",
+            "cwe", "confidence", "rationale", "fidelity", "exploit_contract", "docker_compose",
             "dockerignore", "vulnerable_dockerfile", "validator_dockerfile",
-            "validator_py", "adapter_files",
+            "validator_py", "support_services", "adapter_files",
         )
     },
 }
@@ -311,14 +338,40 @@ safe_cleanup() {
   rm -f "$OWNERSHIP_FILE"
 }
 
+record_created_resources() {
+  local network_preexisted="$1"
+  : > "$OWNERSHIP_FILE"
+  for name in cluster1-control-plane cluster2-control-plane kind-registry; do
+    resource_id="$(docker inspect --format '{{.Id}}' "$name" 2>/dev/null || true)"
+    if [[ -n "$resource_id" ]]; then
+      printf 'container|%s|%s\n' "$name" "$resource_id" >> "$OWNERSHIP_FILE"
+    fi
+  done
+  if [[ "$network_preexisted" == "false" ]]; then
+    resource_id="$(docker network inspect --format '{{.Id}}' kind 2>/dev/null || true)"
+    if [[ -n "$resource_id" ]]; then
+      printf 'network|kind|%s\n' "$resource_id" >> "$OWNERSHIP_FILE"
+    fi
+  fi
+}
+
 rm -rf "$WORK_ROOT"
 mkdir -p "$WORK_ROOT"
+# Shipyard's Dapper container mounts $HOME/.docker into /root/.docker.  Keep
+# that mount isolated so tools running as root in the container cannot leave
+# root-owned Buildx state in the invoking user's real Docker configuration.
+mkdir -p "$WORK_ROOT/runner-home"
+export HOME="$WORK_ROOT/runner-home"
 
 run_variant() {
   local variant="$1"
   local expected="$2"
   local work="$WORK_ROOT/$variant"
   local network_preexisted=false
+  # Keep the host Buildx state outside $HOME/.docker, which Dapper mounts into
+  # its root-running container. Each variant receives a fresh configuration.
+  export DOCKER_CONFIG="$WORK_ROOT/docker-config-$variant"
+  mkdir -p "$DOCKER_CONFIG"
   OWNERSHIP_FILE="$work/.cvelab-owned-resources"
   for name in cluster1-control-plane cluster2-control-plane kind-registry; do
     if docker inspect "$name" >/dev/null 2>&1; then
@@ -330,7 +383,6 @@ run_variant() {
     network_preexisted=true
   fi
   cp -a "$LAB_ROOT/source/$variant/." "$work"
-  chown -R root:root "$work"
   while IFS= read -r -d '' text_file; do
     if grep -Iq $'\r' "$text_file"; then
       sed -i 's/\r$//' "$text_file"
@@ -350,25 +402,22 @@ YAML
   git config user.email cvelab@localhost
   git add -A
   git commit -qm "CVE lab source snapshot"
+  local dapper_image="$variant:$(git branch --show-current)"
 
-  make deploy USING=wireguard
-
-  : > "$OWNERSHIP_FILE"
-  for name in cluster1-control-plane cluster2-control-plane kind-registry; do
-    resource_id="$(docker inspect --format '{{.Id}}' "$name" 2>/dev/null || true)"
-    test -n "$resource_id" || { echo "Unable to establish ownership of $name" >&2; return 4; }
-    printf 'container|%s|%s\n' "$name" "$resource_id" >> "$OWNERSHIP_FILE"
-  done
-  if [[ "$network_preexisted" == "false" ]]; then
-    resource_id="$(docker network inspect --format '{{.Id}}' kind 2>/dev/null || true)"
-    test -n "$resource_id" || { echo "Unable to establish ownership of kind network" >&2; return 4; }
-    printf 'network|kind|%s\n' "$resource_id" >> "$OWNERSHIP_FILE"
+  if ! make deploy USING=wireguard; then
+    record_created_resources "$network_preexisted"
+    return 5
   fi
+  record_created_resources "$network_preexisted"
+  test "$(wc -l < "$OWNERSHIP_FILE")" -ge 3 || {
+    echo "Unable to establish ownership of the Shipyard resources" >&2
+    return 4
+  }
 
   kubectl_tool() {
     docker run --rm --network kind \
       -v "$work:/workspace:ro" -v "$LAB_ROOT/e2e:/poc:ro" \
-      --entrypoint /usr/sbin/kubectl "$variant:master" "$@"
+      --entrypoint /usr/sbin/kubectl "$dapper_image" "$@"
   }
   local host_k1="$work/output/kubeconfigs/kind-config-cluster1"
   local host_k2="$work/output/kubeconfigs/kind-config-cluster2"
@@ -468,6 +517,12 @@ POC_FILE="$LAB_ROOT/artifacts/PoC.yaml"
 export PATH="$HOME/.local/bin:$PATH"
 OWNERSHIP_FILE="$WORK_ROOT/owned-resources"
 
+# Dapper mounts $HOME/.docker into a root-running build container.  An
+# isolated HOME prevents it from corrupting the user's Buildx state while the
+# public images used by this lab do not require registry credentials.
+mkdir -p "$WORK_ROOT/runner-home"
+export HOME="$WORK_ROOT/runner-home"
+
 safe_cleanup() {
   test -s "$OWNERSHIP_FILE" || return 0
   while IFS='|' read -r kind name expected_id; do
@@ -490,6 +545,23 @@ safe_cleanup() {
   rm -f "$OWNERSHIP_FILE"
 }
 
+record_created_resources() {
+  local network_preexisted="$1"
+  : > "$OWNERSHIP_FILE"
+  for name in cluster1-control-plane cluster2-control-plane kind-registry; do
+    resource_id="$(docker inspect --format '{{.Id}}' "$name" 2>/dev/null || true)"
+    if [[ -n "$resource_id" ]]; then
+      printf 'container|%s|%s\n' "$name" "$resource_id" >> "$OWNERSHIP_FILE"
+    fi
+  done
+  if [[ "$network_preexisted" == "false" ]]; then
+    resource_id="$(docker network inspect --format '{{.Id}}' kind 2>/dev/null || true)"
+    if [[ -n "$resource_id" ]]; then
+      printf 'network|kind|%s\n' "$resource_id" >> "$OWNERSHIP_FILE"
+    fi
+  fi
+}
+
 active_variant() {
   test -s "$STATE" || { echo "No manual lab is active. Run setup first." >&2; exit 2; }
   cat "$STATE"
@@ -499,6 +571,9 @@ prepare_source() {
   local variant="$1"
   local work="$WORK_ROOT/$variant"
   local network_preexisted=false
+  # Do not let the root-running Dapper container mount the host Buildx state.
+  export DOCKER_CONFIG="$WORK_ROOT/docker-config-$variant"
+  mkdir -p "$DOCKER_CONFIG"
   for name in cluster1-control-plane cluster2-control-plane kind-registry; do
     if docker inspect "$name" >/dev/null 2>&1; then
       echo "Refusing to start: Docker container name $name is already in use." >&2
@@ -512,7 +587,6 @@ prepare_source() {
   rm -rf "$work"
   mkdir -p "$work"
   cp -a "$LAB_ROOT/source/$variant/." "$work"
-  chown -R root:root "$work"
   while IFS= read -r -d '' text_file; do
     if grep -Iq $'\r' "$text_file"; then sed -i 's/\r$//' "$text_file"; fi
   done < <(find "$work" -type f -print0)
@@ -530,18 +604,15 @@ YAML
   git config user.email cvelab@localhost
   git add -A
   git commit -qm "CVE manual PoC source snapshot"
-  make deploy USING=wireguard
-  : > "$OWNERSHIP_FILE"
-  for name in cluster1-control-plane cluster2-control-plane kind-registry; do
-    resource_id="$(docker inspect --format '{{.Id}}' "$name" 2>/dev/null || true)"
-    test -n "$resource_id" || { echo "Unable to establish ownership of $name" >&2; return 4; }
-    printf 'container|%s|%s\n' "$name" "$resource_id" >> "$OWNERSHIP_FILE"
-  done
-  if [[ "$network_preexisted" == "false" ]]; then
-    resource_id="$(docker network inspect --format '{{.Id}}' kind 2>/dev/null || true)"
-    test -n "$resource_id" || { echo "Unable to establish ownership of kind network" >&2; return 4; }
-    printf 'network|kind|%s\n' "$resource_id" >> "$OWNERSHIP_FILE"
+  if ! make deploy USING=wireguard; then
+    record_created_resources "$network_preexisted"
+    return 5
   fi
+  record_created_resources "$network_preexisted"
+  test "$(wc -l < "$OWNERSHIP_FILE")" -ge 3 || {
+    echo "Unable to establish ownership of the Shipyard resources" >&2
+    return 4
+  }
   mkdir -p "$WORK_ROOT"
   printf '%s' "$variant" > "$STATE"
   echo "Manual $variant lab is ready and will remain running."
@@ -549,12 +620,18 @@ YAML
 }
 
 kubectl_tool() {
-  local variant work
+  local variant work branch dapper_image
   variant="$(active_variant)"
   work="$WORK_ROOT/$variant"
+  branch="$(git -C "$work" branch --show-current)"
+  dapper_image="$variant:$branch"
+  docker image inspect "$dapper_image" >/dev/null 2>&1 || {
+    echo "Missing Shipyard utility image: $dapper_image" >&2
+    return 2
+  }
   docker run --rm --network kind \
     -v "$work:/workspace:ro" -v "$LAB_ROOT:/lab:ro" \
-    --entrypoint /usr/sbin/kubectl "$variant:master" "$@"
+    --entrypoint /usr/sbin/kubectl "$dapper_image" "$@"
 }
 
 exploit() {
@@ -760,6 +837,21 @@ def _canonicalize_compose_builds(content: str, vulnerable_only: bool = False) ->
     return content
 
 
+def _canonicalize_validator_dockerfile(content: str) -> str:
+    """Make validator COPY sources relative to its isolated ./validator context."""
+    replacements = {
+        "COPY validator/validator.py ": "COPY validator.py ",
+        "COPY ./validator/validator.py ": "COPY validator.py ",
+        "COPY adapter/validator.py ": "COPY validator.py ",
+        '"validator/validator.py"': '"validator.py"',
+        '"./validator/validator.py"': '"validator.py"',
+        '"adapter/validator.py"': '"validator.py"',
+    }
+    for source, target in replacements.items():
+        content = content.replace(source, target)
+    return content
+
+
 def _validate_generated(files: list[dict], vulnerable_only: bool = False) -> None:
     paths = {item["path"].replace("\\", "/") for item in files}
     required = {
@@ -787,6 +879,13 @@ def _validate_generated(files: list[dict], vulnerable_only: bool = False) -> Non
                 raise RuntimeError(
                     f"Generated Gradle Dockerfile must normalize Windows CRLF before execution: {path}"
                 )
+        if path == "validator/Dockerfile" and re.search(
+            r"(?mi)^\s*COPY\s+(?:\./)?(?:validator|adapter)/validator\.py\s+",
+            item["content"],
+        ):
+            raise RuntimeError(
+                "Validator Dockerfile COPY source must be relative to the ./validator build context"
+            )
         if path == "docker-compose.yml":
             if "internal: true" not in lowered:
                 raise RuntimeError("Compose network must be internal")
@@ -819,6 +918,17 @@ def _validate_generated(files: list[dict], vulnerable_only: bool = False) -> Non
                 raise RuntimeError(
                     "Validator must emit nested vulnerable/patched evidence with confirmed and blocked fields"
                 )
+            manual_contract = {
+                "CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "exploit", "verify",
+            }
+            missing_manual = {
+                field for field in manual_contract if field not in item["content"]
+            }
+            if missing_manual:
+                raise RuntimeError(
+                    "Validator is missing the manual PoC contract: "
+                    + ", ".join(sorted(missing_manual))
+                )
             if re.search(
                 r"['\"](?:attack_executed|confirmed|differential_confirmed)['\"]\s*:\s*True\b",
                 item["content"],
@@ -830,6 +940,32 @@ def _validate_generated(files: list[dict], vulnerable_only: bool = False) -> Non
                     allowed_hosts.add("patched")
                 if url not in allowed_hosts:
                     raise RuntimeError(f"Validator external target rejected: {url}")
+
+
+def _validate_fidelity(fidelity: dict) -> None:
+    level = fidelity.get("execution_level")
+    product_started = fidelity.get("vendor_product_started")
+    exercised = fidelity.get("exercised_vendor_components")
+    simulated = fidelity.get("simulated_components")
+    if level == "source_component" and product_started is not False:
+        raise RuntimeError("source_component fidelity cannot claim that the vendor product started")
+    if level == "vendor_service" and product_started is not True:
+        raise RuntimeError("vendor_service fidelity requires the actual vendor product to start")
+    if level == "product_end_to_end" and product_started is not True:
+        raise RuntimeError("product_end_to_end fidelity requires the actual vendor product to start")
+    if not isinstance(exercised, list) or not exercised:
+        raise RuntimeError("Fidelity must name at least one exercised vendor component")
+    if not isinstance(simulated, list):
+        raise RuntimeError("Fidelity simulated_components must be a list")
+
+
+def _validate_support_services(services: list[str], compose: str) -> None:
+    reserved = {"vulnerable", "patched", "validator"}
+    if len(services) != len(set(services)) or reserved.intersection(services):
+        raise RuntimeError("Support service names must be unique and cannot use reserved names")
+    for service in services:
+        if not re.search(rf"(?m)^  {re.escape(service)}:\s*$", compose):
+            raise RuntimeError(f"Compose support service is missing: {service}")
 
 
 def _generate_curated_lighthouse(
@@ -929,7 +1065,11 @@ networks:
         "repository": repo_url,
         "revisions": {"vulnerable": vulnerable, "patched": fixed},
         "source_provenance": CURATED_SOURCES[cve]["provenance"],
-        "runner": {"type": "wsl_shipyard", "distribution": "kali-linux", "script": "e2e/run.sh"},
+        "runner": {
+            "type": "shipyard",
+            "distribution": "kali-linux",
+            "script": "e2e/run.sh",
+        },
         "safety": {
             "target_scope": "ephemeral_local_kind_clusters_only",
             "payload": "non_destructive_endpointslice_namespace_injection",
@@ -940,6 +1080,20 @@ networks:
             "preconditions": ["Attacker controls one spoke cluster in the disposable local cluster set"],
             "observable_effect": "The peer cluster contains the attacker-created EndpointSlice in kube-system.",
             "evidence_type": "authorization_bypass",
+        },
+        "fidelity": {
+            "execution_level": "product_end_to_end",
+            "vendor_product_started": True,
+            "exercised_vendor_components": [
+                "upstream Lighthouse agent",
+                "upstream Lighthouse broker",
+                "Kubernetes API",
+            ],
+            "simulated_components": [],
+            "rationale": (
+                "The recorded upstream revisions run through the real two-cluster "
+                "agent and broker flow."
+            ),
         },
         "generation": {"model": None, "confidence": 1.0, "rationale": "Deterministic curated upstream two-cluster E2E profile"},
     }
@@ -1049,8 +1203,16 @@ def generate_source_lab(
                 "set to security_effect_observed, observable_effect, evidence_type, vulnerable as an object with a "
                 "computed confirmed field and raw observations, patched_tested set to false, differential_confirmed "
                 "set to false, and fix_status set to PUBLIC_FIX_NOT_IDENTIFIED. Exit zero only when the vulnerable "
-                "security effect is genuinely observed. Never hard-code attack_executed or vulnerable.confirmed. A "
-                f"harmless canary ({marker}) may identify affected data. No reverse shells, callbacks, persistence, "
+                "security effect is genuinely observed. Never hard-code attack_executed or vulnerable.confirmed. "
+                "The validator must also implement manual mode selected with CVELAB_MANUAL_ACTION and CVELAB_TARGET. "
+                "Action exploit executes the exact attack against target vulnerable and prints its raw observation; "
+                "action verify independently evaluates that target and prints REPRODUCED only when confirmed. With "
+                "neither variable set it must retain automatic JSON validation. Populate fidelity honestly: choose "
+                "source_component when an adapter invokes selected vendor code, vendor_service when the actual vendor "
+                "service/binary starts, or product_end_to_end only when the complete security-relevant request path "
+                "runs through the real product. List every simulated policy, peer, backend, or downstream component. "
+                "List every additional Compose dependency in support_services so the runner builds and starts it. "
+                f"A harmless canary ({marker}) may identify affected data. No reverse shells, callbacks, persistence, "
                 "credential access, destructive operations, Docker socket, privileged mode, capabilities, or remote "
                 "target option. If command execution is intrinsic, restrict it to a canary file inside the vulnerable "
                 "container. Normalize CRLF for copied scripts. Source archives contain no .git directory, so initialize "
@@ -1068,11 +1230,16 @@ def generate_source_lab(
             },
             {"path": ".dockerignore", "content": generation["dockerignore"]},
             {"path": "vulnerable/Dockerfile", "content": generation["vulnerable_dockerfile"]},
-            {"path": "validator/Dockerfile", "content": generation["validator_dockerfile"]},
+            {
+                "path": "validator/Dockerfile",
+                "content": _canonicalize_validator_dockerfile(generation["validator_dockerfile"]),
+            },
             {"path": "validator/validator.py", "content": generation["validator_py"]},
             *generation["adapter_files"],
         ]
         _validate_generated(generated_files, vulnerable_only=True)
+        _validate_fidelity(generation["fidelity"])
+        _validate_support_services(generation["support_services"], generation["docker_compose"])
         lab_dir = output_root.resolve() / cve
         _snapshot(repository, vulnerable, lab_dir / "source" / "vulnerable")
         for item in generated_files:
@@ -1086,7 +1253,7 @@ def generate_source_lab(
             "revisions": {"vulnerable": vulnerable, "patched": None},
             "fix_status": "PUBLIC_FIX_NOT_IDENTIFIED",
             "patched_tested": False,
-            "startup_services": ["vulnerable"],
+            "startup_services": [*generation["support_services"], "vulnerable"],
             "source_provenance": "Public vulnerable source resolved from CVE discovery or explicit override",
             "safety": {
                 "target_scope": "internal_docker_network_only",
@@ -1094,6 +1261,7 @@ def generate_source_lab(
                 "limitations": "No public fixed revision was identified; remediation behavior was not tested.",
             },
             "exploit_contract": generation["exploit_contract"],
+            "fidelity": generation["fidelity"],
             "generation": {
                 "model": model,
                 "confidence": generation["confidence"],
@@ -1136,8 +1304,18 @@ def generate_source_lab(
             "patched. vulnerable and patched must each be JSON objects. vulnerable.confirmed is true only when "
             "the security effect is observed. patched.confirmed is false and patched.blocked is true only when "
             "the same attack is demonstrably blocked. Include raw observations in those objects. Never hard-code "
-            "a successful result. A harmless canary marker "
-            f"({marker}) may identify affected data, but marker reflection alone is not proof. No reverse shells, callbacks, persistence, "
+            "a successful result. The validator must also implement manual mode using CVELAB_MANUAL_ACTION and "
+            "CVELAB_TARGET. Action exploit sends the exact attack only to the selected vulnerable or patched service "
+            "and prints its raw observation. Action verify independently evaluates that target and prints REPRODUCED "
+            "for a confirmed vulnerable target or BLOCKED for a confirmed patched target. With neither variable set, "
+            "retain automatic differential JSON validation. Prefer running the actual vendor service or binary whenever "
+            "the repository permits it. Populate fidelity honestly: choose source_component when only selected vendor "
+            "functions are wrapped, vendor_service when the actual vendor service/binary starts but part of the "
+            "security path is simulated, or product_end_to_end only when the complete security-relevant request path "
+            "runs through the real product. List every simulated authorization, routing, backend, peer, or downstream "
+            "component. "
+            "List every additional Compose dependency in support_services so the runner builds and starts it. "
+            f"A harmless canary marker ({marker}) may identify affected data, but marker reflection alone is not proof. No reverse shells, callbacks, persistence, "
             "credential access, destructive operations, Docker socket, privileged mode, extra capabilities, or "
             "remote target option. If command execution is intrinsic to the CVE, restrict it to creating a canary "
             "file inside the vulnerable container and verify that file as the observable effect. Dockerfiles may install build dependencies from normal package "
@@ -1161,11 +1339,16 @@ def generate_source_lab(
         {"path": ".dockerignore", "content": generation["dockerignore"]},
         {"path": "vulnerable/Dockerfile", "content": generation["vulnerable_dockerfile"]},
         {"path": "patched/Dockerfile", "content": generation["patched_dockerfile"]},
-        {"path": "validator/Dockerfile", "content": generation["validator_dockerfile"]},
+        {
+            "path": "validator/Dockerfile",
+            "content": _canonicalize_validator_dockerfile(generation["validator_dockerfile"]),
+        },
         {"path": "validator/validator.py", "content": generation["validator_py"]},
         *generation["adapter_files"],
     ]
     _validate_generated(generated_files)
+    _validate_fidelity(generation["fidelity"])
+    _validate_support_services(generation["support_services"], generation["docker_compose"])
 
     lab_dir = output_root.resolve() / cve
     _snapshot(repository, vulnerable, lab_dir / "source" / "vulnerable")
@@ -1175,18 +1358,23 @@ def generate_source_lab(
     plan = {
         "cve": cve,
         "cwe": generation["cwe"],
-        "lab_type": "SOURCE_REPRODUCTION",
+        "lab_type": (
+            "END_TO_END_REPRODUCTION"
+            if generation["fidelity"]["execution_level"] == "product_end_to_end"
+            else "SOURCE_REPRODUCTION"
+        ),
         "marker": marker,
         "repository": repo_url,
         "revisions": {"vulnerable": vulnerable, "patched": fixed},
         "source_provenance": curated.get("provenance") if curated else "CVE reference or explicit user override",
-        "startup_services": ["vulnerable", "patched"],
+        "startup_services": [*generation["support_services"], "vulnerable", "patched"],
         "safety": {
             "target_scope": "internal_docker_network_only",
             "payload": "non_destructive_exploit_canary",
             "limitations": "Generated from a public security patch; validation is required before claiming reproduction.",
         },
         "exploit_contract": generation["exploit_contract"],
+        "fidelity": generation["fidelity"],
         "generation": {
             "model": model,
             "confidence": generation["confidence"],
@@ -1197,3 +1385,176 @@ def generate_source_lab(
     write_text(lab_dir / "plan.json", json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
     write_text(lab_dir / "validator" / "plan.json", json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
     return {"ok": True, "status": "GENERATED_UNVALIDATED", "lab_dir": str(lab_dir), "plan": plan}
+
+
+def _repair_material(lab_dir: Path) -> dict[str, str]:
+    """Return only generated adapter inputs, never the vendor source snapshots."""
+    candidates = [
+        lab_dir / "docker-compose.yml",
+        lab_dir / ".dockerignore",
+        lab_dir / "vulnerable" / "Dockerfile",
+        lab_dir / "patched" / "Dockerfile",
+        lab_dir / "validator" / "Dockerfile",
+        lab_dir / "validator" / "validator.py",
+    ]
+    adapter_dir = lab_dir / "adapter"
+    if adapter_dir.is_dir():
+        candidates.extend(sorted(path for path in adapter_dir.iterdir() if path.is_file()))
+    material = {}
+    for path in candidates:
+        if not path.is_file():
+            continue
+        relative = path.relative_to(lab_dir).as_posix()
+        if ALLOWED_GENERATED.fullmatch(relative):
+            material[relative] = path.read_text(encoding="utf-8", errors="replace")[:30000]
+    return material
+
+
+def repair_source_lab(
+    cve_value: str,
+    output_root: Path,
+    failure: dict,
+    attempt: int,
+    api_key: str | None,
+    model: str | None,
+) -> dict:
+    """Regenerate a failed source adapter using its observed runtime diagnostics."""
+    cve = normalize_cve(cve_value)
+    lab_dir = output_root.resolve() / cve
+    plan_path = lab_dir / "plan.json"
+    dossier_path = lab_dir / "dossier.json"
+    if not plan_path.is_file() or not dossier_path.is_file():
+        raise RuntimeError("Automatic repair requires an existing generated source lab")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    if plan.get("runner"):
+        raise RuntimeError("Curated runners are deterministic and cannot be AI-repaired")
+    dossier = json.loads(dossier_path.read_text(encoding="utf-8"))
+    repo_url = plan.get("repository")
+    revisions = plan.get("revisions", {})
+    vulnerable = revisions.get("vulnerable")
+    fixed = revisions.get("patched")
+    if not repo_url or not vulnerable:
+        raise RuntimeError("Automatic repair is missing repository provenance")
+    cache_key = hashlib.sha256(repo_url.encode()).hexdigest()[:16]
+    repository = output_root.resolve() / ".source-cache" / cache_key
+    if not repository.is_dir():
+        raise RuntimeError(f"Automatic repair source cache is missing: {repository}")
+
+    vulnerable_only = fixed is None
+    context = _source_context(repository, vulnerable, fixed or vulnerable, dossier)
+    diagnostic = json.dumps(failure, ensure_ascii=True, indent=2)[:40000]
+    current = json.dumps(_repair_material(lab_dir), ensure_ascii=True, indent=2)[:100000]
+    variant_contract = (
+        "This is vulnerable-only: do not create a patched image or service. Emit patched_tested=false, "
+        "differential_confirmed=false, and fix_status=PUBLIC_FIX_NOT_IDENTIFIED."
+        if vulnerable_only
+        else
+        "Test the identical attack against vulnerable and patched services. Success requires the effect on "
+        "vulnerable, its absence on patched, patched.blocked=true, and differential_confirmed=true."
+    )
+    generation = structured_response(
+        api_key=api_key,
+        model=model,
+        schema=VULNERABLE_ONLY_SCHEMA if vulnerable_only else SOURCE_SCHEMA,
+        schema_name="cvelab_autonomous_adapter_repair",
+        max_output_tokens=16000,
+        instructions=(
+            "Repair the complete adapter for an authorized local-only defensive CVE lab. The observed failure and "
+            "container logs are authoritative: identify their root cause and return a full replacement, not a patch. "
+            "Do not repeat the failing design when the diagnostics disprove it. Build and run the supplied immutable "
+            "vendor source snapshots; never modify or return vendor source. Prefer the actual vendor service or binary. "
+            "Use source_component only if launching the product is genuinely impractical, vendor_service when the real "
+            "service starts with simulated surrounding components, and product_end_to_end only when the complete "
+            "security-relevant product path executes. Disclose every simulated component. Compose must use an internal "
+            "network, no host ports or mounts, services named vulnerable, patched where applicable, and validator, and "
+            "list all extra services in support_services. Run containers non-root with no-new-privileges. The automatic "
+            "validator must perform the attack, derive its booleans from raw observations, print one JSON document with "
+            "attack_executed, proof_quality=security_effect_observed, observable_effect, evidence_type, vulnerable, and "
+            "the required comparison fields, and exit zero only on genuine proof. It must also support independently "
+            "runnable CVELAB_MANUAL_ACTION=exploit|verify and CVELAB_TARGET=vulnerable|patched modes; exploit prints raw "
+            "evidence and verify prints REPRODUCED or BLOCKED only after evaluating a fresh request. Never hard-code a "
+            "successful result or treat canary reflection alone as proof. Preserve the exploit contract unless runtime "
+            "evidence shows it is technically wrong. No remote target option, callbacks, reverse shells, persistence, "
+            "credential access, destructive operations, Docker socket, privileged mode, or extra capabilities. "
+            + variant_contract
+        ),
+        input_text=(
+            context
+            + "\n\n--- FAILED ADAPTER ---\n"
+            + current
+            + "\n\n--- OBSERVED FAILURE (AUTOMATIC ATTEMPT "
+            + str(attempt)
+            + ") ---\n"
+            + diagnostic
+        ),
+    )
+    compose = _canonicalize_compose_builds(
+        generation["docker_compose"], vulnerable_only=vulnerable_only
+    )
+    generated_files = [
+        {"path": "docker-compose.yml", "content": compose},
+        {"path": ".dockerignore", "content": generation["dockerignore"]},
+        {"path": "vulnerable/Dockerfile", "content": generation["vulnerable_dockerfile"]},
+        {
+            "path": "validator/Dockerfile",
+            "content": _canonicalize_validator_dockerfile(generation["validator_dockerfile"]),
+        },
+        {"path": "validator/validator.py", "content": generation["validator_py"]},
+    ]
+    if not vulnerable_only:
+        generated_files.insert(
+            3,
+            {"path": "patched/Dockerfile", "content": generation["patched_dockerfile"]},
+        )
+    generated_files.extend(generation["adapter_files"])
+    _validate_generated(generated_files, vulnerable_only=vulnerable_only)
+    _validate_fidelity(generation["fidelity"])
+    _validate_support_services(generation["support_services"], compose)
+
+    new_paths = {item["path"].replace("\\", "/") for item in generated_files}
+    adapter_dir = lab_dir / "adapter"
+    if adapter_dir.is_dir():
+        for old_file in adapter_dir.iterdir():
+            relative = old_file.relative_to(lab_dir).as_posix()
+            if old_file.is_file() and ALLOWED_GENERATED.fullmatch(relative) and relative not in new_paths:
+                old_file.unlink()
+    for item in generated_files:
+        write_text(lab_dir / item["path"], item["content"])
+
+    history = plan.get("generation", {}).get("repair_history", [])
+    history.append({
+        "attempt": attempt,
+        "model": model or os.getenv("CVELAB_MODEL"),
+        "failure": diagnostic[:8000],
+        "confidence": generation["confidence"],
+        "rationale": generation["rationale"],
+    })
+    plan["cwe"] = generation["cwe"]
+    if not vulnerable_only:
+        plan["lab_type"] = (
+            "END_TO_END_REPRODUCTION"
+            if generation["fidelity"]["execution_level"] == "product_end_to_end"
+            else "SOURCE_REPRODUCTION"
+        )
+    plan["startup_services"] = [
+        *generation["support_services"], "vulnerable",
+        *([] if vulnerable_only else ["patched"]),
+    ]
+    plan["exploit_contract"] = generation["exploit_contract"]
+    plan["fidelity"] = generation["fidelity"]
+    plan["generation"] = {
+        **plan.get("generation", {}),
+        "model": model or os.getenv("CVELAB_MODEL"),
+        "confidence": generation["confidence"],
+        "rationale": generation["rationale"],
+        "repair_history": history,
+    }
+    write_text(plan_path, json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
+    write_text(lab_dir / "validator" / "plan.json", json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
+    return {
+        "ok": True,
+        "status": "REPAIRED_UNVALIDATED",
+        "attempt": attempt,
+        "lab_dir": str(lab_dir),
+        "plan": plan,
+    }
