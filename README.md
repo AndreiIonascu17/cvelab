@@ -4,6 +4,13 @@
 
 Generatorul nu considera simpla reflectare a unui marker drept dovada. Un rezultat reusit trebuie sa demonstreze efectul vulnerabilitatii asupra artefactului real vulnerabil.
 
+## Documentatie
+
+- [Ghid complet de instalare si utilizare](GUIDE.md)
+- [Bundle si instalare Linux](linux/README.md)
+
+Linux nativ este platforma recomandata. Windows ramane suportat prin Docker Desktop sau prin fallback-ul Docker Engine din Kali WSL.
+
 ## Rezultate posibile
 
 - `SOURCE_REPRODUCTION`: versiunea vulnerabila si versiunea reparata sunt reproduse; testul reuseste pe vulnerabil si este respins pe patched.

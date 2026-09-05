@@ -703,16 +703,27 @@ def _run_git(arguments: list[str], cwd: Path | None = None, binary: bool = False
     git = shutil.which("git")
     if not git:
         raise RuntimeError("Git was not found")
+    text_options = (
+        {"text": False}
+        if binary
+        else {"text": True, "encoding": "utf-8", "errors": "replace"}
+    )
     completed = subprocess.run(
         [git, *arguments],
         cwd=cwd,
         capture_output=True,
-        text=not binary,
+        **text_options,
     )
     if completed.returncode:
-        error = completed.stderr if not binary else completed.stderr.decode(errors="replace")
+        error = (
+            completed.stderr or ""
+            if not binary
+            else (completed.stderr or b"").decode("utf-8", errors="replace")
+        )
         raise RuntimeError(f"git {' '.join(arguments[:3])} failed: {error.strip()}")
-    return completed.stdout
+    if completed.stdout is not None:
+        return completed.stdout
+    return b"" if binary else ""
 
 
 def _safe_repo_url(value: str) -> str:
@@ -754,7 +765,9 @@ def discover_source_with_openai(dossier: dict, api_key: str | None, model: str |
             "vendor advisory, upstream repository, GitHub/GitLab advisory, release notes, package registry, and "
             "exact fixing commits. SOURCE_READY requires a public HTTPS GitHub or GitLab repository and an exact "
             "immutable fixing commit supported by evidence; provide its parent or an evidenced affected commit as "
-            "vulnerable_ref. VULNERABLE_ONLY requires an exact evidenced affected tag or commit but no public fix. "
+            "vulnerable_ref. VULNERABLE_ONLY requires an exact evidenced affected tag or commit but no exact public "
+            "fix. If an affected revision is evidenced but the fixing commit is absent or ambiguous, you MUST return "
+            "VULNERABLE_ONLY even when an advisory names a patched release. "
             "Use VENDOR_ARTIFACT_REQUIRED for proprietary products, appliances, operating systems, licensed "
             "installers, or authenticated downloads. Never invent URLs, versions, repositories, commit hashes, "
             "patches, or exploit details. If provenance is ambiguous, return INSUFFICIENT_DATA. Do not produce a "
@@ -1152,7 +1165,9 @@ def generate_source_lab(
             "status": "ARTIFACT_REQUIRED",
             "cve": cve,
             "reason": discovery["rationale"] if discovery else "No public source repository and fixed commit were found.",
-            "required": ["Verified public repository and immutable affected/fixed revisions"],
+            "required": [
+                "Verified public repository and immutable affected revision; fixed revision when available"
+            ],
             "evidence_urls": discovery.get("evidence_urls", []) if discovery else [],
         }
     vulnerable_only = resolved is None
