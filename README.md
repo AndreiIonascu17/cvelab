@@ -1,38 +1,38 @@
 # CVELab
 
-`cvelab` genereaza si ruleaza laboratoare locale pentru validarea reproductibila a vulnerabilitatilor descrise de un CVE. Utilizatorul furnizeaza CVE-ul, iar aplicatia incearca sa rezolve sursele publice, sa construiasca mediul, sa execute un PoC sigur si sa produca dovezi, un walkthrough si un raport.
+`cvelab` generates and runs local labs for reproducible validation of vulnerabilities described by a CVE. The user supplies a CVE identifier, and the application attempts to resolve public sources, build the environment, execute a safe proof of concept (PoC), and produce evidence, a walkthrough, and a report.
 
-Generatorul nu considera simpla reflectare a unui marker drept dovada. Un rezultat reusit trebuie sa demonstreze efectul vulnerabilitatii asupra artefactului real vulnerabil.
+The generator does not treat a reflected marker alone as proof. A successful result must demonstrate the vulnerability's effect on the actual vulnerable artifact.
 
-## Documentatie
+## Documentation
 
-- [Ghid complet de instalare si utilizare](GUIDE.md)
-- [Bundle si instalare Linux](linux/README.md)
+- [Complete installation and usage guide](GUIDE.md)
+- [Linux bundle and installation](linux/README.md)
 
-Linux nativ este platforma recomandata. Windows ramane suportat prin Docker Desktop sau prin fallback-ul Docker Engine din Kali WSL.
+Native Linux is the recommended platform. Windows remains supported through Docker Desktop or the Docker Engine fallback in Kali WSL.
 
-## Rezultate posibile
+## Possible outcomes
 
-- `SOURCE_REPRODUCTION`: versiunea vulnerabila si versiunea reparata sunt reproduse; testul reuseste pe vulnerabil si este respins pe patched.
-- `VULNERABLE_ONLY_REPRODUCTION`: versiunea vulnerabila este validata, dar nu exista un fix public identificabil. Nu este inventata o versiune patched.
-- `CLOSED_SOURCE_REPRODUCTION`: foloseste numai un artefact proprietar obtinut legal si inregistrat local.
-- `ARTIFACT_REQUIRED`: lipsesc codul, imaginea sau binarul necesar unei reproduceri fidele.
-- `POC_NOT_GENERATED`: informatiile disponibile nu sunt suficiente pentru o dovada reala si verificabila.
+- `SOURCE_REPRODUCTION`: both vulnerable and fixed versions are reproduced; the test succeeds against the vulnerable version and is blocked by the patched version.
+- `VULNERABLE_ONLY_REPRODUCTION`: the vulnerable version is validated, but no public fix can be identified. A patched version is not fabricated.
+- `CLOSED_SOURCE_REPRODUCTION`: uses only a legally obtained proprietary artifact registered locally.
+- `ARTIFACT_REQUIRED`: the source code, image, or binary needed for a faithful reproduction is missing.
+- `POC_NOT_GENERATED`: the available information is insufficient for real, verifiable proof.
 
-## Cerinte
+## Requirements
 
-- Linux sau Windows 10/11.
-- Python 3.11 sau mai nou.
-- Docker Engine pe Linux sau Docker Desktop pe Windows.
-- Git disponibil in `PATH`.
-- Bash, Make si curl pentru profilele E2E care folosesc Shipyard/Kind.
-- WSL cu o distributie Kali este necesar pentru Shipyard numai pe Windows.
-- Un API key OpenAI si un model compatibil pentru generarea automata a adaptoarelor.
-- Acces legal la produs si licenta necesara pentru software closed source.
+- Linux or Windows 10/11.
+- Python 3.11 or newer.
+- Docker Engine on Linux or Docker Desktop on Windows.
+- Git available in `PATH`.
+- Bash, Make, and curl for E2E profiles that use Shipyard/Kind.
+- WSL with a Kali distribution is required for Shipyard only on Windows.
+- An OpenAI API key and a compatible model for automatic adapter generation.
+- Legal access to the product and any required license for closed-source software.
 
-## Instalare
+## Installation
 
-Pe Kali/Debian:
+On Kali/Debian:
 
 ```bash
 sudo apt update
@@ -48,7 +48,7 @@ python -m pip install .
 cvelab --help
 ```
 
-Pe Windows, din PowerShell:
+On Windows, from PowerShell:
 
 ```powershell
 cd "C:\OffSec Lab\cvelab"
@@ -56,62 +56,62 @@ py -m pip install .
 cvelab --help
 ```
 
-Daca folderul de scripturi Python nu este in `PATH`:
+If the Python scripts directory is not in `PATH`:
 
 ```powershell
 & "$env:LOCALAPPDATA\Programs\Python\Python313\Scripts\cvelab.exe" --help
 ```
 
-## Pornire rapida
+## Quick start
 
-Comanda recomandata pentru un CVE open source pe Linux este:
+The recommended command for an open-source CVE on Linux is:
 
 ```bash
 cvelab --output-root "$PWD/generated-labs" auto CVE-YYYY-NNNNN --ai on --key --model gpt-5.6-sol
 ```
 
-Pe Windows:
+On Windows:
 
 ```powershell
 cvelab --output-root "C:\OffSec Lab\cvelab\generated-labs" auto CVE-YYYY-NNNNN --ai on --key --model gpt-5.6-sol
 ```
 
-Optiunea `--key` fara o valoare dupa ea deschide promptul mascat `OpenAI API key:`. Cheia nu este scrisa in proiect si nu apare in linia de comanda.
+The `--key` option without a value opens the masked `OpenAI API key:` prompt. The key is not written to the project or included in the command line.
 
-Exemplu:
+Example:
 
 ```powershell
 cvelab --output-root "C:\OffSec Lab\cvelab\generated-labs" auto CVE-2026-47342 --ai on --key --model gpt-5.6-sol
 ```
 
-Fluxul `auto`:
+The `auto` workflow:
 
-1. Colecteaza metadatele publice despre CVE.
-2. Identifica repository-ul si referinta vulnerabila.
-3. Identifica fixul public, daca exista.
-4. Obtine snapshot-urile de cod necesare.
-5. Genereaza un adaptor specific produsului.
-6. Valideaza structura adaptorului inainte de Docker.
-7. Construieste si porneste laboratorul local.
-8. Executa PoC-ul si verifica efectul autentic.
-9. Ruleaza automat si forma manuala a PoC-ului (`exploit` si `verify`) pe fiecare varianta.
-10. Daca build-ul, pornirea sau dovada esueaza, captureaza logurile, regenereaza adaptorul pe baza
-    cauzei observate si repeta validarea (maximum 4 incercari implicit).
-11. Scrie dovezile, walkthrough-ul si raportul final numai dupa validare.
+1. Collects public CVE metadata.
+2. Identifies the repository and vulnerable revision.
+3. Identifies the public fix, if available.
+4. Obtains the required source snapshots.
+5. Generates a product-specific adapter.
+6. Validates the adapter's structure before running Docker.
+7. Builds and starts the local lab.
+8. Executes the PoC and verifies the actual effect.
+9. Automatically runs the manual PoC actions (`exploit` and `verify`) against each variant as well.
+10. If the build, startup, or proof fails, captures logs, regenerates the adapter based on
+    the observed cause, and repeats validation (up to 4 attempts by default).
+11. Writes the evidence, walkthrough, and final report only after validation.
 
-Nu este necesara interventie intre incercari. Numarul maxim poate fi schimbat, de exemplu:
+No intervention is required between attempts. To change the maximum number of attempts:
 
 ```bash
 cvelab --output-root "$PWD/generated-labs" auto CVE-YYYY-NNNNN \
   --key --model gpt-5.6-sol --max-attempts 6
 ```
 
-Istoricul generarii, erorilor, reparatiilor si validarilor este pastrat in
+The history of generation, errors, repairs, and validation is saved in
 `generated-labs/CVE-YYYY-NNNNN/automation.json`.
 
-## CVE cu fix public
+## CVEs with a public fix
 
-Cand sunt disponibile versiunea vulnerabila si fixul, rezultatul asteptat este diferential:
+When both the vulnerable version and the fix are available, the expected result is differential:
 
 ```json
 {
@@ -122,30 +122,30 @@ Cand sunt disponibile versiunea vulnerabila si fixul, rezultatul asteptat este d
 }
 ```
 
-Aceasta inseamna ca acelasi caz de test a demonstrat efectul pe versiunea vulnerabila si absenta efectului pe versiunea reparata.
+This means the same test case demonstrated the effect on the vulnerable version and its absence on the fixed version.
 
-Referintele pot fi furnizate explicit:
-
-```powershell
-cvelab --output-root "C:\OffSec Lab\cvelab\generated-labs" auto CVE-YYYY-NNNNN `
-  --repo https://github.com/owner/project.git `
-  --vulnerable-ref <commit-vulnerabil> `
-  --fixed-ref <commit-fix> `
-  --ai on --key --model gpt-5.6-sol
-```
-
-## CVE fara fix public
-
-Aceeasi comanda `auto` poate produce un PoC real numai pe versiunea vulnerabila atunci cand sursa vulnerabila este disponibila, dar nu a fost publicat sau identificat un fix. Generatorul nu cere artificial `--fixed-ref` si nu creeaza un serviciu patched sintetic.
+References can be provided explicitly:
 
 ```powershell
 cvelab --output-root "C:\OffSec Lab\cvelab\generated-labs" auto CVE-YYYY-NNNNN `
   --repo https://github.com/owner/project.git `
-  --vulnerable-ref <commit-vulnerabil> `
+  --vulnerable-ref <vulnerable-commit> `
+  --fixed-ref <fix-commit> `
   --ai on --key --model gpt-5.6-sol
 ```
 
-Un rezultat reusit fara fix indica:
+## CVEs without a public fix
+
+The same `auto` command can produce a real PoC against only the vulnerable version when vulnerable source code is available but no fix has been published or identified. The generator does not unnecessarily require `--fixed-ref` or create a synthetic patched service.
+
+```powershell
+cvelab --output-root "C:\OffSec Lab\cvelab\generated-labs" auto CVE-YYYY-NNNNN `
+  --repo https://github.com/owner/project.git `
+  --vulnerable-ref <vulnerable-commit> `
+  --ai on --key --model gpt-5.6-sol
+```
+
+A successful result without a fix indicates:
 
 ```json
 {
@@ -157,72 +157,72 @@ Un rezultat reusit fara fix indica:
 }
 ```
 
-Acesta este un PoC al vulnerabilitatii, dar nu este o validare a remedierii. Raportul pastreaza aceasta limitare si nu afirma ca exista o versiune reparata.
+This is a proof of the vulnerability, but it does not validate remediation. The report retains this limitation and does not claim that a fixed version exists.
 
-## Comenzi principale
+## Main commands
 
-| Comanda | Rol |
+| Command | Purpose |
 | --- | --- |
-| `auto` | Rezolva informatiile, construieste laboratorul, ruleaza PoC-ul si produce livrabilele. |
-| `run` | Ruleaza din nou un laborator deja generat. |
-| `source` | Genereaza un laborator source-level folosind referinte Git explicite. |
-| `source-all` | Genereaza si ruleaza laboratorul source-level. |
-| `build` | Genereaza un laborator de clasa CWE; nu este un PoC real al produsului. |
-| `all` | Genereaza si ruleaza laboratorul de clasa CWE. |
-| `closed-auto` | Rezolva cerintele unui produs closed source si foloseste un artefact local inregistrat. |
-| `closed` | Construieste reproducerea closed source din catalog. |
+| `auto` | Resolves information, builds the lab, runs the PoC, and produces deliverables. |
+| `run` | Runs a previously generated lab again. |
+| `source` | Generates a source-level lab using explicit Git references. |
+| `source-all` | Generates and runs the source-level lab. |
+| `build` | Generates a CWE-class lab; this is not a real product PoC. |
+| `all` | Generates and runs the CWE-class lab. |
+| `closed-auto` | Resolves requirements for a closed-source product and uses a registered local artifact. |
+| `closed` | Builds the closed-source reproduction from the catalog. |
 
-Rularea din nou a unui laborator:
+Run an existing lab again:
 
 ```powershell
 cvelab --output-root "C:\OffSec Lab\cvelab\generated-labs" run CVE-YYYY-NNNNN
 ```
 
-Generare source-level explicita:
+Generate a source-level lab explicitly:
 
 ```powershell
 cvelab source CVE-YYYY-NNNNN `
   --repo https://github.com/owner/project.git `
-  --vulnerable-ref <commit-vulnerabil> `
-  --fixed-ref <commit-fix> `
+  --vulnerable-ref <vulnerable-commit> `
+  --fixed-ref <fix-commit> `
   --ai on --key --model gpt-5.6-sol
 ```
 
-Generare si rulare intr-o singura comanda:
+Generate and run in a single command:
 
 ```powershell
 cvelab source-all CVE-YYYY-NNNNN `
   --repo https://github.com/owner/project.git `
-  --vulnerable-ref <commit-vulnerabil> `
-  --fixed-ref <commit-fix> `
+  --vulnerable-ref <vulnerable-commit> `
+  --fixed-ref <fix-commit> `
   --ai on --key --model gpt-5.6-sol
 ```
 
-## Livrabile
+## Deliverables
 
-Un laborator validat este creat in:
+A validated lab is created in:
 
 ```text
 generated-labs/<CVE>/
 ```
 
-Fisiere importante:
+Key files:
 
-- `e2e/result.json`: rezultatul verificabil si statusurile reproducerii.
-- `e2e/`: runnerul si probele E2E specifice produsului, daca profilul le foloseste.
-- `validator/validator.py`: PoC-ul/validatorul executabil pentru adaptorul generat.
-- `artifacts/PoC.py` (sau payload-ul specific profilului): PoC-ul local inspectabil.
-- `artifacts/manual.sh`: runnerul Linux cu actiuni separate `setup`, `exploit`, `verify`, `cleanup`.
-- `artifacts/MANUAL-POC.md`: instructiunile reproducerii manuale.
-- `artifacts/EVIDENCE.json`: dovezi structurate si provenienta.
-- `artifacts/WALKTHROUGH.md`: pasii pentru reproducere manuala.
-- `artifacts/REPORT.md`: raportul tehnic, limitele si concluzia.
-- `docker-compose.yml`: topologia locala a laboratorului Docker.
-- `source/`: snapshot-urile Git folosite de laborator.
+- `e2e/result.json`: the verifiable result and reproduction statuses.
+- `e2e/`: the product-specific E2E runner and probes, if used by the profile.
+- `validator/validator.py`: the executable PoC/validator for the generated adapter.
+- `artifacts/PoC.py` (or the profile-specific payload): the inspectable local PoC.
+- `artifacts/manual.sh`: the Linux runner with separate `setup`, `exploit`, `verify`, and `cleanup` actions.
+- `artifacts/MANUAL-POC.md`: manual reproduction instructions.
+- `artifacts/EVIDENCE.json`: structured evidence and provenance.
+- `artifacts/WALKTHROUGH.md`: manual reproduction steps.
+- `artifacts/REPORT.md`: the technical report, limitations, and conclusion.
+- `docker-compose.yml`: the local Docker lab topology.
+- `source/`: the Git snapshots used by the lab.
 
-Pentru reproducerea manuala se urmeaza `artifacts/WALKTHROUGH.md`. Un PoC acceptat trebuie sa contina comanda sau cererea exacta, efectul observabil si metoda de verificare. Simplul camp `ok: true` nu este suficient fara dovezile din rezultat.
+For manual reproduction, follow `artifacts/WALKTHROUGH.md`. An accepted PoC must include the exact command or request, the observable effect, and the verification method. An `ok: true` field alone is insufficient without supporting evidence in the result.
 
-Pe Kali/Linux, dupa o rulare `auto` reusita:
+On Kali/Linux, after a successful `auto` run:
 
 ```bash
 cd generated-labs/CVE-YYYY-NNNNN/artifacts
@@ -232,45 +232,45 @@ bash manual.sh verify vulnerable
 bash manual.sh cleanup
 ```
 
-Pentru un CVE cu fix public, aceiasi pasi se repeta cu `patched`; verdictul asteptat este
-`BLOCKED`. Pentru `VULNERABLE_ONLY_REPRODUCTION`, varianta `patched` nu este oferita.
+For a CVE with a public fix, repeat the same steps with `patched`; the expected verdict is
+`BLOCKED`. For `VULNERABLE_ONLY_REPRODUCTION`, the `patched` variant is not offered.
 
-Fiecare raport foloseste acelasi contract si include nivelul de fidelitate, componentele vendor
-executate, componentele simulate, dovada bruta pentru vulnerable/patched, contractul probei si
-provenienta. `source_component` nu inseamna E2E al produsului; numai
-`product_end_to_end` impreuna cu `product_e2e_verified: true` confirma acel nivel.
+Every report uses the same contract and includes the fidelity level, vendor components
+executed, simulated components, raw vulnerable/patched evidence, the probe contract, and
+provenance. `source_component` does not mean product E2E; only
+`product_end_to_end` together with `product_e2e_verified: true` confirms that level.
 
-## Software closed source
+## Closed-source software
 
 ```powershell
 cvelab closed-auto CVE-YYYY-NNNNN --key --model gpt-5.6-sol
 ```
 
-Daca produsul necesita autentificare, entitlement sau licenta, aplicatia se opreste cu `ARTIFACT_REQUIRED`. Dupa obtinerea legala a imaginii sau a kitului de instalare, artefactul este inregistrat o singura data in `closed-catalog.json`, apoi comanda poate continua.
+If the product requires authentication, entitlement, or a license, the application stops with `ARTIFACT_REQUIRED`. After legally obtaining the image or installation package, register the artifact once in `closed-catalog.json`, then the command can continue.
 
-Generatorul nu ocoleste autentificarea vendorului, nu descarca software piratat si nu substituie produsul real cu o simulare sintetica.
+The generator does not bypass vendor authentication, download pirated software, or substitute a synthetic simulation for the real product.
 
-## API key si model
+## API key and model
 
-Varianta recomandata:
+Recommended approach:
 
 ```powershell
 cvelab auto CVE-YYYY-NNNNN --ai on --key --model gpt-5.6-sol
 ```
 
-Alternativ:
+Alternatively:
 
 ```powershell
-$env:OPENAI_API_KEY = "cheia-ta"
+$env:OPENAI_API_KEY = "your-api-key"
 $env:CVELAB_MODEL = "gpt-5.6-sol"
 cvelab auto CVE-YYYY-NNNNN --ai on
 ```
 
-Nu se introduce cheia in fisiere, commit-uri, capturi de ecran sau exemple publice. Daca o cheie a fost expusa, ea trebuie revocata si regenerata.
+Do not put the key in files, commits, screenshots, or public examples. If a key is exposed, revoke and replace it.
 
-## Docker Desktop pe Windows
+## Docker Desktop on Windows
 
-Inainte de `auto` sau `run`, Docker trebuie sa raspunda:
+Before running `auto` or `run`, Docker must respond:
 
 ```powershell
 docker version
@@ -278,23 +278,24 @@ docker context show
 docker info
 ```
 
-Daca Shipyard esueaza la push catre `localhost:5000` cu `EOF` sau `connection reset`,
-verifica temporar fara VPN. Unele politici VPN blocheaza accesul daemonului Docker la
-porturile publicate si la subretelele bridge, chiar daca registry-ul este sanatos intre
-containere. Testul trebuie reluat numai dupa ce `curl http://127.0.0.1:5000/v2/` poate
-ajunge la un registry local publicat de Docker.
+If Shipyard fails while pushing to `localhost:5000` with `EOF` or `connection reset`,
+check temporarily without a VPN. Some VPN policies block Docker daemon access to
+published ports and bridge subnets, even when the registry is healthy between
+containers. Retry the test only after `curl http://127.0.0.1:5000/v2/` can
+reach a local registry published by Docker.
 
-Runnerul trateaza erorile tranzitorii cunoscute ale contextului Docker si ale socket-urilor Docker Desktop. Daca backend-ul Docker Desktop se inchide complet, laboratorul nu poate continua pana cand engine-ul este din nou disponibil.
+The runner handles known transient Docker context and Docker Desktop socket errors. If the Docker Desktop backend shuts down completely, the lab cannot continue until the engine is available again.
 
-Erori precum `Dockerfile.vulnerable: no such file or directory` trebuie detectate in preflight. Un adaptor AI incomplet este respins, nu lansat partial.
+Errors such as `Dockerfile.vulnerable: no such file or directory` should be detected during preflight. An incomplete AI adapter is rejected rather than partially launched.
 
-Cleanup-ul elimina numai resursele laboratorului curent. Proiectul nu foloseste `docker system prune --volumes` pentru curatarea normala.
+Cleanup removes only the current lab's resources. The project does not use `docker system prune --volumes` for normal cleanup.
 
-## Docker Engine pe Linux
+## Docker Engine on Linux
 
-Runnerul Shipyard este lansat direct prin Bash si foloseste Docker Engine-ul utilizatorului
-curent. Nu sunt necesare WSL, Docker Desktop, `kubectl`, Kind sau Helm instalate separat pe
-host; uneltele Kubernetes ale profilului sunt furnizate de mediul Shipyard. Verificare:
+The Shipyard runner is launched directly through Bash and uses the current user's
+Docker Engine. WSL, Docker Desktop, and separate host installations of `kubectl`, Kind,
+or Helm are not required; the profile's Kubernetes tools are provided by the Shipyard
+environment. Verify with:
 
 ```bash
 docker version
@@ -302,19 +303,19 @@ docker compose version
 docker info
 ```
 
-## Limite
+## Limitations
 
-- Niciun generator nu poate produce fidel fiecare CVE doar din identificator.
-- Un CVE fara cod vulnerabil public sau artefact legal disponibil ramane `ARTIFACT_REQUIRED` ori `POC_NOT_GENERATED`.
-- Lipsa unui fix public nu impiedica PoC-ul pe versiunea vulnerabila, dar impiedica validarea diferentiala a remedierii.
-- Un repository sau un commit ghicit nu este acceptat ca provenienta.
-- AI-ul genereaza adaptorul, dar rezultatul este acceptat numai dupa verificarea executabila a efectului.
-- Laboratoarele sintetice de clasa CWE sunt demonstrative, nu PoC-uri ale produsului mentionat de CVE.
+- No generator can faithfully reproduce every CVE from its identifier alone.
+- A CVE without public vulnerable code or a legally available artifact remains `ARTIFACT_REQUIRED` or `POC_NOT_GENERATED`.
+- The absence of a public fix does not prevent a PoC against the vulnerable version, but it prevents differential validation of remediation.
+- A guessed repository or commit is not accepted as provenance.
+- AI generates the adapter, but the result is accepted only after executable verification of the effect.
+- Synthetic CWE-class labs are demonstrations, not PoCs for the product named by the CVE.
 
-## Siguranta
+## Safety
 
-- Laboratoarele sunt destinate cercetarii autorizate.
-- Serviciile generate sunt limitate la loopback si la reteaua Docker interna.
-- Payload-urile trebuie sa fie nedistructive.
-- Nu se scaneaza si nu se ataca tinte externe.
-- Orice test pe un sistem care nu iti apartine necesita autorizatie explicita.
+- Labs are intended for authorized research.
+- Generated services are restricted to loopback and the internal Docker network.
+- Payloads must be nondestructive.
+- Do not scan or attack external targets.
+- Any test on a system you do not own requires explicit authorization.

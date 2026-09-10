@@ -1,32 +1,32 @@
-# Ghid CVELab
+# CVELab Guide
 
-Acest ghid descrie instalarea, rularea si interpretarea rezultatelor CVELab.
-Platforma recomandata este Linux nativ cu Docker Engine si pluginul Compose.
+This guide covers installing and running CVELab and interpreting its results.
+The recommended platform is native Linux with Docker Engine and the Compose plugin.
 
-## 1. Ce face CVELab
+## 1. What CVELab does
 
-CVELab porneste de la un identificator CVE si incearca sa:
+CVELab starts with a CVE identifier and attempts to:
 
-1. colecteze metadate si referinte publice;
-2. identifice repository-ul si revizia vulnerabila;
-3. identifice fixul public, daca acesta exista;
-4. construiasca un laborator Docker local;
-5. execute un validator specific vulnerabilitatii;
-6. confirme un efect de securitate observabil;
-7. produca dovezi, un walkthrough si un raport.
+1. Collect public metadata and references.
+2. Identify the repository and vulnerable revision.
+3. Identify the public fix, if one exists.
+4. Build a local Docker lab.
+5. Execute a vulnerability-specific validator.
+6. Confirm an observable security effect.
+7. Produce evidence, a walkthrough, and a report.
 
-CVELab nu considera un marker reflectat sau un camp hardcodat drept PoC. Un
-rezultat este acceptat numai daca validatorul executa testul si observa efectul
-definit in contractul PoC.
+CVELab does not treat a reflected marker or a hardcoded field as a PoC. A result
+is accepted only if the validator executes the test and observes the effect
+defined in the PoC contract.
 
-## 2. Rezultatele posibile
+## 2. Possible outcomes
 
 ### SOURCE_REPRODUCTION
 
-Exista revizii publice vulnerabila si reparata. Acelasi test demonstreaza
-vulnerabilitatea pe prima revizie si respingerea pe revizia patched.
+Public vulnerable and fixed revisions are available. The same test demonstrates
+the vulnerability on the first revision and its rejection on the patched revision.
 
-Semnale asteptate:
+Expected indicators:
 
 ```json
 {
@@ -39,11 +39,11 @@ Semnale asteptate:
 
 ### VULNERABLE_ONLY_REPRODUCTION
 
-Revizia vulnerabila este publica si verificabila, dar nu exista un commit de fix
-public identificat cu suficienta incredere. CVELab nu inventeaza un serviciu
-patched.
+The vulnerable revision is public and verifiable, but no public fix commit has
+been identified with sufficient confidence. CVELab does not fabricate a patched
+service.
 
-Semnale asteptate:
+Expected indicators:
 
 ```json
 {
@@ -55,42 +55,42 @@ Semnale asteptate:
 }
 ```
 
-Acest rezultat demonstreaza vulnerabilitatea, dar nu valideaza remedierea.
+This result demonstrates the vulnerability but does not validate remediation.
 
 ### ARTIFACT_REQUIRED
 
-Produsul vulnerabil nu este disponibil public sau necesita autentificare,
-entitlement, licenta, firmware ori mediu hardware specific. CVELab nu ocoleste
-aceste cerinte si nu inlocuieste produsul cu o simulare.
+The vulnerable product is not publicly available or requires authentication,
+entitlement, a license, firmware, or a specific hardware environment. CVELab does
+not bypass these requirements or replace the product with a simulation.
 
 ### POC_NOT_GENERATED
 
-Datele publice nu sustin o reproducere fidela. Acest rezultat este preferabil
-unui PoC fabricat sau atribuit unei revizii neverificate.
+Public data does not support a faithful reproduction. This outcome is preferable
+to a fabricated PoC or one attributed to an unverified revision.
 
-## 3. Instalare recomandata pe Linux
+## 3. Recommended Linux installation
 
-### Cerinte
+### Requirements
 
-- Python 3.11 sau mai nou;
-- modulul Python `venv`;
-- Git;
-- Docker Engine activ;
-- pluginul Docker Compose;
-- acces la internet pentru surse publice, imagini si API;
-- accesul utilizatorului la socketul Docker.
+- Python 3.11 or newer.
+- The Python `venv` module.
+- Git.
+- A running Docker Engine.
+- The Docker Compose plugin.
+- Internet access for public sources, images, and the API.
+- User access to the Docker socket.
 
-Pe Debian, Ubuntu sau Kali, numele uzuale ale pachetelor de baza sunt:
+On Debian, Ubuntu, or Kali, common base package names are:
 
 ```bash
 sudo apt update
 sudo apt install -y git python3 python3-venv
 ```
 
-Instaleaza Docker Engine din repository-ul oficial potrivit distributiei:
+Install Docker Engine from the official repository appropriate for your distribution:
 [Docker Engine installation](https://docs.docker.com/engine/install/).
 
-Verifica mediul:
+Verify the environment:
 
 ```bash
 python3 --version
@@ -99,10 +99,10 @@ docker version
 docker compose version
 ```
 
-Apartenenta la grupul `docker` acorda privilegii echivalente accesului root.
-Foloseste aceasta configuratie numai pe un sistem de laborator controlat.
+Membership in the `docker` group grants privileges equivalent to root access.
+Use this configuration only on a controlled lab system.
 
-### Instalare din Git
+### Installation from Git
 
 ```bash
 git clone https://github.com/AndreiIonascu17/cvelab.git
@@ -113,18 +113,18 @@ python -m pip install .
 cvelab --help
 ```
 
-Pastreaza repository-ul si laboratoarele pe filesystem-ul Linux. Evita rularea
-dintr-o partitie NTFS montata daca performanta build-urilor este importanta.
+Keep the repository and labs on the Linux filesystem. Avoid running from a
+mounted NTFS partition if build performance matters.
 
-### Instalare din bundle
+### Installation from a bundle
 
-Construieste bundle-ul:
+Build the bundle:
 
 ```bash
 bash scripts/build-linux.sh
 ```
 
-Instaleaza bundle-ul rezultat:
+Install the resulting bundle:
 
 ```bash
 cd dist-linux
@@ -134,7 +134,7 @@ cd cvelab-0.5.0-linux
 ./install.sh
 ```
 
-Installerul verifica SHA-256 pentru wheel si instaleaza fara `sudo` in:
+The installer verifies the wheel's SHA-256 checksum and installs without `sudo` at:
 
 ```text
 ~/.local/share/cvelab/venv
@@ -143,34 +143,34 @@ Installerul verifica SHA-256 pentru wheel si instaleaza fara `sudo` in:
 
 ## 4. API key
 
-Varianta recomandata foloseste promptul mascat:
+The recommended approach uses the masked prompt:
 
 ```bash
 cvelab auto CVE-YYYY-NNNNN --ai on --key --model gpt-5.6-sol
 ```
 
-Cand apare:
+When this appears:
 
 ```text
 OpenAI API key:
 ```
 
-introdu numai cheia API. Nu introduce din nou comanda `cvelab`.
+enter only the API key. Do not enter the `cvelab` command again.
 
-Alternativ:
+Alternatively:
 
 ```bash
-export OPENAI_API_KEY="cheia-ta"
+export OPENAI_API_KEY="your-api-key"
 export CVELAB_MODEL="gpt-5.6-sol"
 cvelab auto CVE-YYYY-NNNNN --ai on
 ```
 
-Nu publica cheia in Git, capturi de ecran, shell history sau rapoarte. Revoca
-imediat orice cheie expusa.
+Do not publish the key in Git, screenshots, shell history, or reports. Revoke
+any exposed key immediately.
 
-## 5. Rulare end-to-end
+## 5. End-to-end execution
 
-Comanda principala:
+Main command:
 
 ```bash
 cvelab --output-root "$HOME/cvelab-labs" \
@@ -180,101 +180,101 @@ cvelab --output-root "$HOME/cvelab-labs" \
   --model gpt-5.6-sol
 ```
 
-Aceasta comanda face discovery, generare, build, pornire, validare si raportare.
+This command performs discovery, generation, building, startup, validation, and reporting.
 
-Daca referintele sunt deja cunoscute:
-
-```bash
-cvelab --output-root "$HOME/cvelab-labs" \
-  auto CVE-YYYY-NNNNN \
-  --repo https://github.com/owner/project.git \
-  --vulnerable-ref COMMIT_VULNERABIL \
-  --fixed-ref COMMIT_FIX \
-  --ai on \
-  --key \
-  --model gpt-5.6-sol
-```
-
-Fara fix public, omite `--fixed-ref`:
+If the references are already known:
 
 ```bash
 cvelab --output-root "$HOME/cvelab-labs" \
   auto CVE-YYYY-NNNNN \
   --repo https://github.com/owner/project.git \
-  --vulnerable-ref COMMIT_VULNERABIL \
+  --vulnerable-ref VULNERABLE_COMMIT \
+  --fixed-ref FIX_COMMIT \
   --ai on \
   --key \
   --model gpt-5.6-sol
 ```
 
-## 6. Rularea unui laborator existent
+Without a public fix, omit `--fixed-ref`:
+
+```bash
+cvelab --output-root "$HOME/cvelab-labs" \
+  auto CVE-YYYY-NNNNN \
+  --repo https://github.com/owner/project.git \
+  --vulnerable-ref VULNERABLE_COMMIT \
+  --ai on \
+  --key \
+  --model gpt-5.6-sol
+```
+
+## 6. Running an existing lab
 
 ```bash
 cvelab --output-root "$HOME/cvelab-labs" run CVE-YYYY-NNNNN
 ```
 
-Foloseste `--keep` numai cand vrei sa inspectezi containerele dupa validare:
+Use `--keep` only when you want to inspect containers after validation:
 
 ```bash
 cvelab --output-root "$HOME/cvelab-labs" run CVE-YYYY-NNNNN --keep
 ```
 
-Cleanup-ul normal este limitat la proiectul Compose al laboratorului. Nu trebuie
-folosit `docker system prune --volumes` pentru acest flux.
+Normal cleanup is restricted to the lab's Compose project. Do not use
+`docker system prune --volumes` for this workflow.
 
-## 7. Livrabile
+## 7. Deliverables
 
-Rezultatele sunt scrise in:
+Results are written to:
 
 ```text
 $HOME/cvelab-labs/CVE-YYYY-NNNNN/
 ```
 
-Fisiere importante:
+Key files:
 
-- `report.json`: verdictul automat si verificarile PoC;
-- `e2e/result.json`: rezultatul profilului E2E, daca acesta exista;
-- `validator/validator.py`: validatorul executabil generat;
-- `artifacts/EVIDENCE.json`: dovezi structurate si provenienta;
-- `artifacts/WALKTHROUGH.md`: reproducerea manuala;
-- `artifacts/REPORT.md`: raportul tehnic si limitarile;
-- `plan.json`: tipul laboratorului, reviziile si contractul exploit;
-- `docker-compose.yml`: serviciile laboratorului;
-- `source/`: snapshot-urile de cod folosite.
+- `report.json`: the automatic verdict and PoC checks.
+- `e2e/result.json`: the E2E profile result, if present.
+- `validator/validator.py`: the generated executable validator.
+- `artifacts/EVIDENCE.json`: structured evidence and provenance.
+- `artifacts/WALKTHROUGH.md`: manual reproduction instructions.
+- `artifacts/REPORT.md`: the technical report and limitations.
+- `plan.json`: the lab type, revisions, and exploit contract.
+- `docker-compose.yml`: lab services.
+- `source/`: the source snapshots used.
 
-Verdictul principal este `real_poc_verified`. Pentru un test cu fix trebuie sa
-fie adevarat si `differential_confirmed`. Pentru un test fara fix, raportul
-trebuie sa pastreze `patched_tested: false`.
+The main verdict is `real_poc_verified`. For a test with a fix,
+`differential_confirmed` must also be true. For a test without a fix, the report
+must retain `patched_tested: false`.
 
-## 8. Reproducere manuala
+## 8. Manual reproduction
 
-Deschide `artifacts/WALKTHROUGH.md` si urmeaza comenzile documentate acolo.
-Walkthrough-ul trebuie sa indice:
+Open `artifacts/WALKTHROUGH.md` and follow the commands documented there.
+The walkthrough must specify:
 
-- cum se porneste versiunea vulnerabila;
-- cererea sau actiunea exacta a PoC-ului;
-- efectul de securitate asteptat;
-- locul in care este inspectata dovada;
-- cum se face cleanup;
-- pasii patched, numai daca un fix public a fost validat.
+- How to start the vulnerable version.
+- The exact PoC request or action.
+- The expected security effect.
+- Where to inspect the evidence.
+- How to clean up.
+- Patched steps, only if a public fix has been validated.
 
-Daca walkthrough-ul nu permite repetarea manuala a efectului, rezultatul nu este
-un livrabil PoC complet.
+If the walkthrough does not allow manual reproduction of the effect, the result
+is not a complete PoC deliverable.
 
-## 9. Closed source
+## 9. Closed-source software
 
 ```bash
 cvelab closed-auto CVE-YYYY-NNNNN --key --model gpt-5.6-sol
 ```
 
-Pentru un produs proprietar, CVELab continua numai cand artefactul obtinut legal
-este disponibil local si inregistrat in `closed-catalog.json`. VirtualBox poate
-gazdui produsul, dar kitul de instalare, licenta si configurarea vendorului nu pot
-fi inventate ori descarcate prin ocolirea controalelor de acces.
+For a proprietary product, CVELab continues only when the legally obtained
+artifact is available locally and registered in `closed-catalog.json`. VirtualBox
+can host the product, but the installation package, license, and vendor
+configuration cannot be fabricated or downloaded by bypassing access controls.
 
-## 10. Depanare
+## 10. Troubleshooting
 
-### Docker nu raspunde
+### Docker does not respond
 
 ```bash
 systemctl status docker
@@ -282,53 +282,53 @@ docker info
 docker compose version
 ```
 
-Pe Linux nativ, remediaza Docker Engine la nivelul sistemului. CVELab nu modifica
-automat daemonul si nu executa factory reset.
+On native Linux, fix Docker Engine at the system level. CVELab does not
+automatically modify the daemon or perform a factory reset.
 
-### Permission denied pentru Docker
+### Docker permission denied
 
-Verifica permisiunile socketului si politica sistemului:
+Check socket permissions and system policy:
 
 ```bash
 ls -l /var/run/docker.sock
 id
 ```
 
-### Adaptor AI incomplet
+### Incomplete AI adapter
 
-Generatorul face preflight pentru `docker-compose.yml`, Dockerfile-uri si
-validator. Un adaptor incomplet este respins inainte de build.
+The generator performs preflight checks for `docker-compose.yml`, Dockerfiles,
+and the validator. An incomplete adapter is rejected before the build.
 
-### Lipseste fixul public
+### Missing public fix
 
-Lipsa fixului nu este o eroare daca revizia vulnerabila este verificata.
-Rezultatul corect este `VULNERABLE_ONLY_REPRODUCTION`.
+The absence of a fix is not an error if the vulnerable revision is verified.
+The correct result is `VULNERABLE_ONLY_REPRODUCTION`.
 
-### Lipseste artefactul vulnerabil
+### Missing vulnerable artifact
 
-Rezultatul corect este `ARTIFACT_REQUIRED` sau `POC_NOT_GENERATED`. Furnizeaza
-un repository/revision verificabil ori artefactul legal cerut; nu folosi o
-simulare ca substitut.
+The correct result is `ARTIFACT_REQUIRED` or `POC_NOT_GENERATED`. Provide a
+verifiable repository/revision or the required legal artifact; do not use a
+simulation as a substitute.
 
-## 11. Siguranta si limite
+## 11. Safety and limitations
 
-- Ruleaza numai pe sisteme proprii sau autorizate explicit.
-- Pastreaza serviciile pe loopback si retele Docker interne.
-- Foloseste payload-uri nedistructive.
-- Nu indrepta validatorul catre tinte externe.
-- Nu confunda laboratoarele sintetice CWE cu PoC-uri ale produsului real.
-- Nu considera absenta unui rezultat dupa timeout drept dovada unica a unui fix.
-- Niciun generator nu poate reproduce fidel orice CVE doar din identificator.
+- Run only on systems you own or are explicitly authorized to test.
+- Keep services on loopback and internal Docker networks.
+- Use nondestructive payloads.
+- Do not point the validator at external targets.
+- Do not confuse synthetic CWE labs with PoCs for the actual product.
+- Do not treat the absence of a result after a timeout as the sole evidence of a fix.
+- No generator can faithfully reproduce every CVE from its identifier alone.
 
-## 12. Dezvoltare
+## 12. Development
 
-Build Linux:
+Linux build:
 
 ```bash
 bash scripts/build-linux.sh
 ```
 
-Verificari rapide:
+Quick checks:
 
 ```bash
 python3 -m compileall -q cvelab
@@ -336,4 +336,4 @@ bash -n linux/install.sh
 bash -n scripts/build-linux.sh
 ```
 
-Artefactele de build sunt create in `dist-linux/` si nu sunt versionate.
+Build artifacts are created in `dist-linux/` and are not tracked in version control.

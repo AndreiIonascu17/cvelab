@@ -204,7 +204,7 @@ def _automatic_analysis(
         schema_name="cvelab_final_analysis",
         max_output_tokens=6000,
         instructions=(
-            "Write a technically precise Romanian defensive-research analysis for the supplied CVE and local lab. "
+            "Write a technically precise English defensive-research analysis for the supplied CVE and local lab. "
             "Use only facts present in the input. Clearly distinguish CVE metadata, model inference, and observed "
             "lab evidence. Never claim the vendor product was validated when lab_type is SYNTHETIC_CLASS_LAB. "
             "Treat lab_plan.fidelity as authoritative: never describe source_component as product end-to-end, and "

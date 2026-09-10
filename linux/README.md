@@ -1,19 +1,19 @@
-# CVELab pentru Linux
+# CVELab for Linux
 
-Acest bundle instaleaza CVELab nativ pe Linux. Docker Desktop si WSL nu sunt necesare.
+This bundle installs CVELab natively on Linux. Docker Desktop and WSL are not required.
 
-## Cerinte
+## Requirements
 
-- distributie Linux suportata de Python si Docker Engine;
-- Python 3.11 sau mai nou, cu modulul `venv`;
-- Git;
-- Docker Engine activ;
-- pluginul Docker Compose;
-- accesul utilizatorului curent la socketul Docker.
+- A Linux distribution supported by Python and Docker Engine.
+- Python 3.11 or newer, with the `venv` module.
+- Git.
+- A running Docker Engine.
+- The Docker Compose plugin.
+- Access to the Docker socket for the current user.
 
-## Instalare
+## Installation
 
-Extrage arhiva si ruleaza:
+Extract the archive and run:
 
 ```bash
 tar -xzf cvelab-*-linux.tar.gz
@@ -21,13 +21,13 @@ cd cvelab-*-linux
 ./install.sh
 ```
 
-Daca `~/.local/bin` nu este in `PATH`:
+If `~/.local/bin` is not in `PATH`:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-## Rulare
+## Usage
 
 ```bash
 cvelab --output-root "$HOME/cvelab-labs" \
@@ -37,11 +37,11 @@ cvelab --output-root "$HOME/cvelab-labs" \
   --model gpt-5.6-sol
 ```
 
-La promptul `OpenAI API key:` introdu numai cheia API. Cheia nu este salvata de installer.
+At the `OpenAI API key:` prompt, enter only the API key. The installer does not save the key.
 
-## CVE fara fix public
+## CVEs without a public fix
 
-Daca repository-ul si revizia vulnerabila sunt verificabile, dar nu exista un fix public exact, CVELab poate genera `VULNERABLE_ONLY_REPRODUCTION`. Raportul trebuie sa indice:
+If the repository and vulnerable revision are verifiable but no exact public fix is available, CVELab can generate `VULNERABLE_ONLY_REPRODUCTION`. The report must indicate:
 
 ```json
 {
@@ -52,16 +52,16 @@ Daca repository-ul si revizia vulnerabila sunt verificabile, dar nu exista un fi
 }
 ```
 
-## Dezinstalare
+## Uninstallation
 
-Installerul nu modifica pachetele sistemului. Pentru dezinstalare elimina mediul virtual si symlink-ul create in:
+The installer does not modify system packages. To uninstall, remove the virtual environment and symbolic link created at:
 
 ```text
 ~/.local/share/cvelab/venv
 ~/.local/bin/cvelab
 ```
 
-Datele din directoarele de laboratoare nu sunt sterse automat.
+Data in lab directories is not deleted automatically.
 
-Pentru configurare, utilizare, interpretarea rezultatelor si depanare consulta
-`GUIDE.md` din repository.
+For configuration, usage, result interpretation, and troubleshooting, see
+`GUIDE.md` in the repository.

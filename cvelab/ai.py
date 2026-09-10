@@ -43,7 +43,11 @@ def structured_response(
         "model": model,
         "store": False,
         "max_output_tokens": max_output_tokens,
-        "instructions": instructions,
+        "instructions": (
+            instructions
+            + " Write all generated prose, documentation, comments, and user-facing messages in English. "
+            "Preserve source quotations, identifiers, and raw evidence verbatim."
+        ),
         "input": input_text,
         "text": {
             "format": {
