@@ -9,6 +9,55 @@ from cvelab.autoflow import run_auto_workflow
 
 
 class AutonomousWorkflowTests(unittest.TestCase):
+    def test_generation_retry_receives_preflight_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lab = root / "CVE-2026-12345"
+            generated = {
+                "ok": True,
+                "status": "GENERATED_UNVALIDATED",
+                "lab_dir": str(lab),
+                "plan": {},
+            }
+            passed = {"ok": True, "report": {"proof_checks": {}}}
+            with (
+                mock.patch(
+                    "cvelab.autoflow.generate_source_lab",
+                    side_effect=[RuntimeError("Compose network must be internal"), generated],
+                ) as generate,
+                mock.patch("cvelab.autoflow.run_lab", return_value=passed),
+                mock.patch("cvelab.autoflow.create_deliverables", side_effect=lambda *args: args[2]),
+            ):
+                result = run_auto_workflow(
+                    "CVE-2026-12345", root, None, None, None,
+                    "key", "model", False, max_attempts=3, progress=lambda _: None,
+                )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(generate.call_count, 2)
+            self.assertEqual(
+                generate.call_args_list[1].args[-1],
+                ["Compose network must be internal"],
+            )
+
+    def test_anthropic_bad_request_is_not_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with mock.patch(
+                "cvelab.autoflow.generate_source_lab",
+                side_effect=RuntimeError("Anthropic API HTTP 400: invalid schema"),
+            ) as generate:
+                result = run_auto_workflow(
+                    "CVE-2026-12345", root, None, None, None,
+                    "key", "model", False, max_attempts=4, progress=lambda _: None,
+                    provider="anthropic",
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "AUTO_GENERATION_FAILED")
+            self.assertEqual(generate.call_count, 1)
+            self.assertEqual(len(result["attempts"]), 1)
+
     def test_failed_proof_is_repaired_and_revalidated(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

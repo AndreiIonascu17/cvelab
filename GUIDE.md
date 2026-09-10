@@ -128,9 +128,9 @@ Install the resulting bundle:
 
 ```bash
 cd dist-linux
-sha256sum --check cvelab-0.5.0-linux.tar.gz.sha256
-tar -xzf cvelab-0.5.0-linux.tar.gz
-cd cvelab-0.5.0-linux
+sha256sum --check cvelab-0.6.0-linux.tar.gz.sha256
+tar -xzf cvelab-0.6.0-linux.tar.gz
+cd cvelab-0.6.0-linux
 ./install.sh
 ```
 
@@ -141,12 +141,12 @@ The installer verifies the wheel's SHA-256 checksum and installs without `sudo` 
 ~/.local/bin/cvelab
 ```
 
-## 4. API key
+## 4. AI provider and API key
 
 The recommended approach uses the masked prompt:
 
 ```bash
-cvelab auto CVE-YYYY-NNNNN --ai on --key --model gpt-5.6-sol
+cvelab auto CVE-YYYY-NNNNN --ai on --provider openai --key --model YOUR_OPENAI_MODEL
 ```
 
 When this appears:
@@ -161,9 +161,48 @@ Alternatively:
 
 ```bash
 export OPENAI_API_KEY="your-api-key"
-export CVELAB_MODEL="gpt-5.6-sol"
+export CVELAB_AI_PROVIDER="openai"
+export CVELAB_MODEL="your-openai-model"
 cvelab auto CVE-YYYY-NNNNN --ai on
 ```
+
+Anthropic uses the same workflow:
+
+```bash
+export ANTHROPIC_API_KEY="your-api-key"
+export CVELAB_AI_PROVIDER="anthropic"
+export CVELAB_MODEL="your-anthropic-model"
+cvelab auto CVE-YYYY-NNNNN --ai on
+```
+
+For a local OpenAI-compatible server, no API key is required by default:
+
+```bash
+export CVELAB_AI_PROVIDER="local"
+export CVELAB_BASE_URL="http://127.0.0.1:11434/v1"
+export CVELAB_MODEL="cvelab-qwen2.5-coder:7b"
+cvelab auto CVE-YYYY-NNNNN --ai on
+```
+
+Source-generation prompts routinely need tens of thousands of tokens. For Ollama, create a
+model with a 64K context instead of using its 4K default on GPUs below 24 GiB:
+
+```text
+FROM qwen2.5-coder:7b
+PARAMETER num_ctx 65536
+```
+
+Save that text as `Modelfile`, then run:
+
+```bash
+ollama create cvelab-qwen2.5-coder:7b -f linux/ollama/Modelfile.qwen2.5-coder-7b
+```
+
+Local responses have a 30-minute timeout by default. Set `CVELAB_LOCAL_TIMEOUT` to a
+different number of seconds when the model or hardware needs it.
+
+Local endpoints do not supply web search. Provide exact `--repo`, `--vulnerable-ref`,
+and `--fixed-ref` overrides when they are not already present in the CVE record.
 
 Do not publish the key in Git, screenshots, shell history, or reports. Revoke
 any exposed key immediately.

@@ -6,6 +6,7 @@ import json
 import sys
 from pathlib import Path
 
+from .ai import resolve_provider
 from .autoflow import run_auto_workflow
 from .core import build_lab, run_lab
 from .closed import run_closed_lab
@@ -16,12 +17,22 @@ from .sourcegen import generate_source_lab
 
 def add_ai_credentials(command: argparse.ArgumentParser) -> None:
     command.add_argument(
+        "--provider",
+        choices=("auto", "openai", "anthropic", "local"),
+        default="auto",
+        help="AI provider (default: infer from environment, otherwise OpenAI)",
+    )
+    command.add_argument(
         "--key",
         nargs="?",
         const="__PROMPT__",
-        help="OpenAI API key; omit the value to enter it securely",
+        help="Provider API key; omit the value to enter it securely (optional for local)",
     )
-    command.add_argument("--model", help="OpenAI model ID (or use CVELAB_MODEL)")
+    command.add_argument("--model", help="Provider model ID (or use CVELAB_MODEL)")
+    command.add_argument(
+        "--base-url",
+        help="Local OpenAI-compatible base URL (default: http://127.0.0.1:11434/v1)",
+    )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -120,10 +131,21 @@ def main(argv: list[str] | None = None) -> int:
     try:
         api_key = getattr(args, "key", None)
         if api_key == "__PROMPT__":
-            api_key = getpass.getpass("OpenAI API key: ")
+            selected_provider = resolve_provider(getattr(args, "provider", None))
+            provider_label = {
+                "openai": "OpenAI",
+                "anthropic": "Anthropic",
+                "local": "Local",
+            }[selected_provider]
+            api_key = getpass.getpass(f"{provider_label} API key: ")
         model = getattr(args, "model", None)
+        provider = getattr(args, "provider", None)
+        base_url = getattr(args, "base_url", None)
         if args.command == "build":
-            result = build_lab(args.cve, args.output_root, args.cwe, args.ai, api_key, model)
+            result = build_lab(
+                args.cve, args.output_root, args.cwe, args.ai,
+                api_key, model, provider, base_url,
+            )
         elif args.command == "auto":
             result = run_auto_workflow(
                 args.cve,
@@ -135,6 +157,8 @@ def main(argv: list[str] | None = None) -> int:
                 model,
                 args.keep,
                 args.max_attempts,
+                provider=provider,
+                base_url=base_url,
             )
         elif args.command in {"source", "source-all"}:
             generated = generate_source_lab(
@@ -145,13 +169,17 @@ def main(argv: list[str] | None = None) -> int:
                 args.vulnerable_ref,
                 api_key,
                 model,
+                provider,
+                base_url,
             )
             if args.command == "source-all" and generated.get("ok"):
                 result = run_lab(args.cve, args.output_root, args.keep)
             else:
                 result = generated
         elif args.command == "closed-auto":
-            result = run_closed_auto(args.cve, args.output_root, api_key, model)
+            result = run_closed_auto(
+                args.cve, args.output_root, api_key, model, provider, base_url
+            )
         elif args.command == "closed":
             result = run_closed_lab(
                 args.cve,
@@ -168,7 +196,10 @@ def main(argv: list[str] | None = None) -> int:
                 args.cve.upper(), args.output_root.resolve() / args.cve.upper(), validated
             )
         else:
-            build_lab(args.cve, args.output_root, args.cwe, args.ai, api_key, model)
+            build_lab(
+                args.cve, args.output_root, args.cwe, args.ai,
+                api_key, model, provider, base_url,
+            )
             result = run_lab(args.cve, args.output_root, args.keep)
         print(json.dumps(result, indent=2))
         return 0 if result.get("ok", True) else 2

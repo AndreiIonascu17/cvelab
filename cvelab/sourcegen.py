@@ -12,7 +12,12 @@ import uuid
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
-from .ai import structured_response
+from .ai import (
+    ai_is_configured,
+    provider_supports_web_search,
+    resolve_provider,
+    structured_response,
+)
 from .core import collect_cve, normalize_cve, write_text
 
 
@@ -751,7 +756,13 @@ def resolve_source(dossier: dict, repo: str | None, fixed_ref: str | None) -> tu
     return None
 
 
-def discover_source_with_openai(dossier: dict, api_key: str | None, model: str | None) -> dict:
+def discover_source_with_ai(
+    dossier: dict,
+    api_key: str | None,
+    model: str | None,
+    provider: str | None = None,
+    base_url: str | None = None,
+) -> dict:
     return structured_response(
         api_key=api_key,
         model=model,
@@ -770,10 +781,12 @@ def discover_source_with_openai(dossier: dict, api_key: str | None, model: str |
             "VULNERABLE_ONLY even when an advisory names a patched release. "
             "Use VENDOR_ARTIFACT_REQUIRED for proprietary products, appliances, operating systems, licensed "
             "installers, or authenticated downloads. Never invent URLs, versions, repositories, commit hashes, "
-            "patches, or exploit details. If provenance is ambiguous, return INSUFFICIENT_DATA. Do not produce a "
-            "payload or remote exploitation instructions."
+            "patches, or runtime-test details. If provenance is ambiguous, return INSUFFICIENT_DATA. This step is "
+            "provenance research only; do not design or expand a reproduction procedure."
         ),
         input_text=json.dumps(dossier, ensure_ascii=True),
+        provider=provider,
+        base_url=base_url,
     )
 
 
@@ -784,7 +797,24 @@ def _snapshot(repository: Path, revision: str, destination: Path) -> None:
         bundle.extractall(destination, filter="data")
 
 
-def _source_context(repository: Path, vulnerable_ref: str, fixed_ref: str, dossier: dict) -> str:
+def _clip_context_section(content: str, limit: int) -> str:
+    if len(content) <= limit:
+        return content
+    marker = "\n... [CVELab truncated this section for the local context window] ...\n"
+    if limit <= len(marker):
+        return content[:max(0, limit)]
+    usable = max(0, limit - len(marker))
+    head = usable * 3 // 4
+    return content[:head] + marker + content[-(usable - head):]
+
+
+def _source_context(
+    repository: Path,
+    vulnerable_ref: str,
+    fixed_ref: str,
+    dossier: dict,
+    max_chars: int | None = None,
+) -> str:
     diff = _run_git(["diff", "--no-ext-diff", "--unified=80", vulnerable_ref, fixed_ref], cwd=repository)
     files = _run_git(["diff", "--name-only", vulnerable_ref, fixed_ref], cwd=repository).splitlines()
     tree = _run_git(["ls-tree", "-r", "--name-only", fixed_ref], cwd=repository).splitlines()
@@ -807,7 +837,23 @@ def _source_context(repository: Path, vulnerable_ref: str, fixed_ref: str, dossi
         "changed_files": files,
         "repository_tree_sample": tree[:500],
     }
-    return json.dumps(material, ensure_ascii=True, indent=2) + "\n\n--- SECURITY PATCH ---\n" + diff[:90000] + "".join(excerpts)
+    metadata = json.dumps(material, ensure_ascii=True, indent=2)
+    patch = diff[:90000]
+    if max_chars is None:
+        return metadata + "\n\n--- SECURITY PATCH ---\n" + patch + "".join(excerpts)
+
+    prefix = _clip_context_section(metadata, min(len(metadata), max_chars // 4))
+    patch_header = "\n\n--- SECURITY PATCH ---\n"
+    remaining = max_chars - len(prefix) - len(patch_header)
+    excerpt_reserve = min(14000, max(0, remaining // 3))
+    patch = _clip_context_section(patch, max(0, remaining - excerpt_reserve))
+    result = prefix + patch_header + patch
+    for excerpt in excerpts:
+        available = max_chars - len(result)
+        if available <= 0:
+            break
+        result += _clip_context_section(excerpt, min(6000, available))
+    return result[:max_chars]
 
 
 def _canonicalize_compose_builds(content: str, vulnerable_only: bool = False) -> str:
@@ -1124,6 +1170,9 @@ def generate_source_lab(
     vulnerable_ref: str | None,
     api_key: str | None,
     model: str | None,
+    provider: str | None = None,
+    base_url: str | None = None,
+    generation_feedback: list[str] | None = None,
 ) -> dict:
     cve = normalize_cve(cve_value)
     dossier = collect_cve(cve)
@@ -1132,10 +1181,14 @@ def generate_source_lab(
     if repo and vulnerable_ref and not fixed_ref:
         vulnerable_only_resolved = (_safe_repo_url(repo), vulnerable_ref)
     discovery = None
-    effective_key = api_key or os.getenv("OPENAI_API_KEY")
-    effective_model = model or os.getenv("CVELAB_MODEL")
-    if not resolved and effective_key and effective_model:
-        discovery = discover_source_with_openai(dossier, api_key, model)
+    if (
+        not resolved
+        and ai_is_configured(api_key, model, provider)
+        and provider_supports_web_search(provider)
+    ):
+        discovery = discover_source_with_ai(
+            dossier, api_key, model, provider, base_url
+        )
         if discovery["status"] == "SOURCE_READY":
             candidate_repo = discovery.get("repository_url")
             candidate_fixed = discovery.get("fixed_ref")
@@ -1195,8 +1248,21 @@ def generate_source_lab(
     _run_git(["rev-parse", "--verify", f"{vulnerable}^{{commit}}"], cwd=repository)
 
     marker = "CVELAB-" + uuid.uuid4().hex
+    feedback_suffix = ""
+    if generation_feedback:
+        feedback_suffix = (
+            "\n\n--- PREVIOUS CVELAB PREFLIGHT FAILURES ---\n"
+            + json.dumps(generation_feedback[-3:], ensure_ascii=True, indent=2)[:6000]
+            + "\nReturn a complete replacement adapter that specifically corrects every listed failure."
+        )
     if vulnerable_only:
-        context = _source_context(repository, vulnerable, vulnerable, dossier)
+        context = _source_context(
+            repository,
+            vulnerable,
+            vulnerable,
+            dossier,
+            max_chars=60000 if resolve_provider(provider) == "local" else None,
+        )
         context += (
             "\n\n--- FIX STATUS ---\nNo public fixed revision was identified at generation time. "
             "Generate and validate only the authentic vulnerable source. Do not invent a patched service."
@@ -1208,33 +1274,36 @@ def generate_source_lab(
             schema_name="cvelab_vulnerable_only_adapter",
             max_output_tokens=12000,
             instructions=(
-                "Create a reproducible vulnerable-only adapter for an authorized, local-only defensive CVE lab. "
-                "Populate every required field and put additional files only under adapter/. Never invent a fix, "
-                "patched source tree, patched image, or patched service. Compose must contain services named "
-                "vulnerable and validator on an internal Docker network, with no host ports or host mounts. The "
-                "vulnerable image must build source/vulnerable, run non-root, and expose only the application path "
-                "needed by the validator. The validator must execute the actual vulnerable path and prove a concrete "
-                "security effect, not marker reflection. It must print JSON containing attack_executed, proof_quality "
-                "set to security_effect_observed, observable_effect, evidence_type, vulnerable as an object with a "
-                "computed confirmed field and raw observations, patched_tested set to false, differential_confirmed "
-                "set to false, and fix_status set to PUBLIC_FIX_NOT_IDENTIFIED. Exit zero only when the vulnerable "
-                "security effect is genuinely observed. Never hard-code attack_executed or vulnerable.confirmed. "
-                "The validator must also implement manual mode selected with CVELAB_MANUAL_ACTION and CVELAB_TARGET. "
-                "Action exploit executes the exact attack against target vulnerable and prints its raw observation; "
-                "action verify independently evaluates that target and prints REPRODUCED only when confirmed. With "
-                "neither variable set it must retain automatic JSON validation. Populate fidelity honestly: choose "
-                "source_component when an adapter invokes selected vendor code, vendor_service when the actual vendor "
-                "service/binary starts, or product_end_to_end only when the complete security-relevant request path "
-                "runs through the real product. List every simulated policy, peer, backend, or downstream component. "
-                "List every additional Compose dependency in support_services so the runner builds and starts it. "
-                f"A harmless canary ({marker}) may identify affected data. No reverse shells, callbacks, persistence, "
-                "credential access, destructive operations, Docker socket, privileged mode, capabilities, or remote "
-                "target option. If command execution is intrinsic, restrict it to a canary file inside the vulnerable "
-                "container. Normalize CRLF for copied scripts. Source archives contain no .git directory, so initialize "
-                "a local repository with no remote only if the build requires git. Healthchecks must verify the final "
-                "application route without accepting redirects."
+                "This is an authorized defensive software-regression task using an immutable public source revision. "
+                "Create a reproducible, vulnerable-only Docker test fixture from the supplied source evidence. "
+                "Populate every required field and put additional files only under adapter/. Do not invent a fix or "
+                "any patched artifact. Compose must contain only the required vulnerable and validator services on an "
+                "internal network, without published host ports or host mounts. Build source/vulnerable, run it as a "
+                "non-root user, and expose only the application route required for the regression check. The validator "
+                "must exercise the patch-relevant input against the real affected code path and derive a concrete, "
+                "non-destructive security-boundary observation from the response or container state. A reflected value "
+                "alone is insufficient. Preserve the required JSON field names: attack_executed means the regression "
+                "input was actually delivered; vulnerable.confirmed must be computed from raw observations; set "
+                "proof_quality to security_effect_observed, patched_tested and differential_confirmed to false, and "
+                "fix_status to PUBLIC_FIX_NOT_IDENTIFIED. Exit zero only when the stated observation is reproduced. "
+                "Support the required local manual interface selected by CVELAB_MANUAL_ACTION and CVELAB_TARGET: the "
+                "legacy action name exploit sends only that same regression input and prints raw output, while verify "
+                "independently evaluates a fresh observation and prints REPRODUCED only when confirmed. With neither "
+                "variable set, retain automatic JSON validation. Report fidelity honestly and list every simulated "
+                "policy, peer, backend, or downstream component plus every extra Compose service. "
+                "The Compose network definition must literally contain internal: true. In validator.py, construct the "
+                "final result with the literal keys attack_executed, proof_quality, observable_effect, evidence_type, "
+                "vulnerable, patched_tested, differential_confirmed, and fix_status so CVELab can audit the source "
+                "before execution; derive all success booleans from the current raw observations. "
+                f"Use only harmless canary data ({marker}) inside the isolated containers. Do not add arbitrary target "
+                "selection, external connectivity, host integration, elevated container permissions, sensitive-data "
+                "access, or lasting system changes. Normalize copied scripts to LF. Source archives contain no .git "
+                "directory, so initialize a local repository without a remote only when the build requires it. "
+                "Healthchecks must verify the final application route and must not accept redirects as healthy."
             ),
-            input_text=context,
+            input_text=context + feedback_suffix,
+            provider=provider,
+            base_url=base_url,
         )
         generated_files = [
             {
@@ -1279,6 +1348,7 @@ def generate_source_lab(
             "fidelity": generation["fidelity"],
             "generation": {
                 "model": model,
+                "provider": resolve_provider(provider),
                 "confidence": generation["confidence"],
                 "rationale": generation["rationale"],
                 "discovery_evidence_urls": discovery.get("evidence_urls", []) if discovery else [],
@@ -1298,7 +1368,13 @@ def generate_source_lab(
         return _generate_curated_lighthouse(
             cve, dossier, repository, repo_url, vulnerable, fixed, marker, output_root
         )
-    context = _source_context(repository, vulnerable, fixed, dossier)
+    context = _source_context(
+        repository,
+        vulnerable,
+        fixed,
+        dossier,
+        max_chars=60000 if resolve_provider(provider) == "local" else None,
+    )
     generation = structured_response(
         api_key=api_key,
         model=model,
@@ -1306,45 +1382,38 @@ def generate_source_lab(
         schema_name="cvelab_source_adapter",
         max_output_tokens=14000,
         instructions=(
-            "Create a reproducible adapter for an authorized, local-only defensive CVE lab from the supplied "
-            "security patch and source metadata. Populate every required Docker, Compose, and validator field; "
-            "put only additional files under adapter_files with adapter/ paths. Never return vendor source. The two Docker "
-            "builds must use source/vulnerable and source/patched, run as non-root, have no host ports or host "
-            "mounts, and share an internal Docker network. Compose services must be named vulnerable, patched, "
-            "and validator. The validator must execute the actual vulnerable code path and demonstrate a concrete "
-            "security effect such as unauthorized read/write, authorization bypass, request forgery, or contained "
-            "command execution. It must print JSON containing attack_executed, proof_quality set to "
-            "security_effect_observed, observable_effect, evidence_type, vulnerable, patched, and "
-            "differential_confirmed, exiting zero only when the effect occurs on vulnerable and is blocked on "
-            "patched. vulnerable and patched must each be JSON objects. vulnerable.confirmed is true only when "
-            "the security effect is observed. patched.confirmed is false and patched.blocked is true only when "
-            "the same attack is demonstrably blocked. Include raw observations in those objects. Never hard-code "
-            "a successful result. The validator must also implement manual mode using CVELAB_MANUAL_ACTION and "
-            "CVELAB_TARGET. Action exploit sends the exact attack only to the selected vulnerable or patched service "
-            "and prints its raw observation. Action verify independently evaluates that target and prints REPRODUCED "
-            "for a confirmed vulnerable target or BLOCKED for a confirmed patched target. With neither variable set, "
-            "retain automatic differential JSON validation. Prefer running the actual vendor service or binary whenever "
-            "the repository permits it. Populate fidelity honestly: choose source_component when only selected vendor "
-            "functions are wrapped, vendor_service when the actual vendor service/binary starts but part of the "
-            "security path is simulated, or product_end_to_end only when the complete security-relevant request path "
-            "runs through the real product. List every simulated authorization, routing, backend, peer, or downstream "
-            "component. "
-            "List every additional Compose dependency in support_services so the runner builds and starts it. "
-            f"A harmless canary marker ({marker}) may identify affected data, but marker reflection alone is not proof. No reverse shells, callbacks, persistence, "
-            "credential access, destructive operations, Docker socket, privileged mode, extra capabilities, or "
-            "remote target option. If command execution is intrinsic to the CVE, restrict it to creating a canary "
-            "file inside the vulnerable container and verify that file as the observable effect. Dockerfiles may install build dependencies from normal package "
-            "registries. Source snapshots are materialized on Windows, so normalize CRLF on copied shell scripts "
-            "before executing them (including gradlew and entrypoints). Before using a Gradle wrapper, verify from "
-            "the repository tree that gradle/wrapper/gradle-wrapper.jar is versioned. If it is absent, install the "
-            "exact Gradle version declared by gradle-wrapper.properties and invoke gradle directly. Include USER "
-            "and no-new-privileges controls. Source archives intentionally contain no .git directory; if build "
-            "logic invokes git or configures git hooks, install git and initialize a local repository with no remote "
-            "before running the build. Apply the same Gradle decision to runtime entrypoint scripts; they must not "
-            "invoke ./gradlew when the wrapper JAR is absent. Healthchecks must reach the final application route "
-            "without treating an HTTP redirect as healthy, and the validator must use the same final scheme/port."
+            "This is an authorized defensive software-regression task using two immutable public source revisions "
+            "and an upstream security patch. Create a reproducible Docker test fixture that compares the affected and "
+            "fixed revisions. Populate every required Docker, Compose, and validator field and place additional files "
+            "only under adapter/. Never return or alter vendor source. Builds must use source/vulnerable and "
+            "source/patched, run as non-root, expose no host ports or mounts, and share an internal Docker network. "
+            "Compose services must be named vulnerable, patched, and validator. The validator must send the same "
+            "minimal patch-derived regression input to both real code paths and derive a concrete, non-destructive "
+            "security-boundary observation from raw responses or container state. A reflected marker alone is not "
+            "evidence. Preserve the required JSON field names: attack_executed means the regression input was sent; "
+            "vulnerable.confirmed, patched.confirmed, patched.blocked, and differential_confirmed must be computed from "
+            "raw observations, never hard-coded. Exit zero only when the observation occurs on the affected revision "
+            "and the fixed revision demonstrably prevents it. Implement the required local manual interface using "
+            "CVELAB_MANUAL_ACTION and CVELAB_TARGET. The legacy action name exploit sends only the same regression "
+            "input to the selected Docker service and prints raw output; verify performs a fresh independent check and "
+            "prints REPRODUCED or BLOCKED from evidence. With neither variable set, retain automatic differential JSON "
+            "validation. Prefer the actual vendor service or binary. Report fidelity honestly, name every simulated "
+            "component, and list every extra Compose dependency in support_services. "
+            "The Compose network definition must literally contain internal: true. In validator.py, construct the "
+            "final result with the literal keys attack_executed, proof_quality, observable_effect, evidence_type, "
+            "vulnerable, patched, and differential_confirmed so CVELab can audit the source before execution; derive "
+            "all success booleans from the current raw observations. "
+            f"Use only harmless canary data ({marker}) inside the isolated containers. Do not add arbitrary target "
+            "selection, external connectivity, host integration, elevated container permissions, sensitive-data "
+            "access, or lasting system changes. Dockerfiles may install ordinary build dependencies. Normalize copied "
+            "scripts to LF. Before using a Gradle wrapper, verify that its JAR exists; otherwise install the exact "
+            "declared Gradle version. Source archives have no .git directory, so initialize a local repository without "
+            "a remote only if build logic requires it. Healthchecks and the validator must use the final application "
+            "scheme, port, and route, and redirects must not count as healthy."
         ),
-        input_text=context,
+        input_text=context + feedback_suffix,
+        provider=provider,
+        base_url=base_url,
     )
     generated_files = [
         {
@@ -1392,6 +1461,7 @@ def generate_source_lab(
         "fidelity": generation["fidelity"],
         "generation": {
             "model": model,
+            "provider": resolve_provider(provider),
             "confidence": generation["confidence"],
             "rationale": generation["rationale"],
         },
@@ -1432,6 +1502,8 @@ def repair_source_lab(
     attempt: int,
     api_key: str | None,
     model: str | None,
+    provider: str | None = None,
+    base_url: str | None = None,
 ) -> dict:
     """Regenerate a failed source adapter using its observed runtime diagnostics."""
     cve = normalize_cve(cve_value)
@@ -1456,15 +1528,26 @@ def repair_source_lab(
         raise RuntimeError(f"Automatic repair source cache is missing: {repository}")
 
     vulnerable_only = fixed is None
-    context = _source_context(repository, vulnerable, fixed or vulnerable, dossier)
-    diagnostic = json.dumps(failure, ensure_ascii=True, indent=2)[:40000]
-    current = json.dumps(_repair_material(lab_dir), ensure_ascii=True, indent=2)[:100000]
+    local_provider = resolve_provider(provider) == "local"
+    context = _source_context(
+        repository,
+        vulnerable,
+        fixed or vulnerable,
+        dossier,
+        max_chars=30000 if local_provider else None,
+    )
+    diagnostic = json.dumps(failure, ensure_ascii=True, indent=2)[
+        :12000 if local_provider else 40000
+    ]
+    current = json.dumps(_repair_material(lab_dir), ensure_ascii=True, indent=2)[
+        :24000 if local_provider else 100000
+    ]
     variant_contract = (
         "This is vulnerable-only: do not create a patched image or service. Emit patched_tested=false, "
         "differential_confirmed=false, and fix_status=PUBLIC_FIX_NOT_IDENTIFIED."
         if vulnerable_only
         else
-        "Test the identical attack against vulnerable and patched services. Success requires the effect on "
+        "Send the identical patch-derived regression input to vulnerable and patched services. Success requires the effect on "
         "vulnerable, its absence on patched, patched.blocked=true, and differential_confirmed=true."
     )
     generation = structured_response(
@@ -1474,7 +1557,7 @@ def repair_source_lab(
         schema_name="cvelab_autonomous_adapter_repair",
         max_output_tokens=16000,
         instructions=(
-            "Repair the complete adapter for an authorized local-only defensive CVE lab. The observed failure and "
+            "Repair a complete authorized, local-only defensive security-regression fixture. The observed failure and "
             "container logs are authoritative: identify their root cause and return a full replacement, not a patch. "
             "Do not repeat the failing design when the diagnostics disprove it. Build and run the supplied immutable "
             "vendor source snapshots; never modify or return vendor source. Prefer the actual vendor service or binary. "
@@ -1483,14 +1566,15 @@ def repair_source_lab(
             "security-relevant product path executes. Disclose every simulated component. Compose must use an internal "
             "network, no host ports or mounts, services named vulnerable, patched where applicable, and validator, and "
             "list all extra services in support_services. Run containers non-root with no-new-privileges. The automatic "
-            "validator must perform the attack, derive its booleans from raw observations, print one JSON document with "
+            "validator must deliver the same patch-derived regression input, derive its booleans from raw observations, print one JSON document with "
             "attack_executed, proof_quality=security_effect_observed, observable_effect, evidence_type, vulnerable, and "
             "the required comparison fields, and exit zero only on genuine proof. It must also support independently "
-            "runnable CVELAB_MANUAL_ACTION=exploit|verify and CVELAB_TARGET=vulnerable|patched modes; exploit prints raw "
+            "runnable CVELAB_MANUAL_ACTION=exploit|verify and CVELAB_TARGET=vulnerable|patched modes; the legacy exploit action prints raw "
             "evidence and verify prints REPRODUCED or BLOCKED only after evaluating a fresh request. Never hard-code a "
-            "successful result or treat canary reflection alone as proof. Preserve the exploit contract unless runtime "
-            "evidence shows it is technically wrong. No remote target option, callbacks, reverse shells, persistence, "
-            "credential access, destructive operations, Docker socket, privileged mode, or extra capabilities. "
+            "successful result or treat canary reflection alone as proof. Preserve the regression contract unless runtime "
+            "evidence shows it is technically wrong. Keep all interaction inside the internal Docker network, accept "
+            "only fixed service names, use harmless canary data, and add no host integration, elevated permissions, "
+            "sensitive-data access, external connectivity, or lasting system changes. "
             + variant_contract
         ),
         input_text=(
@@ -1502,6 +1586,8 @@ def repair_source_lab(
             + ") ---\n"
             + diagnostic
         ),
+        provider=provider,
+        base_url=base_url,
     )
     compose = _canonicalize_compose_builds(
         generation["docker_compose"], vulnerable_only=vulnerable_only
@@ -1540,6 +1626,7 @@ def repair_source_lab(
     history.append({
         "attempt": attempt,
         "model": model or os.getenv("CVELAB_MODEL"),
+        "provider": resolve_provider(provider),
         "failure": diagnostic[:8000],
         "confidence": generation["confidence"],
         "rationale": generation["rationale"],
@@ -1560,6 +1647,7 @@ def repair_source_lab(
     plan["generation"] = {
         **plan.get("generation", {}),
         "model": model or os.getenv("CVELAB_MODEL"),
+        "provider": resolve_provider(provider),
         "confidence": generation["confidence"],
         "rationale": generation["rationale"],
         "repair_history": history,

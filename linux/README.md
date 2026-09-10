@@ -33,11 +33,27 @@ export PATH="$HOME/.local/bin:$PATH"
 cvelab --output-root "$HOME/cvelab-labs" \
   auto CVE-YYYY-NNNNN \
   --ai on \
+  --provider openai \
   --key \
   --model gpt-5.6-sol
 ```
 
-At the `OpenAI API key:` prompt, enter only the API key. The installer does not save the key.
+At the masked provider API-key prompt, enter only the API key. The installer does not save the key.
+
+Anthropic and local examples:
+
+```bash
+cvelab auto CVE-YYYY-NNNNN \
+  --provider anthropic --key --model YOUR_ANTHROPIC_MODEL
+
+cvelab auto CVE-YYYY-NNNNN \
+  --provider local --base-url http://127.0.0.1:11434/v1 \
+  --model cvelab-qwen2.5-coder:7b
+```
+
+For Ollama, create the selected model with at least a 64K context (`PARAMETER num_ctx
+65536` in its `Modelfile`). The common 4K default is too small for CVELab source prompts.
+Local requests allow 30 minutes by default; `CVELAB_LOCAL_TIMEOUT` changes this value.
 
 ## CVEs without a public fix
 

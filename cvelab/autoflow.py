@@ -30,6 +30,13 @@ def _infrastructure_failure(message: str) -> bool:
         "openai api http 401",
         "openai api http 403",
         "openai_api_key is not set",
+        "anthropic_api_key is not set",
+        "anthropic api http 400",
+        "anthropic api http 404",
+        "anthropic reached max_tokens",
+        "anthropic refused structured generation",
+        "anthropic response did not contain structured output",
+        "could not connect to local api",
         "cvelab_model is not set",
     )
     return any(indicator in lowered for indicator in indicators)
@@ -66,6 +73,8 @@ def run_auto_workflow(
     keep: bool,
     max_attempts: int = 4,
     progress: Progress | None = None,
+    provider: str | None = None,
+    base_url: str | None = None,
 ) -> dict:
     """Generate, execute, diagnose, repair, and re-run a CVE lab autonomously."""
     if max_attempts < 1:
@@ -74,6 +83,7 @@ def run_auto_workflow(
     cve = normalize_cve(cve_value)
     lab_dir = output_root.resolve() / cve
     attempts: list[dict] = []
+    generation_feedback: list[str] = []
     _record(lab_dir, attempts)
 
     generated = None
@@ -88,8 +98,12 @@ def run_auto_workflow(
                 vulnerable_ref,
                 api_key,
                 model,
+                provider,
+                base_url,
+                generation_feedback,
             )
         except Exception as exc:
+            generation_feedback.append(str(exc)[:6000])
             attempts.append({
                 "phase": "generation",
                 "attempt": generation_attempt,
@@ -161,6 +175,8 @@ def run_auto_workflow(
                     repair_calls,
                     api_key,
                     model,
+                    provider,
+                    base_url,
                 )
             except Exception as exc:
                 attempts.append({
@@ -223,7 +239,9 @@ def run_auto_workflow(
                 )
                 _record(lab_dir, attempts, "VALIDATED")
                 announce(f"{cve}: exploit, patched control, and manual PoC verified")
-                delivered = create_deliverables(cve, lab_dir, validated, api_key, model)
+                delivered = create_deliverables(
+                    cve, lab_dir, validated, api_key, model, provider, base_url
+                )
                 delivered["automation"] = automation
                 return delivered
             pending_failure = {

@@ -86,7 +86,14 @@ def _catalog_entry(cve: str) -> tuple[dict[str, Any] | None, str | None]:
     return None, None
 
 
-def _ai_plan(cve: str, dossier: dict[str, Any], api_key: str | None, model: str | None) -> dict[str, Any]:
+def _ai_plan(
+    cve: str,
+    dossier: dict[str, Any],
+    api_key: str | None,
+    model: str | None,
+    provider: str | None = None,
+    base_url: str | None = None,
+) -> dict[str, Any]:
     return structured_response(
         api_key=api_key,
         model=model,
@@ -95,8 +102,9 @@ def _ai_plan(cve: str, dossier: dict[str, Any], api_key: str | None, model: str 
             "Use only public vendor documentation, advisories, official registries, and precise evidence. "
             "Return READY only when an exact publicly accessible vulnerable Docker image tag, HTTP port, "
             "and non-destructive marker-only HTTP reproduction are documented. Never guess image names, "
-            "tags, endpoints, credentials, or patched behavior. Do not produce command execution, shells, "
-            "persistence, credential theft, destructive payloads, or remote-target instructions. "
+            "tags, endpoints, credentials, or patched behavior. Keep the result to a marker-based HTTP regression "
+            "request against the named service inside the generated Docker network; do not add capabilities or "
+            "targets beyond that contained check. "
             "Use relative HTTP paths only and express headers as name/value list items. "
             "Use null for optional match predicates that do not apply. "
             "If proprietary artifacts, authentication, a license, non-HTTP interaction, or missing technical "
@@ -108,6 +116,8 @@ def _ai_plan(cve: str, dossier: dict[str, Any], api_key: str | None, model: str 
         max_output_tokens=5000,
         tools=[{"type": "web_search"}],
         include=["web_search_call.action.sources"],
+        provider=provider,
+        base_url=base_url,
     )
 
 
@@ -169,13 +179,17 @@ def run_closed_auto(
     output_root: Path,
     api_key: str | None,
     model: str | None,
+    provider: str | None = None,
+    base_url: str | None = None,
 ) -> dict[str, Any]:
     cve = normalize_cve(cve_value)
     entry, catalog_source = _catalog_entry(cve)
     dossier: dict[str, Any] | None = None
     if entry is None:
         dossier = collect_cve(cve)
-        plan = _normalize_plan(_ai_plan(cve, dossier, api_key, model))
+        plan = _normalize_plan(
+            _ai_plan(cve, dossier, api_key, model, provider, base_url)
+        )
         resolution_source = "public_research"
     else:
         plan = _normalize_plan(entry)

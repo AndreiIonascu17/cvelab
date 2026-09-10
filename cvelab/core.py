@@ -12,7 +12,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-from .ai import plan_with_openai
+from .ai import ai_is_configured, plan_with_ai
 from .templates import APP_PY, DOCKERFILE, VALIDATOR_DOCKERFILE, VALIDATOR_PY, compose_yaml
 
 SUPPORTED_CWES = {"CWE-22", "CWE-78", "CWE-89", "CWE-284", "CWE-434", "CWE-918"}
@@ -69,6 +69,8 @@ def select_cwe(
     ai_mode: str,
     api_key: str | None = None,
     model: str | None = None,
+    provider: str | None = None,
+    base_url: str | None = None,
 ) -> tuple[str, dict | None]:
     explicit = normalize_cwe(override)
     candidates = [explicit] if explicit else dossier.get("cwes", [])
@@ -76,16 +78,21 @@ def select_cwe(
         if candidate in SUPPORTED_CWES:
             return candidate, None
 
-    effective_key = api_key or os.getenv("OPENAI_API_KEY")
-    if ai_mode in {"auto", "on"} and effective_key:
-        ai_plan = plan_with_openai(dossier, api_key=api_key, model=model)
+    if ai_mode in {"auto", "on"} and ai_is_configured(api_key, model, provider):
+        ai_plan = plan_with_ai(
+            dossier,
+            api_key=api_key,
+            model=model,
+            provider=provider,
+            base_url=base_url,
+        )
         candidate = normalize_cwe(ai_plan.get("cwe"))
         if candidate in SUPPORTED_CWES:
             return candidate, ai_plan
         if ai_mode == "on":
             raise RuntimeError(f"AI selected unsupported CWE: {candidate}")
     elif ai_mode == "on":
-        raise RuntimeError("--ai on requires OPENAI_API_KEY and CVELAB_MODEL")
+        raise RuntimeError("--ai on requires a configured AI provider and CVELAB_MODEL")
 
     found = ", ".join(dossier.get("cwes", [])) or "none"
     raise RuntimeError(f"No supported CWE found (metadata: {found}). Use --cwe with one of {sorted(SUPPORTED_CWES)}")
@@ -116,10 +123,14 @@ def build_lab(
     ai_mode: str,
     api_key: str | None = None,
     model: str | None = None,
+    provider: str | None = None,
+    base_url: str | None = None,
 ) -> dict:
     cve = normalize_cve(cve_value)
     dossier = collect_cve(cve)
-    cwe, ai_plan = select_cwe(dossier, cwe_override, ai_mode, api_key, model)
+    cwe, ai_plan = select_cwe(
+        dossier, cwe_override, ai_mode, api_key, model, provider, base_url
+    )
     lab_dir = output_root.resolve() / cve
     digest = int(hashlib.sha256(cve.encode()).hexdigest()[:6], 16)
     vulnerable_port = 20000 + (digest % 18000)

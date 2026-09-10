@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .ai import structured_response
+from .ai import ai_is_configured, structured_response
 from .core import write_text
 
 
@@ -193,8 +193,10 @@ def _automatic_analysis(
     dossier: dict,
     plan: dict,
     report: dict,
-    api_key: str,
-    model: str,
+    api_key: str | None,
+    model: str | None,
+    provider: str | None = None,
+    base_url: str | None = None,
 ) -> dict:
     material = {"cve_dossier": dossier, "lab_plan": plan, "validation_report": report}
     return structured_response(
@@ -210,12 +212,15 @@ def _automatic_analysis(
             "Treat lab_plan.fidelity as authoritative: never describe source_component as product end-to-end, and "
             "name simulated components when explaining limitations. "
             "Explain the actual vulnerability mechanism and prerequisites, not merely the CWE definition. "
-            "For attack_path, describe the executed local exploit path and its observed security effect, not remote "
-            "targeting instructions. Do not add shells, persistence, credential access, destructive actions, or "
-            "unverified versions, commits, patches, mitigations, or repositories. If a fix is not in the input, say "
+            "For the legacy attack_path field, describe only the regression input already executed inside the generated "
+            "Docker network and its observed security effect. Do not introduce capabilities, targets, procedures, or "
+            "claims beyond the contained test evidence. Do not add unverified versions, commits, patches, mitigations, "
+            "or repositories. If a fix is not in the input, say "
             "that remediation status cannot be confirmed from the collected record."
         ),
         input_text=json.dumps(material, ensure_ascii=True),
+        provider=provider,
+        base_url=base_url,
     )
 
 
@@ -225,6 +230,8 @@ def create_deliverables(
     result: dict,
     api_key: str | None = None,
     model: str | None = None,
+    provider: str | None = None,
+    base_url: str | None = None,
 ) -> dict:
     plan = json.loads((lab_dir / "plan.json").read_text(encoding="utf-8"))
     dossier = json.loads((lab_dir / "dossier.json").read_text(encoding="utf-8"))
@@ -261,9 +268,11 @@ def create_deliverables(
         }
     analysis = None
     analysis_error = None
-    if api_key and model:
+    if model and ai_is_configured(api_key, model, provider):
         try:
-            analysis = _automatic_analysis(dossier, plan, report, api_key, model)
+            analysis = _automatic_analysis(
+                dossier, plan, report, api_key, model, provider, base_url
+            )
         except Exception as exc:
             # The evidence-backed deterministic report is still complete. A
             # prose-analysis API failure must not discard a validated PoC.

@@ -27,7 +27,7 @@ Native Linux is the recommended platform. Windows remains supported through Dock
 - Git available in `PATH`.
 - Bash, Make, and curl for E2E profiles that use Shipyard/Kind.
 - WSL with a Kali distribution is required for Shipyard only on Windows.
-- An OpenAI API key and a compatible model for automatic adapter generation.
+- An OpenAI or Anthropic API key, or a local OpenAI-compatible model server, for automatic adapter generation.
 - Legal access to the product and any required license for closed-source software.
 
 ## Installation
@@ -76,7 +76,69 @@ On Windows:
 cvelab --output-root "C:\OffSec Lab\cvelab\generated-labs" auto CVE-YYYY-NNNNN --ai on --key --model gpt-5.6-sol
 ```
 
-The `--key` option without a value opens the masked `OpenAI API key:` prompt. The key is not written to the project or included in the command line.
+The `--key` option without a value opens a masked prompt for the selected provider. The key is not written to the project or included in the command line.
+
+## AI providers
+
+CVELab supports OpenAI, Anthropic, and local servers exposing an OpenAI-compatible
+`/v1/chat/completions` endpoint. Selecting the provider explicitly is recommended.
+
+OpenAI:
+
+```bash
+cvelab auto CVE-YYYY-NNNNN \
+  --provider openai --key --model YOUR_OPENAI_MODEL
+```
+
+Anthropic:
+
+```bash
+cvelab auto CVE-YYYY-NNNNN \
+  --provider anthropic --key --model YOUR_ANTHROPIC_MODEL
+```
+
+Local model, using Ollama's default OpenAI-compatible endpoint:
+
+```bash
+ollama create cvelab-qwen2.5-coder:7b -f linux/ollama/Modelfile.qwen2.5-coder-7b
+cvelab auto CVE-YYYY-NNNNN \
+  --provider local \
+  --base-url http://127.0.0.1:11434/v1 \
+  --model cvelab-qwen2.5-coder:7b
+```
+
+Use an Ollama `Modelfile` with enough context for source patches and generated adapters:
+
+```text
+FROM qwen2.5-coder:7b
+PARAMETER num_ctx 65536
+```
+
+The standard Ollama context on GPUs below 24 GiB is only 4096 tokens, which is too small
+for typical CVELab source-generation prompts. A 64K context is recommended. Larger context
+windows require more RAM or VRAM. Local generation can be slow on CPU, so CVELab allows
+30 minutes per local response by default; override this with `CVELAB_LOCAL_TIMEOUT` in seconds.
+
+A local API key is optional. For servers such as vLLM, llama.cpp, or an authenticated
+gateway, change `--base-url` and pass `--key` when required.
+
+The equivalent environment variables are:
+
+```bash
+export CVELAB_AI_PROVIDER=openai     # openai, anthropic, or local
+export CVELAB_MODEL=YOUR_MODEL
+export OPENAI_API_KEY=YOUR_KEY       # OpenAI only
+export ANTHROPIC_API_KEY=YOUR_KEY    # Anthropic only
+export CVELAB_ANTHROPIC_EFFORT=low  # optional: low, medium, high, xhigh, max
+export CVELAB_BASE_URL=http://127.0.0.1:11434/v1  # local only
+export CVELAB_LOCAL_API_KEY=YOUR_KEY # optional local authentication
+export CVELAB_LOCAL_TIMEOUT=1800      # optional local request timeout
+```
+
+With `--provider auto`, `CVELAB_BASE_URL` selects local, an Anthropic key without an
+OpenAI key selects Anthropic, and OpenAI is the fallback. Local endpoints do not provide
+CVELab with web search. If the CVE record does not contain exact source references, pass
+`--repo`, `--vulnerable-ref`, and, when available, `--fixed-ref` explicitly.
 
 Example:
 
