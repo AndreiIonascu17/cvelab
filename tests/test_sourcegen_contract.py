@@ -201,3 +201,49 @@ class ExternalTargetGuardTests(unittest.TestCase):
             Path(__file__).resolve().parent.parent / "cvelab" / "sourcegen.py"
         ).read_text(encoding="utf-8")
         self.assertIn('if "{" in url:', source)
+
+
+class AdapterTreeTests(unittest.TestCase):
+    """adapter/ holds a project, not a flat list of files.
+
+    Exercising a library usually means a real one: package.json beside its
+    source, go.mod beside a main. Allowing a single level under adapter/
+    refused a lodash lab three times over
+    adapter/vulnerable/package.json, and the repair budget ran out on a
+    structural rule rather than on anything about the vulnerability.
+    """
+
+    def allowed(self, path: str) -> bool:
+        from pathlib import PurePosixPath
+
+        from cvelab.sourcegen import ALLOWED_GENERATED
+
+        pure = PurePosixPath(path)
+        if pure.is_absolute() or ".." in pure.parts:
+            return False
+        return bool(ALLOWED_GENERATED.fullmatch(path))
+
+    def test_a_nested_project_is_allowed(self) -> None:
+        self.assertTrue(self.allowed("adapter/vulnerable/package.json"))
+        self.assertTrue(self.allowed("adapter/a/b/c/index.js"))
+
+    def test_the_flat_files_still_work(self) -> None:
+        for path in (
+            "adapter/server.js",
+            "docker-compose.yml",
+            "validator/validator.py",
+            "vulnerable/Dockerfile",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(self.allowed(path))
+
+    def test_escaping_the_directory_is_still_refused(self) -> None:
+        for path in ("../etc/passwd", "/etc/passwd", "adapter/../../x", "adapter/"):
+            with self.subTest(path=path):
+                self.assertFalse(self.allowed(path))
+
+    def test_a_file_outside_the_allowed_roots_is_still_refused(self) -> None:
+        # Depth is not what makes a path unsafe; writing outside the
+        # adapter is.
+        self.assertFalse(self.allowed("server.js"))
+        self.assertFalse(self.allowed("source/vulnerable/x.py"))

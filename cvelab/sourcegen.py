@@ -164,9 +164,17 @@ GITLAB_COMMIT = re.compile(
     r"^(https://[^/]+/[^/]+/[^/]+?)/-/commit/([0-9a-f]{7,40})(?:[?#].*)?$",
     re.IGNORECASE,
 )
+# adapter/ takes a tree, not a flat list of files. Exercising a library
+# usually means a real project -- package.json beside its source, a go.mod
+# beside a main -- and allowing only one level under adapter/ left no way
+# to express that: a lodash lab was refused three times for writing
+# adapter/vulnerable/package.json. Depth is not what makes a path unsafe;
+# escaping the directory is, and that is still refused by the absolute and
+# ".." checks at the call site.
 ALLOWED_GENERATED = re.compile(
     r"^(docker-compose\.yml|\.dockerignore|(?:vulnerable|patched)/Dockerfile|"
-    r"validator/(?:Dockerfile|validator\.py|requirements\.txt)|adapter/[A-Za-z0-9_.-]+)$"
+    r"validator/(?:Dockerfile|validator\.py|requirements\.txt)|"
+    r"adapter/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)$"
 )
 FORBIDDEN = {
     "privileged:": "privileged containers",
