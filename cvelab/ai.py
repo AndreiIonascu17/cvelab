@@ -1,3 +1,17 @@
+# Copyright 2026 SyncBit Software SRL and the CVELab contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import json
@@ -7,6 +21,18 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
+from . import usage
+from .providers import (
+    CHAT_COMPLETIONS,
+    MESSAGES,
+    PROVIDERS,
+    RESPONSES,
+    SELECTABLE,
+    auth_headers_for,
+    endpoint_for,
+    timeout_for,
+)
+from .providers import get as get_provider
 
 PLAN_SCHEMA = {
     "type": "object",
@@ -22,7 +48,9 @@ PLAN_SCHEMA = {
 }
 
 
-SUPPORTED_PROVIDERS = {"auto", "openai", "anthropic", "local"}
+# Derived, never maintained by hand: see cvelab/providers.py.
+SUPPORTED_PROVIDERS = set(SELECTABLE)
+PROVIDER_KEY_VARIABLE = {p.name: p.key_variable for p in PROVIDERS.values()}
 
 
 class AIHTTPError(RuntimeError):
@@ -35,25 +63,30 @@ def resolve_provider(provider: str | None = None) -> str:
     selected = (provider or os.getenv("CVELAB_AI_PROVIDER") or "auto").lower()
     if selected not in SUPPORTED_PROVIDERS:
         raise ValueError(
-            f"Unsupported AI provider: {selected}. Choose openai, anthropic, or local."
+            f"Unsupported AI provider: {selected}. Choose "
+            + ", ".join(PROVIDERS)
+            + "."
         )
     if selected != "auto":
         return selected
+    # A base URL means the user pointed us somewhere, which is what local is.
     if os.getenv("CVELAB_BASE_URL"):
         return "local"
-    if os.getenv("ANTHROPIC_API_KEY") and not os.getenv("OPENAI_API_KEY"):
-        return "anthropic"
+    # Otherwise the first provider whose key is present wins, with OpenAI
+    # last so an existing OpenAI setup keeps behaving as it did.
+    present = [
+        name for name, p in PROVIDERS.items()
+        if p.key_variable and os.getenv(p.key_variable) and name != "openai"
+    ]
+    if present and not os.getenv("OPENAI_API_KEY"):
+        return present[0]
     return "openai"
 
 
 def _provider_key(provider: str, api_key: str | None) -> str | None:
     if api_key:
         return api_key
-    if provider == "openai":
-        return os.getenv("OPENAI_API_KEY")
-    if provider == "anthropic":
-        return os.getenv("ANTHROPIC_API_KEY")
-    return os.getenv("CVELAB_LOCAL_API_KEY")
+    return os.getenv(PROVIDER_KEY_VARIABLE.get(provider, "CVELAB_LOCAL_API_KEY"))
 
 
 def ai_is_configured(
@@ -63,11 +96,12 @@ def ai_is_configured(
 ) -> bool:
     selected = resolve_provider(provider)
     selected_model = model or os.getenv("CVELAB_MODEL")
-    return bool(selected_model and (selected == "local" or _provider_key(selected, api_key)))
+    required = get_provider(selected).requires_key
+    return bool(selected_model and (not required or _provider_key(selected, api_key)))
 
 
 def provider_supports_web_search(provider: str | None = None) -> bool:
-    return resolve_provider(provider) in {"openai", "anthropic"}
+    return get_provider(resolve_provider(provider)).web_search
 
 
 def _local_base_url(base_url: str | None) -> str:
@@ -263,10 +297,11 @@ def _openai_response(
         body["include"] = include
     payload = _request_json(
         "OpenAI",
-        "https://api.openai.com/v1/responses",
+        endpoint_for("openai"),
         body,
-        {"Authorization": f"Bearer {api_key}"},
+        auth_headers_for("openai", api_key),
     )
+    usage.record("openai", model, payload)
     for item in payload.get("output", []):
         if item.get("type") != "message":
             continue
@@ -309,18 +344,19 @@ def _anthropic_response(
         ]
     payload = _request_json(
         "Anthropic",
-        "https://api.anthropic.com/v1/messages",
+        endpoint_for("anthropic"),
         body,
-        {"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+        auth_headers_for("anthropic", api_key),
     )
+    usage.record("anthropic", model, payload)
     stop_reason = payload.get("stop_reason")
-    usage = payload.get("usage", {})
+    token_usage = payload.get("usage", {})
     content = payload.get("content", [])
     content_types = [block.get("type", "unknown") for block in content]
     if stop_reason == "max_tokens":
         raise RuntimeError(
             "Anthropic reached max_tokens before producing structured output "
-            f"(output_tokens={usage.get('output_tokens', 'unknown')}, "
+            f"(output_tokens={token_usage.get('output_tokens', 'unknown')}, "
             f"content_types={content_types})"
         )
     if stop_reason == "refusal" or any(block.get("type") == "refusal" for block in content):
@@ -332,12 +368,13 @@ def _anthropic_response(
             return _decode_json_text(block.get("text", ""), "Anthropic")
     raise RuntimeError(
         "Anthropic response did not contain structured output "
-        f"(stop_reason={stop_reason!r}, output_tokens={usage.get('output_tokens', 'unknown')}, "
+        f"(stop_reason={stop_reason!r}, output_tokens={token_usage.get('output_tokens', 'unknown')}, "
         f"content_types={content_types})"
     )
 
 
-def _local_response(
+def _chat_completions_response(
+    provider_name: str,
     api_key: str | None,
     base_url: str | None,
     model: str,
@@ -347,44 +384,73 @@ def _local_response(
     schema_name: str,
     max_output_tokens: int,
 ) -> dict:
-    base = _local_base_url(base_url)
-    url = base if base.endswith("/chat/completions") else base + "/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    """The OpenAI chat/completions dialect, for every provider that speaks it.
+
+    DeepSeek and a local server differ only in things the registry declares:
+    the endpoint, whether a key is needed, how long to wait, and whether
+    response_format json_schema is accepted. Where it is not, the schema
+    travels in the instructions and the structure is validated after the
+    response arrives, as it is for every provider.
+    """
+    provider = get_provider(provider_name)
+    if provider_name == "local":
+        # A local URL is whatever the user typed, so it is checked for
+        # credentials and stray components before it is used.
+        base = _local_base_url(base_url)
+        url = base if base.endswith("/chat/completions") else base + "/chat/completions"
+    else:
+        url = endpoint_for(provider_name, base_url)
+    headers = auth_headers_for(provider_name, api_key)
+    timeout = _local_timeout() if provider_name == "local" else timeout_for(provider_name)
+
+    schema_json = json.dumps(schema, ensure_ascii=True)
+    system = instructions
+    if not provider.json_schema:
+        system += (
+            " Return exactly one JSON object matching this schema, with no "
+            "prose and no code fence: " + schema_json
+        )
     body = {
         "model": model,
         "messages": [
-            {"role": "system", "content": instructions},
+            {"role": "system", "content": system},
             {"role": "user", "content": input_text},
         ],
         "temperature": 0,
         "max_tokens": max_output_tokens,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {"name": schema_name, "strict": True, "schema": schema},
-        },
+        "response_format": (
+            {"type": "json_schema",
+             "json_schema": {"name": schema_name, "strict": True, "schema": schema}}
+            if provider.json_schema
+            else {"type": "json_object"}
+        ),
     }
     try:
-        payload = _request_json(
-            "Local", url, body, headers, timeout_seconds=_local_timeout()
-        )
+        payload = _request_json(provider.label, url, body, headers, timeout_seconds=timeout)
     except AIHTTPError as exc:
-        if exc.status not in {400, 422}:
+        if not provider.json_schema or exc.status not in {400, 422}:
             raise
+        # The server refused the schema form; say it in words instead.
         body["response_format"] = {"type": "json_object"}
         body["messages"][0]["content"] += (
-            " Return exactly one JSON object matching this schema: "
-            + json.dumps(schema, ensure_ascii=True)
+            " Return exactly one JSON object matching this schema: " + schema_json
         )
-        payload = _request_json(
-            "Local", url, body, headers, timeout_seconds=_local_timeout()
-        )
+        payload = _request_json(provider.label, url, body, headers, timeout_seconds=timeout)
+
+    usage.record(provider_name, model, payload)
     choices = payload.get("choices", [])
     if not choices:
-        raise RuntimeError("Local API response did not contain a completion choice")
-    content = choices[0].get("message", {}).get("content", "")
+        raise RuntimeError(f"{provider.label} response did not contain a completion choice")
+    content = (choices[0].get("message", {}) or {}).get("content", "")
     if isinstance(content, list):
         content = "".join(item.get("text", "") for item in content if isinstance(item, dict))
-    return _decode_json_text(str(content), "Local")
+    if not str(content).strip():
+        finish = choices[0].get("finish_reason")
+        raise RuntimeError(
+            f"{provider.label} returned no content (finish_reason={finish!r}); "
+            "a truncated response usually means max_tokens was reached"
+        )
+    return _decode_json_text(str(content), provider.label)
 
 
 def structured_response(
@@ -404,8 +470,8 @@ def structured_response(
     selected = resolve_provider(provider)
     api_key = _provider_key(selected, api_key)
     model = model or os.getenv("CVELAB_MODEL")
-    if selected != "local" and not api_key:
-        variable = "OPENAI_API_KEY" if selected == "openai" else "ANTHROPIC_API_KEY"
+    if get_provider(selected).requires_key and not api_key:
+        variable = PROVIDER_KEY_VARIABLE[selected]
         raise RuntimeError(f"{variable} is not set; use --key or the environment variable")
     if not model:
         raise RuntimeError("CVELAB_MODEL is not set; use --model or the environment variable")
@@ -413,26 +479,31 @@ def structured_response(
         " Write all generated prose, documentation, comments, and user-facing messages in English. "
         "Preserve source quotations, identifiers, and raw evidence verbatim."
     )
-    if selected == "openai":
+    provider = get_provider(selected)
+    # Dispatch on the dialect, not the name: a provider that speaks one we
+    # already handle needs no new request code.
+    if tools and not provider.web_search:
+        instructions += (
+            " No web-search tool is available from this endpoint. Use only the supplied input and "
+            "return insufficient-data status rather than inventing provenance."
+        )
+    if provider.dialect == RESPONSES:
         result = _openai_response(
             api_key or "", model, instructions, input_text, schema, schema_name,
             max_output_tokens, tools, include,
         )
-    elif selected == "anthropic":
+    elif provider.dialect == MESSAGES:
         result = _anthropic_response(
             api_key or "", model, instructions, input_text, schema,
             max_output_tokens, tools,
         )
-    else:
-        if tools:
-            instructions += (
-                " No web-search tool is available from this local endpoint. Use only the supplied input and "
-                "return insufficient-data status rather than inventing provenance."
-            )
-        result = _local_response(
-            api_key, base_url, model, instructions, input_text, schema,
-            schema_name, max_output_tokens,
+    elif provider.dialect == CHAT_COMPLETIONS:
+        result = _chat_completions_response(
+            selected, api_key, base_url, model, instructions, input_text,
+            schema, schema_name, max_output_tokens,
         )
+    else:
+        raise RuntimeError(f"No handler for dialect {provider.dialect!r}")
     _validate_schema(result, schema)
     return result
 

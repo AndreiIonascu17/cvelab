@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability in CVELab
+    url: https://github.com/AndreiIonascu17/cvelab/security/advisories/new
+    about: Report privately. Do not open a public issue for a security defect.
+  - name: Question or idea
+    url: https://github.com/AndreiIonascu17/cvelab/discussions
+    about: Ask about usage, interpreting results, or propose a direction.
+  - name: Email support
+    url: mailto:support@syncbitsoft.com
+    about: Installation or usage help that does not belong in a public issue.
+  - name: Usage guide
+    url: https://github.com/AndreiIonascu17/cvelab/blob/main/GUIDE.md
+    about: Installation, configuration, result interpretation, and troubleshooting.

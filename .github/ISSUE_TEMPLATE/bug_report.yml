@@ -1,0 +1,60 @@
+name: Bug report
+description: CVELab itself misbehaves, independent of any specific CVE
+title: "[bug] "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a CVE that will not reproduce, use the "CVE failed to reproduce"
+        template instead. For a security defect in CVELab, do not open an
+        issue: see SECURITY.md.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands, with any API key removed.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Output or error
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: "cvelab 0.6.0, Debian 13, Python 3.13.2, Docker 28.1.1"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I removed every API key from the output I pasted.
+          required: true
+        - label: "`docker info` succeeds for my user."
+          required: true

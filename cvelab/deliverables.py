@@ -1,3 +1,17 @@
+# Copyright 2026 SyncBit Software SRL and the CVELab contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import json
@@ -5,7 +19,6 @@ from pathlib import Path
 
 from .ai import ai_is_configured, structured_response
 from .core import write_text
-
 
 ANALYSIS_SCHEMA = {
     "type": "object",
@@ -282,119 +295,21 @@ def create_deliverables(
     elif (artifacts / "analysis.json").is_file():
         analysis = json.loads((artifacts / "analysis.json").read_text(encoding="utf-8"))
 
-    if plan.get("scenario") == "lighthouse_broker_namespace_injection_e2e":
-        poc_path = artifacts / "PoC.yaml"
-        write_text(poc_path, (lab_dir / "e2e" / "poc.yaml").read_text(encoding="utf-8"))
-        write_text(
-            artifacts / "manual.sh",
-            (lab_dir / "e2e" / "manual.sh").read_text(encoding="utf-8"),
-        )
-        manual_wrapper = r'''param(
-    [Parameter(Mandatory=$true)]
-    [ValidateSet("setup", "exploit", "verify", "cleanup")]
-    [string]$Action,
-    [ValidateSet("vulnerable", "patched")]
-    [string]$Variant = "vulnerable"
-)
-$script = Join-Path $PSScriptRoot "manual.sh"
-$wslScript = (& wsl -d kali-linux -u root -- wslpath -a $script).Trim()
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-& wsl -d kali-linux -u root -- bash $wslScript $Action $Variant
-exit $LASTEXITCODE
-'''
-        write_text(artifacts / "PoC.ps1", manual_wrapper)
-        manual_guide = fr'''# {cve} Manual PoC
-
-This kit reproduces the real authorization-bypass effect in a disposable local two-cluster lab.
-The lab stays active between steps so every resource and command can be inspected.
-
-## Vulnerable reproduction on Linux
-
-```bash
-cd "{artifacts}"
-cat PoC.yaml
-bash manual.sh setup vulnerable
-bash manual.sh exploit
-bash manual.sh verify
-```
-
-## Vulnerable reproduction on Windows/WSL
-
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-Set-Location "{artifacts}"
-Get-Content .\PoC.yaml
-.\PoC.ps1 setup vulnerable
-.\PoC.ps1 exploit
-.\PoC.ps1 verify
-```
-
-Successful reproduction prints `REPRODUCED` and displays an `EndpointSlice` in
-`cluster1/kube-system` containing the attacker-controlled TEST-NET address `198.51.100.77`.
-
-## Cleanup
-
-```bash
-bash manual.sh cleanup
-```
-
-On Windows/WSL:
-
-```powershell
-.\PoC.ps1 cleanup
-```
-
-## Patched control
-
-```bash
-bash manual.sh setup patched
-bash manual.sh exploit
-bash manual.sh verify
-bash manual.sh cleanup
-```
-
-On Windows/WSL:
-
-```powershell
-.\PoC.ps1 setup patched
-.\PoC.ps1 exploit
-.\PoC.ps1 verify
-.\PoC.ps1 cleanup
-```
-
-The patched control succeeds only when it prints `BLOCKED` and no attacker-controlled
-`EndpointSlice` appears in `cluster1/kube-system`.
-
-## Files
-
-- `PoC.yaml`: inspectable attack payload.
-- `PoC.ps1`: Windows entry point with separate setup, exploit, verify, and cleanup actions.
-- `manual.sh`: native Linux entry point, also used by the Windows/WSL wrapper.
-- `REPORT.md`: evidence captured by the automatic differential validation.
-'''
-        write_text(artifacts / "MANUAL-POC.md", manual_guide)
-        poc_name = "PoC.yaml"
-    elif plan.get("scenario") == "lighthouse_namespace_injection":
-        poc_path = artifacts / "PoC.go"
-        poc_source = (lab_dir / "adapter" / "vulnerable_poc_test.go").read_text(encoding="utf-8")
-        write_text(poc_path, poc_source)
-        poc_name = "PoC.go"
-    else:
-        validator = (lab_dir / "validator" / "validator.py").read_text(encoding="utf-8")
-        poc_header = (
-            f'"""Local-only verified exploit PoC for {cve}.\n\n'
-            f'Lab type: {plan["lab_type"]}. Scenario: {plan.get("scenario", "default")}.\n'
-            'This script is designed for the generated Docker lab, not remote targets.\n"""\n\n'
-        )
-        poc_path = artifacts / "PoC.py"
-        write_text(poc_path, poc_header + validator)
-        poc_name = "PoC.py"
-        _write_generic_manual_assets(
-            cve,
-            lab_dir,
-            artifacts,
-            plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION",
-        )
+    validator = (lab_dir / "validator" / "validator.py").read_text(encoding="utf-8")
+    poc_header = (
+        f'"""Local-only verified exploit PoC for {cve}.\n\n'
+        f'Lab type: {plan["lab_type"]}. Scenario: {plan.get("scenario", "default")}.\n'
+        'This script is designed for the generated Docker lab, not remote targets.\n"""\n\n'
+    )
+    poc_path = artifacts / "PoC.py"
+    write_text(poc_path, poc_header + validator)
+    poc_name = "PoC.py"
+    _write_generic_manual_assets(
+        cve,
+        lab_dir,
+        artifacts,
+        plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION",
+    )
     write_text(artifacts / "plan.json", json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
 
     source_note = (
@@ -416,11 +331,6 @@ The patched control succeeds only when it prints `BLOCKED` and no attacker-contr
     scenario = plan.get("scenario", "default")
     contract = plan.get("exploit_contract", {})
     scenario_details = (
-        "A crafted EndpointSlice from compromised cluster2 declares kube-system as its source namespace. "
-        "The real vulnerable Lighthouse agent and broker propagate it into cluster1/kube-system; the fixed "
-        "agent rejects the same object before local creation."
-        if scenario == "lighthouse_broker_namespace_injection_e2e"
-        else
         "The synthetic model submits an object from `tenant-a` with an attacker-selected "
         "destination of `kube-system`. The vulnerable variant creates it there; the patched "
         "model rejects cross-namespace injection."
@@ -441,41 +351,27 @@ The patched control succeeds only when it prints `BLOCKED` and no attacker-contr
         attack_path = _steps(analysis["attack_path"])
         analyst_fidelity = analysis["fidelity"]
     else:
-        if scenario == "lighthouse_broker_namespace_injection_e2e":
-            prerequisites = (
-                "- Docker Engine on Linux, or Docker Desktop with Kali WSL on Windows.\n"
-                "- Bash, Git, Make, and curl available in the execution environment.\n"
-                "- A disposable two-cluster local lab created by the supplied PoC kit."
-            )
+        prerequisites = "- Consult the CVE dossier and generated plan."
+        if vulnerable_only:
             attack_path = (
-                "1. Deploy the recorded vulnerable upstream revision to two local kind clusters.\n"
-                "2. Apply PoC.yaml in cluster2/cvelab-source and force a fresh update with a nonce.\n"
-                "3. Observe address 198.51.100.77 in an EndpointSlice under cluster1/kube-system.\n"
-                "4. Repeat on the fixed revision and require both object absence and the explicit agent rejection log."
+                "1. Build and start the recorded vulnerable upstream revision.\n"
+                "2. Execute the generated local-only attack with a unique canary.\n"
+                "3. Verify the concrete security effect using an independent observation.\n"
+                "4. Record that no patched control was tested because no public fix was identified."
             )
-            analyst_fidelity = "This is an end-to-end reproduction using recorded upstream source revisions and the real agent/broker flow."
+            analyst_fidelity = (
+                "This is a source-backed vulnerable-only reproduction. It proves the observed "
+                "effect for the recorded revision but makes no remediation claim."
+            )
         else:
-            prerequisites = "- Consult the CVE dossier and generated plan."
-            if vulnerable_only:
-                attack_path = (
-                    "1. Build and start the recorded vulnerable upstream revision.\n"
-                    "2. Execute the generated local-only attack with a unique canary.\n"
-                    "3. Verify the concrete security effect using an independent observation.\n"
-                    "4. Record that no patched control was tested because no public fix was identified."
-                )
-                analyst_fidelity = (
-                    "This is a source-backed vulnerable-only reproduction. It proves the observed "
-                    "effect for the recorded revision but makes no remediation claim."
-                )
-            else:
-                prerequisites = _bullets(contract.get("preconditions", []))
-                attack_path = (
-                    "1. Build and start both recorded source revisions.\n"
-                    "2. Execute the exact local attack declared in plan.json against the vulnerable target.\n"
-                    "3. Capture the raw response and independently check the declared security effect.\n"
-                    "4. Repeat the identical attack against the patched target and require it to be blocked."
-                )
-                analyst_fidelity = fidelity_record.get("rationale", "See plan.json.")
+            prerequisites = _bullets(contract.get("preconditions", []))
+            attack_path = (
+                "1. Build and start both recorded source revisions.\n"
+                "2. Execute the exact local attack declared in plan.json against the vulnerable target.\n"
+                "3. Capture the raw response and independently check the declared security effect.\n"
+                "4. Repeat the identical attack against the patched target and require it to be blocked."
+            )
+            analyst_fidelity = fidelity_record.get("rationale", "See plan.json.")
     fidelity = (
         f"Execution level: `{fidelity_record.get('execution_level', 'unknown')}`. "
         f"Vendor product started: `{fidelity_record.get('vendor_product_started', False)}`. "
@@ -489,7 +385,7 @@ The patched control succeeds only when it prints `BLOCKED` and no attacker-contr
 
 The lab is restricted to a disposable local environment and uses a non-destructive exploit canary.
 The PoC has no arbitrary remote-target option. Automatic evidence is stored in
-`report.json` and `artifacts/EVIDENCE.json`{'; the Shipyard profile also writes `e2e/result.json`' if scenario == 'lighthouse_broker_namespace_injection_e2e' else ''}.
+`report.json` and `artifacts/EVIDENCE.json`.
 
 ## Reproduction on Linux
 
@@ -576,22 +472,16 @@ For an inspectable, step-by-step reproduction that keeps the lab running, follow
         mechanism = scenario_details
         impacts = "- Consult the public CVE description."
         components = "- Consult dossier.json."
-        if scenario == "lighthouse_broker_namespace_injection_e2e":
-            interpretation = "The vulnerable upstream revision propagated the canary into kube-system; the fixed revision kept it absent and logged an explicit rejection."
-            remediation = "The recorded fixed upstream revision enforces namespace validation for remote EndpointSlices."
-            limitations = "- Validation is restricted to the isolated two-cluster local environment and recorded revisions."
-            confidence = "High confidence for the executed local upstream revisions because both positive exploit evidence and explicit negative-control rejection were captured."
+        if vulnerable_only:
+            interpretation = "The declared effect was observed on the recorded vulnerable source revision; no patched control was available."
+            remediation = "No public fixed revision was identified at generation time. Re-run differential validation when a fix becomes public."
+            limitations = "- Patched behavior and remediation effectiveness were not tested."
+            confidence = "Confidence applies to the observed vulnerable revision only; there is no differential confirmation."
         else:
-            if vulnerable_only:
-                interpretation = "The declared effect was observed on the recorded vulnerable source revision; no patched control was available."
-                remediation = "No public fixed revision was identified at generation time. Re-run differential validation when a fix becomes public."
-                limitations = "- Patched behavior and remediation effectiveness were not tested."
-                confidence = "Confidence applies to the observed vulnerable revision only; there is no differential confirmation."
-            else:
-                interpretation = "The differential result applies only to the generated lab."
-                remediation = "Not established by the generated lab."
-                limitations = "- Vendor-product behavior was not exercised."
-                confidence = "Confidence is limited to the observed local class model."
+            interpretation = "The differential result applies only to the generated lab."
+            remediation = "Not established by the generated lab."
+            limitations = "- Vendor-product behavior was not exercised."
+            confidence = "Confidence is limited to the observed local class model."
     markdown_report = f"""# {cve} Validation Report
 
 ## Result

@@ -1,8 +1,21 @@
+# Copyright 2026 SyncBit Software SRL and the CVELab contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import json
 import re
-import socket
 import subprocess
 import time
 import urllib.error
@@ -11,7 +24,6 @@ import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
-
 
 _CVE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 _MAX_BODY = 64 * 1024
@@ -153,7 +165,7 @@ def _wait_ready(network_name: str, base_url: str, health_path: str) -> None:
             )
             if response["status"] < 500:
                 return
-        except (OSError, subprocess.CalledProcessError, urllib.error.URLError, socket.timeout):
+        except (TimeoutError, OSError, subprocess.CalledProcessError, urllib.error.URLError):
             pass
         time.sleep(2)
     raise RuntimeError(f"container did not become ready at {health_path}")

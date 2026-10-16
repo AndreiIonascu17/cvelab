@@ -1,16 +1,93 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "cvelab"
 version = "0.6.0"
-description = "Local-only CVE reproduction and PoC generator"
+description = "Local-only CVE reproduction and PoC generator with differential vulnerable-versus-patched validation"
+readme = "README.md"
 requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "SyncBit Software SRL", email = "contact@syncbitsoft.com" }]
+maintainers = [{ name = "SyncBit Software SRL", email = "contact@syncbitsoft.com" }]
+keywords = [
+    "cve",
+    "vulnerability",
+    "security",
+    "proof-of-concept",
+    "reproduction",
+    "docker",
+    "vulnerability-research",
+    "appsec",
+    "llm",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Natural Language :: English",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Security",
+    "Topic :: Software Development :: Testing",
+    "Typing :: Typed",
+]
 dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.14",
+    "mypy>=1.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/AndreiIonascu17/cvelab"
+Repository = "https://github.com/AndreiIonascu17/cvelab"
+Documentation = "https://github.com/AndreiIonascu17/cvelab/blob/main/GUIDE.md"
+Changelog = "https://github.com/AndreiIonascu17/cvelab/blob/main/CHANGELOG.md"
+Issues = "https://github.com/AndreiIonascu17/cvelab/issues"
+"Security Policy" = "https://github.com/AndreiIonascu17/cvelab/blob/main/SECURITY.md"
 
 [project.scripts]
 cvelab = "cvelab.cli:main"
 
 [tool.setuptools]
 packages = ["cvelab"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+src = ["cvelab", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4"]
+# E501: generated report and Dockerfile templates are embedded as long literals.
+# SIM102, SIM117: collapsing these hurts readability in validation and test code.
+ignore = ["E501", "SIM102", "SIM117"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["cvelab"]
+warn_unused_configs = true
+warn_redundant_casts = true
+no_implicit_optional = true
+# The package has a known backlog of annotation gaps. CI reports mypy without
+# failing the build; tighten these as the backlog is cleared.
+check_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers -m 'not docker'"
+markers = [
+    "docker: integration test that builds or runs real containers (excluded by default)",
+]

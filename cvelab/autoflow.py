@@ -1,21 +1,34 @@
+# Copyright 2026 SyncBit Software SRL and the CVELab contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import json
-import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
+from . import progress, usage
 from .core import normalize_cve, run_lab, write_text
 from .deliverables import create_deliverables
 from .sourcegen import generate_source_lab, repair_source_lab
-
 
 Progress = Callable[[str], None]
 
 
 def _default_progress(message: str) -> None:
-    print(f"[cvelab auto] {message}", file=sys.stderr, flush=True)
+    progress.step(message)
 
 
 def _infrastructure_failure(message: str) -> bool:
@@ -52,6 +65,9 @@ def _record(
         "schema_version": 1,
         "status": status,
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        # Written on every update, so an interrupted run still shows what it
+        # spent before it stopped.
+        "usage": usage.as_dict(),
         "attempts": attempts,
     }
     if failure is not None:
@@ -80,6 +96,7 @@ def run_auto_workflow(
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
     announce = progress or _default_progress
+    usage.reset()
     cve = normalize_cve(cve_value)
     lab_dir = output_root.resolve() / cve
     attempts: list[dict] = []
@@ -151,13 +168,13 @@ def run_auto_workflow(
         raise RuntimeError("Automatic generation ended without a result")
 
     plan = generated.get("plan", {})
-    curated_runner = bool(plan.get("runner"))
+    scripted_runner = bool(plan.get("runner"))
     pending_failure: dict | None = None
     repair_calls = 0
     validation_attempt = 0
 
     while validation_attempt < max_attempts:
-        if pending_failure and not curated_runner and not _infrastructure_failure(
+        if pending_failure and not scripted_runner and not _infrastructure_failure(
             json.dumps(pending_failure, ensure_ascii=True)
         ):
             if repair_calls >= max_attempts - 1:
@@ -261,8 +278,8 @@ def run_auto_workflow(
                 json.dumps(pending_failure, ensure_ascii=True)
             ):
                 announce(f"{cve}: transient/infrastructure failure; retrying without rewriting the PoC")
-            elif curated_runner:
-                announce(f"{cve}: curated runner failed; retrying the deterministic workflow")
+            elif scripted_runner:
+                announce(f"{cve}: scripted runner failed; retrying the deterministic workflow")
 
     reason = pending_failure or {"kind": "repair_budget_exhausted"}
     _record(lab_dir, attempts, "AUTO_REPAIR_EXHAUSTED", reason)

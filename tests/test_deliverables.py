@@ -1,6 +1,21 @@
+# Copyright 2026 SyncBit Software SRL and the CVELab contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -82,9 +97,37 @@ class DeliverableContractTests(unittest.TestCase):
             evidence = json.loads((lab / "artifacts" / "EVIDENCE.json").read_text())
             self.assertEqual(evidence["schema_version"], 1)
             self.assertEqual(evidence["validation"], validation)
-            subprocess.run(
-                ["bash", "-n", str(lab / "artifacts" / "manual.sh")],
-                check=True,
+            self.assert_valid_bash(lab / "artifacts" / "manual.sh")
+
+    def assert_valid_bash(self, script: Path) -> None:
+        # Resolved, never the bare name, matching run_shipyard_script: on
+        # Windows CreateProcess searches System32 before PATH, so "bash"
+        # reaches the WSL launcher stub, which exits 1 with a UTF-16 complaint
+        # about having no installed distribution.
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash is not installed")
+        # Fed on stdin rather than by path, because a native Windows path does
+        # not survive the boundary into Git Bash. Bytes, not text: subprocess
+        # wraps a text-mode stdin in a TextIOWrapper with newline=None, which
+        # would rewrite "\n" to os.linesep and hand bash a CRLF script.
+        completed = subprocess.run(
+            [bash, "-n"],
+            input=script.read_bytes(),
+            capture_output=True,
+        )
+        if completed.returncode != 0:
+            payload = script.read_bytes()
+            has_crlf = b"\r\n" in payload
+            self.fail(
+                f"generated {script.name} is not valid bash\n"
+                f"  bash: {bash!r}\n"
+                f"  rc: {completed.returncode}\n"
+                f"  stderr: {completed.stderr.decode('utf-8', 'replace').strip()!r}\n"
+                f"  stdout: {completed.stdout.decode('utf-8', 'replace').strip()!r}\n"
+                f"  bytes: {len(payload)}\n"
+                f"  head: {payload[:120]!r}\n"
+                f"  has_crlf: {has_crlf}"
             )
 
 

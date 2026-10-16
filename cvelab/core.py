@@ -1,3 +1,17 @@
+# Copyright 2026 SyncBit Software SRL and the CVELab contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import hashlib
@@ -12,7 +26,9 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+from . import progress
 from .ai import ai_is_configured, plan_with_ai
+from .providers import PROVIDERS
 from .templates import APP_PY, DOCKERFILE, VALIDATOR_DOCKERFILE, VALIDATOR_PY, compose_yaml
 
 SUPPORTED_CWES = {"CWE-22", "CWE-78", "CWE-89", "CWE-284", "CWE-434", "CWE-918"}
@@ -98,9 +114,46 @@ def select_cwe(
     raise RuntimeError(f"No supported CWE found (metadata: {found}). Use --cwe with one of {sorted(SUPPORTED_CWES)}")
 
 
+_SECRETS: set[str] = set()
+
+# Shorter values would match ordinary words and redact harmless text.
+MINIMUM_SECRET_LENGTH = 12
+
+
+def register_secret(value: str | None) -> None:
+    """Record a credential that must never reach disk or stdout.
+
+    Provider errors are stored verbatim in automation.json so a failed run can
+    be diagnosed, and a gateway that echoes the request in its error body would
+    otherwise put the key in a file users attach to bug reports.
+    """
+    if value and len(value) >= MINIMUM_SECRET_LENGTH:
+        _SECRETS.add(value)
+
+
+def redact(text: str) -> str:
+    """Replace every registered credential in `text`."""
+    for secret in _SECRETS:
+        text = text.replace(secret, "[REDACTED]")
+    return text
+
+
+def register_environment_secrets() -> None:
+    """Register every provider key variable the registry declares.
+
+    This list used to be written out by hand, and adding DeepSeek did not
+    update it: a DEEPSEEK_API_KEY echoed back inside a provider error would
+    have been written to automation.json in the clear. Reading the registry
+    means a provider is covered the moment it is declared, which matters more
+    now that a finished run can be uploaded to a control plane.
+    """
+    for provider in PROVIDERS.values():
+        register_secret(os.getenv(provider.key_variable))
+
+
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8", newline="\n")
+    path.write_text(redact(content), encoding="utf-8", newline="\n")
 
 
 def select_scenario(dossier: dict, cwe: str) -> str:
@@ -463,20 +516,23 @@ def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
         if configured.returncode != 0:
             detail = (configured.stderr or configured.stdout).strip()
             raise RuntimeError(f"Compose preflight failed: {detail}")
-        run_docker_stage(
-            compose + ["build", *startup_services, "validator"],
-            stage="build",
-            docker=docker,
-            environment=environment,
-            cwd=lab_dir,
-        )
-        run_docker_stage(
-            compose + ["up", "-d", *startup_services],
-            stage="startup",
-            docker=docker,
-            environment=environment,
-            cwd=lab_dir,
-        )
+        with progress.stage("building lab images"):
+            run_docker_stage(
+                compose + ["build", *startup_services, "validator"],
+                stage="build",
+                docker=docker,
+                environment=environment,
+                cwd=lab_dir,
+            )
+        with progress.stage("starting lab services"):
+            run_docker_stage(
+                compose + ["up", "-d", *startup_services],
+                stage="startup",
+                docker=docker,
+                environment=environment,
+                cwd=lab_dir,
+            )
+        progress.step("running the validator")
         started = subprocess.run(
             compose + ["--profile", "tools", "run", "-d", "validator"],
             cwd=lab_dir,

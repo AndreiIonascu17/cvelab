@@ -102,6 +102,25 @@ docker compose version
 Membership in the `docker` group grants privileges equivalent to root access.
 Use this configuration only on a controlled lab system.
 
+### Installation from one file
+
+CVELab imports nothing outside the Python standard library. There is no
+package to resolve, no virtual environment to create and no index to reach:
+
+```bash
+curl -LO https://cvelab.tech/cvelab.pyz
+curl -LO https://cvelab.tech/cvelab.pyz.sha256
+sha256sum -c cvelab.pyz.sha256
+
+python3 cvelab.pyz doctor
+```
+
+Check the digest. It is the difference between running what was published
+and running whatever answered.
+
+Every command below works the same way: `python3 cvelab.pyz auto ...` where
+the guide writes `cvelab auto ...`.
+
 ### Installation from Git
 
 ```bash
@@ -285,7 +304,48 @@ The main verdict is `real_poc_verified`. For a test with a fix,
 `differential_confirmed` must also be true. For a test without a fix, the report
 must retain `patched_tested: false`.
 
-## 8. Manual reproduction
+## 8. Sending a report to cvelab.tech
+
+A run happens on your machine, with your provider key and your Docker. If you
+want the history in one place rather than in a folder on one laptop, an
+account at [cvelab.tech](https://cvelab.tech/app/) can hold the reports.
+
+Create a token in the dashboard and export it:
+
+```bash
+export CVELAB_TOKEN=cvelab_...
+cvelab auto CVE-2024-12345 --provider openai --model MODEL
+```
+
+The report is sent when the run finishes. What travels:
+
+| | Sent |
+|---|---|
+| `REPORT.md` | yes |
+| CVE, repository, fixed revision, model, token counts, cost | yes |
+| `PoC.py`, `WALKTHROUGH.md`, `plan.json`, `report.json` | only with `--upload-poc` |
+| Your provider key | never |
+| The source, the images, the containers | never |
+
+The key is not in the payload, and anything that looks like a registered
+credential is replaced with `[REDACTED]` before the request is built.
+
+Three ways to send nothing:
+
+- Do not set a token. Without one the upload code is never reached.
+- Pass `--no-upload` for a single run.
+- Revoke the token in the dashboard. Reports already filed are kept.
+
+A failed upload never fails a run. The lab stays on disk and goes up later:
+
+```bash
+cvelab upload CVE-2024-12345 --dry-run    # print what would be sent
+cvelab upload CVE-2024-12345
+```
+
+Self-hosting the control plane: set `CVELAB_ENDPOINT` to its origin.
+
+## 9. Manual reproduction
 
 Open `artifacts/WALKTHROUGH.md` and follow the commands documented there.
 The walkthrough must specify:
@@ -300,7 +360,7 @@ The walkthrough must specify:
 If the walkthrough does not allow manual reproduction of the effect, the result
 is not a complete PoC deliverable.
 
-## 9. Closed-source software
+## 10. Closed-source software
 
 ```bash
 cvelab closed-auto CVE-YYYY-NNNNN --key --model gpt-5.6-sol
@@ -311,7 +371,7 @@ artifact is available locally and registered in `closed-catalog.json`. VirtualBo
 can host the product, but the installation package, license, and vendor
 configuration cannot be fabricated or downloaded by bypassing access controls.
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 ### Docker does not respond
 
@@ -349,7 +409,7 @@ The correct result is `ARTIFACT_REQUIRED` or `POC_NOT_GENERATED`. Provide a
 verifiable repository/revision or the required legal artifact; do not use a
 simulation as a substitute.
 
-## 11. Safety and limitations
+## 12. Safety and limitations
 
 - Run only on systems you own or are explicitly authorized to test.
 - Keep services on loopback and internal Docker networks.
@@ -359,7 +419,7 @@ simulation as a substitute.
 - Do not treat the absence of a result after a timeout as the sole evidence of a fix.
 - No generator can faithfully reproduce every CVE from its identifier alone.
 
-## 12. Development
+## 13. Development
 
 Linux build:
 

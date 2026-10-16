@@ -1,0 +1,177 @@
+# Copyright 2026 SyncBit Software SRL and the CVELab contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""A local run may send its report to a control plane; it must send nothing else.
+
+The point of the BYOK tier is that the provider key stays on the machine that
+ran the lab. These tests fail if uploading ever starts carrying more than the
+run produced, or if it happens without being asked for.
+"""
+
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+import unittest.mock as mock
+from pathlib import Path
+
+from cvelab import core, upload
+
+SENTINEL = "sk-not-a-real-key-0123456789"
+
+
+def make_lab(root: Path, *, report: str = "# Report\n") -> Path:
+    lab = root / "CVE-2024-12345"
+    (lab / "artifacts").mkdir(parents=True)
+    (lab / "plan.json").write_text(
+        json.dumps(
+            {
+                "repository": "https://github.com/example/widget",
+                "revisions": {"vulnerable": "aaa", "patched": "bbb"},
+            }
+        )
+    )
+    (lab / "artifacts" / "REPORT.md").write_text(report)
+    (lab / "artifacts" / "PoC.py").write_text("print('exploit')\n")
+    (lab / "artifacts" / "WALKTHROUGH.md").write_text("# Walkthrough\n")
+    (lab / "artifacts" / "report.json").write_text("{}")
+    return lab
+
+
+RESULT = {"ok": True, "cve": "CVE-2024-12345", "status": "VALIDATED"}
+
+
+class CollectTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def collect(self, lab: Path, **kwargs) -> dict:
+        options = {"provider": "openai", "model": "gpt-5.6-sol", "include_poc": False}
+        options.update(kwargs)
+        return upload.collect(lab, RESULT, **options)
+
+    def test_only_the_report_leaves_by_default(self) -> None:
+        payload = self.collect(make_lab(self.root))
+        self.assertEqual([d["name"] for d in payload["documents"]], ["REPORT.md"])
+
+    def test_the_exploit_leaves_only_when_asked(self) -> None:
+        payload = self.collect(make_lab(self.root), include_poc=True)
+        names = [d["name"] for d in payload["documents"]]
+        self.assertIn("PoC.py", names)
+        self.assertIn("WALKTHROUGH.md", names)
+
+    def test_metadata_comes_from_the_plan(self) -> None:
+        payload = self.collect(make_lab(self.root))
+        self.assertEqual(payload["repo"], "https://github.com/example/widget")
+        self.assertEqual(payload["fixed_ref"], "bbb")
+
+    def test_a_registered_key_is_redacted(self) -> None:
+        core.register_secret(SENTINEL)
+        self.addCleanup(core._SECRETS.discard, SENTINEL)
+        lab = make_lab(self.root, report=f"key was {SENTINEL}\n")
+        payload = self.collect(lab)
+        serialised = json.dumps(payload)
+        self.assertNotIn(SENTINEL, serialised)
+        self.assertIn("[REDACTED]", serialised)
+
+    def test_an_oversized_document_is_trimmed_and_marked(self) -> None:
+        lab = make_lab(self.root, report="A" * (upload.MAX_DOCUMENT_BYTES + 5000))
+        document = self.collect(lab)["documents"][0]
+        self.assertTrue(document["truncated"])
+        self.assertLessEqual(
+            len(document["text"].encode("utf-8")), upload.MAX_DOCUMENT_BYTES
+        )
+
+    def test_an_unknown_outcome_is_not_called_a_success(self) -> None:
+        payload = upload.collect(
+            make_lab(self.root),
+            {"ok": False, "cve": "CVE-2024-12345", "status": "SOMETHING_NEW"},
+            provider=None,
+            model=None,
+            include_poc=False,
+        )
+        self.assertEqual(payload["status"], "failed")
+
+    def test_every_known_outcome_maps_to_a_stored_status(self) -> None:
+        allowed = {"queued", "running", "succeeded", "declined", "failed", "cancelled"}
+        self.assertTrue(set(upload.STATUS.values()) <= allowed)
+
+    def test_the_payload_never_carries_a_key_field(self) -> None:
+        payload = self.collect(make_lab(self.root), include_poc=True)
+        for field in ("api_key", "key", "token", "authorization"):
+            self.assertNotIn(field, payload)
+
+
+class TokenTests(unittest.TestCase):
+    def test_no_token_means_nothing_is_sent(self) -> None:
+        with mock.patch.object(upload, "find_token", return_value=None):
+            with mock.patch.object(upload, "send") as send:
+                answer = upload.upload_result(Path("/nonexistent"), RESULT)
+        self.assertIsNone(answer)
+        send.assert_not_called()
+
+    def test_the_environment_wins_over_the_file(self) -> None:
+        with mock.patch.dict("os.environ", {upload.TOKEN_VARIABLE: "cvelab_env"}):
+            self.assertEqual(upload.find_token(), "cvelab_env")
+
+    def test_a_missing_token_file_is_not_an_error(self) -> None:
+        with mock.patch.dict("os.environ", {upload.TOKEN_VARIABLE: ""}):
+            with mock.patch.object(upload, "TOKEN_FILE", Path("/nonexistent/token")):
+                self.assertIsNone(upload.find_token())
+
+    def test_a_failed_upload_does_not_fail_the_run(self) -> None:
+        # The lab is the deliverable. An unreachable control plane must not
+        # turn a validated reproduction into a non-zero exit.
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        lab = make_lab(Path(temporary.name))
+        with mock.patch.object(upload, "send", side_effect=upload.UploadError("down")):
+            answer = upload.upload_result(lab, RESULT, token="cvelab_x")
+        self.assertEqual(answer["ok"], False)
+
+
+class EndpointTests(unittest.TestCase):
+    def test_the_endpoint_is_a_default_not_a_constant(self) -> None:
+        with mock.patch.dict("os.environ", {"CVELAB_ENDPOINT": "https://self.hosted/"}):
+            self.assertEqual(upload.endpoint(), "https://self.hosted")
+
+    def test_the_default_is_the_public_service(self) -> None:
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(upload.endpoint(), "https://cvelab.tech")
+
+
+class PreflightTests(unittest.TestCase):
+    """Uploading is opt-out, so the preflight has to say which way it is set."""
+
+    def test_the_preflight_says_when_nothing_will_be_sent(self) -> None:
+        from cvelab.doctor import check_report_upload
+
+        with mock.patch.object(upload, "find_token", return_value=None):
+            self.assertIn("off", check_report_upload().detail)
+
+    def test_the_preflight_names_where_reports_go(self) -> None:
+        from cvelab.doctor import check_report_upload
+
+        with mock.patch.object(upload, "find_token", return_value="cvelab_x"):
+            detail = check_report_upload().detail
+        self.assertIn("on", detail)
+        self.assertIn(upload.endpoint(), detail)
+        self.assertIn("--no-upload", detail)
+
+
+if __name__ == "__main__":
+    unittest.main()

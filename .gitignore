@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 build/
+dist/
 .venv/
 .pytest_cache/
 .mypy_cache/
@@ -20,3 +21,20 @@ dist-linux/
 
 .DS_Store
 Thumbs.db
+
+benchmarks/labs/
+benchmarks/results.json
+
+# Worker local development secrets — never committed.
+site/.dev.vars
+site/.wrangler/
+node_modules/
+
+benchmarks/dry-run.json
+
+benchmarks/.estimate-cache/
+benchmarks/dry-run*.json
+
+# Built by scripts/build_pyz.py; published, never committed. (dist/ above.)
+site/public/cvelab.pyz
+site/public/cvelab.pyz.sha256

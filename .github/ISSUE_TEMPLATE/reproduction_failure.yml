@@ -1,0 +1,93 @@
+name: CVE failed to reproduce
+description: A CVE that CVELab could not reproduce, or reproduced incorrectly
+title: "[repro] CVE-YYYY-NNNNN: "
+labels: ["reproduction", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is the most useful report you can file. Reproduction failures drive
+        nearly every improvement to adapter generation.
+
+        Before attaching files, remove any API key from them.
+
+  - type: input
+    id: cve
+    attributes:
+      label: CVE identifier
+      placeholder: CVE-2026-12345
+    validations:
+      required: true
+
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Outcome reported by CVELab
+      options:
+        - POC_NOT_GENERATED
+        - ARTIFACT_REQUIRED
+        - Ran but the proof was not verified
+        - Reported success, but the proof is wrong
+        - Crashed or errored out
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: The full command, with the API key removed.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: >
+        If you know the repository, the vulnerable revision, or the fix commit,
+        include them. That is often exactly what the resolver failed to find.
+    validations:
+      required: true
+
+  - type: textarea
+    id: automation
+    attributes:
+      label: automation.json
+      description: >
+        From generated-labs/<CVE>/automation.json. It holds the generation,
+        error, repair, and validation history. Truncate if very large, but keep
+        the first and last attempt.
+      render: json
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: AI provider
+      options:
+        - OpenAI
+        - Anthropic
+        - Local (OpenAI-compatible)
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      placeholder: gpt-5.6-sol
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: CVELab version, OS, Python version, Docker version.
+      placeholder: "cvelab 0.6.0, Debian 13, Python 3.13.2, Docker 28.1.1"
+    validations:
+      required: true

@@ -1,3 +1,17 @@
+# Copyright 2026 SyncBit Software SRL and the CVELab contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import json
@@ -27,9 +41,8 @@ class ShipyardRunnerTests(unittest.TestCase):
             self.assertEqual((lab_dir / "e2e" / "native.txt").read_text(), "ran")
 
     def test_missing_script_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            with self.assertRaisesRegex(RuntimeError, "was not found"):
-                run_shipyard_script(Path(temporary), {"script": "e2e/missing.sh"})
+        with tempfile.TemporaryDirectory() as temporary, self.assertRaisesRegex(RuntimeError, "was not found"):
+            run_shipyard_script(Path(temporary), {"script": "e2e/missing.sh"})
 
     @unittest.skipIf(__import__("os").name == "nt", "native Linux runner test")
     def test_failure_hint_does_not_assume_vpn_is_the_cause(self) -> None:
@@ -39,12 +52,11 @@ class ShipyardRunnerTests(unittest.TestCase):
             script.parent.mkdir(parents=True)
             script.write_text("#!/usr/bin/env bash\nexit 125\n", encoding="utf-8")
 
-            with mock.patch("cvelab.core.ensure_docker"):
-                with self.assertRaisesRegex(
-                    RuntimeError,
-                    "exit 125 normally means Docker could not create or start",
-                ):
-                    run_shipyard_script(lab_dir, {"script": "e2e/run.sh"})
+            with mock.patch("cvelab.core.ensure_docker"), self.assertRaisesRegex(
+                RuntimeError,
+                "exit 125 normally means Docker could not create or start",
+            ):
+                run_shipyard_script(lab_dir, {"script": "e2e/run.sh"})
 
     def test_report_requires_differential_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

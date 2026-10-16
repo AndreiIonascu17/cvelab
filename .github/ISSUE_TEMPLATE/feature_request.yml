@@ -1,0 +1,38 @@
+name: Feature request
+description: Propose a capability or an improvement
+title: "[feature] "
+labels: ["enhancement", "triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you unable to do today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: >
+            This does not weaken the sandbox, and does not add weaponization,
+            persistence, or detection-evasion capability.
+          required: true
+        - label: >
+            This does not add a runtime dependency, or the issue explains why
+            one is unavoidable.
+          required: true
