@@ -247,3 +247,48 @@ class AdapterTreeTests(unittest.TestCase):
         # adapter is.
         self.assertFalse(self.allowed("server.js"))
         self.assertFalse(self.allowed("source/vulnerable/x.py"))
+
+
+class ConfirmedSemanticsTests(unittest.TestCase):
+    """The contract has to say what confirmed means, on both sides.
+
+    Two DeepSeek runs, two CVEs, two ecosystems, the same two checks
+    failing. Its validator used a different rule per side:
+
+        vulnerable_confirmed = vuln_canary               # the effect
+        patched_confirmed    = patch_status is not None  # a reply arrived
+
+    A patched build that refuses the input still answers, so the second
+    rule calls a successful defence a successful exploit and inverts the
+    proof. Opus called one observe() for both sides and passed. Nothing in
+    the contract asked for that, so the model that guessed differently was
+    not contradicting anything written down.
+
+    manual_poc_verified failed alongside it, but only as a consequence:
+    those checks sit behind `if automatic_proof`, so they never ran.
+    """
+
+    SOURCE = (
+        Path(__file__).resolve().parent.parent / "cvelab" / "sourcegen.py"
+    ).read_text(encoding="utf-8")
+    SENTENCE = "Measure confirmed the same way on both sides"
+
+    def test_a_rejection_is_not_a_confirmation(self) -> None:
+        # Fragments that sit on one source line: the sentence itself is
+        # split across string literals, so the assembled prompt is what
+        # carries it, not any single line of the file.
+        self.assertIn("confirmed=false and blocked=true", self.SOURCE)
+        self.assertIn("the security effect was observed", self.SOURCE)
+        self.assertIn("recording that as a confirmation", self.SOURCE)
+
+    def test_every_prompt_that_names_the_keys_also_defines_confirmed(self) -> None:
+        # Two prompt blocks build a validator contract -- the differential
+        # one and the vulnerable-only one. A clarification added to one of
+        # them is half a fix, and counting occurrences would not notice:
+        # the first attempt at this landed twice in the same block.
+        blocks = self.SOURCE.split("the literal keys attack_executed")
+        self.assertEqual(len(blocks), 3, "expected exactly two contract prompts")
+        for number, block in enumerate(blocks[1:], 1):
+            with self.subTest(prompt=number):
+                head = block[:2000]
+                self.assertIn(self.SENTENCE, head)
