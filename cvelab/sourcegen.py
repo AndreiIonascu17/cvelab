@@ -543,11 +543,20 @@ def _validate_generated(files: list[dict], vulnerable_only: bool = False) -> Non
                     "Validator is missing the manual PoC contract: "
                     + ", ".join(sorted(missing_manual))
                 )
+            # Only the fields the contract says must be computed. The same
+            # instruction defines attack_executed as "the regression input
+            # was actually delivered", which the validator knows for a fact
+            # once it has sent it -- banning that literal rejected every
+            # validator written exactly as asked, across two unrelated model
+            # families, on all four attempts.
             if re.search(
-                r"['\"](?:attack_executed|confirmed|differential_confirmed)['\"]\s*:\s*True\b",
+                r"['\"](?:confirmed|differential_confirmed)['\"]\s*:\s*True\b",
                 item["content"],
             ):
-                raise RuntimeError("Validator contains a hard-coded successful exploit result")
+                raise RuntimeError(
+                    "Validator hard-codes a success verdict; confirmed and "
+                    "differential_confirmed must be computed from observations"
+                )
             for url in re.findall(r"https?://([^/'\"\s:]+)", lowered):
                 allowed_hosts = {"vulnerable", "127.0.0.1", "localhost"}
                 if not vulnerable_only:

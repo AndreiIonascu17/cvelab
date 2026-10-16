@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+import re
 import unittest
+from pathlib import Path
 
 from cvelab.sourcegen import (
     _canonicalize_validator_dockerfile,
@@ -113,3 +115,50 @@ class GeneratedValidatorContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ValidatorVerdictGuardTests(unittest.TestCase):
+    """The guard must reject a faked verdict and accept an honest one.
+
+    Banning a literal `"attack_executed": True` rejected every validator
+    written exactly as the instruction asks, across two unrelated model
+    families, on all four attempts each. The contract defines that field as
+    "the regression input was actually delivered" -- a fact the code knows
+    once it has sent it. Only `confirmed` and `differential_confirmed` have
+    to be computed.
+    """
+
+    PATTERN = re.compile(
+        r"['\"](?:confirmed|differential_confirmed)['\"]\s*:\s*True\b"
+    )
+
+    HONEST = """
+    sent = deliver(payload)
+    observed = MARKER in sent.text
+    result = {
+        "attack_executed": True,
+        "vulnerable": {"confirmed": observed},
+        "differential_confirmed": observed and not patched_observed,
+    }
+    """
+
+    FAKED = """
+    result = {
+        "attack_executed": True,
+        "vulnerable": {"confirmed": True},
+        "differential_confirmed": True,
+    }
+    """
+
+    def test_an_honest_validator_is_accepted(self) -> None:
+        self.assertIsNone(self.PATTERN.search(self.HONEST))
+
+    def test_a_faked_verdict_is_rejected(self) -> None:
+        self.assertIsNotNone(self.PATTERN.search(self.FAKED))
+
+    def test_the_shipped_guard_is_this_one(self) -> None:
+        source = (
+            Path(__file__).resolve().parent.parent / "cvelab" / "sourcegen.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("confirmed|differential_confirmed", source)
+        self.assertNotIn("attack_executed|confirmed|differential_confirmed", source)
