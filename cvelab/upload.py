@@ -22,6 +22,11 @@ anything that does get sent.
 Uploading is opt-in twice over. There has to be a token, and the run has to
 not carry --no-upload. Without a token this module is never reached, so the
 default install talks to nobody.
+
+A run that validated joins a shared corpus, without being attributed to the
+account that filed it. A run that did not validate never does: it says what
+somebody was looking at and little else. describe() states this before each
+upload rather than leaving it in a policy nobody opens.
 """
 
 from __future__ import annotations
@@ -166,6 +171,10 @@ def describe(payload: dict) -> str:
     if not payload["documents"]:
         lines.append("  (no documents; metadata only)")
     lines.append("  the provider key is not part of this payload")
+    if payload["status"] == "succeeded":
+        # Saying this once per run is the difference between a corpus people
+        # chose to join and one they were enrolled in.
+        lines.append("  a validated run joins the shared corpus, unattributed")
     return "\n".join(lines)
 
 

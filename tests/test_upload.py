@@ -116,6 +116,21 @@ class CollectTests(unittest.TestCase):
             self.assertNotIn(field, payload)
 
 
+    def test_a_validated_run_says_it_will_be_shared(self) -> None:
+        # Enrolling people in a corpus without saying so is the one thing
+        # this feature must not do.
+        payload = self.collect(make_lab(self.root))
+        self.assertIn("shared corpus", upload.describe(payload))
+
+    def test_a_failed_run_does_not_claim_to_be_shared(self) -> None:
+        payload = upload.collect(
+            make_lab(self.root),
+            {"ok": False, "cve": "CVE-2024-12345", "status": "AUTO_REPAIR_EXHAUSTED"},
+            provider=None, model=None, include_poc=False,
+        )
+        self.assertNotIn("shared corpus", upload.describe(payload))
+
+
 class TokenTests(unittest.TestCase):
     def test_no_token_means_nothing_is_sent(self) -> None:
         with mock.patch.object(upload, "find_token", return_value=None):
