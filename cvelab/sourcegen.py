@@ -558,6 +558,15 @@ def _validate_generated(files: list[dict], vulnerable_only: bool = False) -> Non
                     "differential_confirmed must be computed from observations"
                 )
             for url in re.findall(r"https?://([^/'\"\s:]+)", lowered):
+                # An interpolated host is a variable, not a destination. The
+                # same contract requires the validator to honour CVELAB_TARGET,
+                # which forces exactly this shape -- so reading f"http://{target}"
+                # as an external host made the two rules unsatisfiable together.
+                # Where the variable may point is bounded at run time instead,
+                # by the Compose network this file is checked to declare
+                # internal.
+                if "{" in url:
+                    continue
                 allowed_hosts = {"vulnerable", "127.0.0.1", "localhost"}
                 if not vulnerable_only:
                     allowed_hosts.add("patched")

@@ -162,3 +162,42 @@ class ValidatorVerdictGuardTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("confirmed|differential_confirmed", source)
         self.assertNotIn("attack_executed|confirmed|differential_confirmed", source)
+
+
+class ExternalTargetGuardTests(unittest.TestCase):
+    """An interpolated host is a variable, not a destination.
+
+    The contract requires the validator to honour CVELAB_TARGET, which
+    forces f"http://{target}/...". Reading that placeholder as an external
+    host made two rules of the same contract unsatisfiable together: a
+    validator that supported the manual interface was rejected for reaching
+    outside, and one that avoided the f-string was rejected for missing the
+    manual interface.
+    """
+
+    HOSTS = re.compile(r"https?://([^/'\"\s:]+)")
+    ALLOWED = {"vulnerable", "patched", "127.0.0.1", "localhost"}
+
+    def rejected(self, source: str) -> list[str]:
+        return [
+            host
+            for host in self.HOSTS.findall(source.lower())
+            if "{" not in host and host not in self.ALLOWED
+        ]
+
+    def test_an_interpolated_target_is_allowed(self) -> None:
+        self.assertEqual(self.rejected('url = f"http://{target}/read"'), [])
+
+    def test_a_real_external_host_is_still_rejected(self) -> None:
+        self.assertEqual(
+            self.rejected('get("http://evil.example.com/x")'), ["evil.example.com"]
+        )
+
+    def test_the_lab_network_hosts_are_allowed(self) -> None:
+        self.assertEqual(self.rejected('get("http://vulnerable:8080/health")'), [])
+
+    def test_the_shipped_guard_skips_placeholders(self) -> None:
+        source = (
+            Path(__file__).resolve().parent.parent / "cvelab" / "sourcegen.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('if "{" in url:', source)
