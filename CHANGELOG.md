@@ -32,6 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Source-lab proof now requires raw observations from each tested target and an
+  explicit failed-attack verdict on the patched revision. Failed proof checks
+  guide a validator-only repair before the workflow rebuilds a working adapter;
+  manual verdicts must match the expected result exactly.
+- Adapter generation and repair now accept nested project files while keeping
+  writes inside the allowed paths. Source snapshots also extract on Python 3.11,
+  and Docker failures decode reliably on Windows.
 - `DEEPSEEK_API_KEY` was never registered for redaction. The list of key
   variables was written out by hand and adding DeepSeek did not update it, so
   a key echoed back inside a provider error would have been written to

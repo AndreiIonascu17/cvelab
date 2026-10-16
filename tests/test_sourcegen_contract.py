@@ -14,15 +14,21 @@
 
 from __future__ import annotations
 
+import json
 import re
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from cvelab.sourcegen import (
+    SOURCE_SCHEMA,
     _canonicalize_validator_dockerfile,
+    _repair_material,
     _validate_fidelity,
     _validate_generated,
     _validate_support_services,
+    repair_validator_verdict,
 )
 
 
@@ -51,7 +57,10 @@ networks:
         {"path": "vulnerable/Dockerfile", "content": "FROM scratch\n"},
         {"path": "patched/Dockerfile", "content": "FROM scratch\n"},
         {"path": "validator/Dockerfile", "content": "FROM scratch\n"},
-        {"path": "validator/validator.py", "content": validator},
+        {
+            "path": "validator/validator.py",
+            "content": validator + "\nPROOF_QUALITY = 'security_effect_observed'\n",
+        },
     ]
 
 
@@ -64,7 +73,7 @@ class GeneratedValidatorContractTests(unittest.TestCase):
     def test_manual_contract_is_required(self) -> None:
         validator = " ".join([
             "attack_executed", "proof_quality", "observable_effect", "evidence_type",
-            "vulnerable", "patched", "differential_confirmed", "confirmed", "blocked",
+            "vulnerable", "patched", "differential_confirmed", "confirmed", "blocked", "raw",
         ])
         with self.assertRaisesRegex(RuntimeError, "manual PoC contract"):
             _validate_generated(generated_files(validator))
@@ -72,10 +81,67 @@ class GeneratedValidatorContractTests(unittest.TestCase):
     def test_manual_contract_is_accepted(self) -> None:
         validator = " ".join([
             "attack_executed", "proof_quality", "observable_effect", "evidence_type",
-            "vulnerable", "patched", "differential_confirmed", "confirmed", "blocked",
+            "vulnerable", "patched", "differential_confirmed", "confirmed", "blocked", "raw",
             "CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "exploit", "verify",
         ])
         _validate_generated(generated_files(validator))
+
+    def test_raw_observation_is_required_before_docker(self) -> None:
+        validator = " ".join([
+            "attack_executed", "proof_quality", "observable_effect", "evidence_type",
+            "vulnerable", "patched", "differential_confirmed", "confirmed", "blocked",
+            "CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "exploit", "verify",
+        ])
+        with self.assertRaisesRegex(RuntimeError, "raw observation"):
+            _validate_generated(generated_files(validator))
+
+    def test_exact_proof_quality_is_required_before_docker(self) -> None:
+        validator = " ".join([
+            "attack_executed", "proof_quality", "observable_effect", "evidence_type",
+            "vulnerable", "patched", "differential_confirmed", "confirmed", "blocked", "raw",
+            "CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "exploit", "verify",
+        ])
+        files = generated_files(validator)
+        files[-1]["content"] = validator + "\nPROOF_QUALITY = 'definitive'\n"
+        with self.assertRaisesRegex(RuntimeError, "exact proof_quality"):
+            _validate_generated(files)
+
+    def test_vendor_source_cannot_be_returned_as_adapter_file(self) -> None:
+        validator = " ".join([
+            "attack_executed", "proof_quality", "observable_effect", "evidence_type",
+            "vulnerable", "patched", "differential_confirmed", "confirmed", "blocked", "raw",
+            "CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "exploit", "verify",
+        ])
+        files = generated_files(validator) + [
+            {"path": "source/vulnerable/lodash.js", "content": "tampered"},
+        ]
+        with self.assertRaisesRegex(RuntimeError, "Unsafe generated path"):
+            _validate_generated(files)
+        pattern = SOURCE_SCHEMA["properties"]["adapter_files"]["items"]["properties"]["path"]["pattern"]
+        self.assertTrue(re.fullmatch(pattern, "adapter/server.js"))
+        self.assertTrue(re.fullmatch(pattern, "adapter/vulnerable/package.json"))
+        self.assertTrue(re.fullmatch(pattern, "adapter/a/b/c/index.js"))
+        self.assertTrue(re.fullmatch(pattern, "validator/requirements.txt"))
+        self.assertIsNone(re.fullmatch(pattern, "source/vulnerable/lodash.js"))
+
+    def test_repair_material_includes_nested_project_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            lab = Path(temporary)
+            nested = lab / "adapter" / "vulnerable" / "package.json"
+            nested.parent.mkdir(parents=True)
+            nested.write_text('{"name":"sample"}', encoding="utf-8")
+            requirements = lab / "validator" / "requirements.txt"
+            requirements.parent.mkdir()
+            requirements.write_text("requests\n", encoding="utf-8")
+            source = lab / "source" / "vulnerable" / "private.txt"
+            source.parent.mkdir(parents=True)
+            source.write_text("vendor source", encoding="utf-8")
+
+            material = _repair_material(lab)
+
+            self.assertEqual(material["adapter/vulnerable/package.json"], '{"name":"sample"}')
+            self.assertEqual(material["validator/requirements.txt"], "requests\n")
+            self.assertNotIn("source/vulnerable/private.txt", material)
 
     def test_fidelity_cannot_promote_component_adapter_to_product(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "cannot claim"):
@@ -111,6 +177,41 @@ class GeneratedValidatorContractTests(unittest.TestCase):
             ["upstream"],
             "services:\n  upstream:\n    image: example.invalid/upstream\n",
         )
+
+    def test_focused_verdict_repair_only_replaces_validator(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lab = root / "CVE-2026-12345"
+            validator = " ".join([
+                "attack_executed", "proof_quality", "observable_effect", "evidence_type",
+                "vulnerable", "patched", "differential_confirmed", "confirmed", "blocked", "raw",
+                "CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "exploit", "verify",
+            ])
+            for item in generated_files(validator):
+                path = lab / item["path"]
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(item["content"], encoding="utf-8")
+            (lab / "plan.json").write_text(json.dumps({"generation": {}}), encoding="utf-8")
+            original_compose = (lab / "docker-compose.yml").read_text(encoding="utf-8")
+            replacement = validator + " corrected\nPROOF_QUALITY = 'security_effect_observed'\n"
+            with mock.patch(
+                "cvelab.sourcegen.structured_response",
+                return_value={"validator_py": replacement},
+            ):
+                result = repair_validator_verdict(
+                    "CVE-2026-12345", root, {"kind": "proof_not_verified"},
+                    1, "key", "model", provider="deepseek",
+                )
+
+            self.assertEqual(result["status"], "VALIDATOR_REPAIRED_UNVALIDATED")
+            self.assertEqual(
+                (lab / "validator" / "validator.py").read_text(encoding="utf-8").strip(),
+                replacement.strip(),
+            )
+            self.assertEqual(
+                (lab / "docker-compose.yml").read_text(encoding="utf-8"), original_compose,
+            )
+            self.assertEqual(result["plan"]["generation"]["repair_history"][0]["kind"], "validator_verdict")
 
 
 if __name__ == "__main__":

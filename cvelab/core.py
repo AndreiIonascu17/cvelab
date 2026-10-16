@@ -323,10 +323,15 @@ def run_docker_stage(
         env=environment,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if result.returncode == 0:
         return
-    engine = subprocess.run([docker, "info"], capture_output=True, text=True, env=environment)
+    engine = subprocess.run(
+        [docker, "info"], capture_output=True, text=True,
+        encoding="utf-8", errors="replace", env=environment,
+    )
     if os.name == "nt" and engine.returncode != 0:
         ensure_docker(docker, environment)
         result = subprocess.run(
@@ -335,6 +340,8 @@ def run_docker_stage(
             env=environment,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if result.returncode == 0:
             return
@@ -469,6 +476,61 @@ def shipyard_report(cve: str, lab_dir: Path, plan: dict) -> dict:
     return {"ok": validated, "lab_dir": str(lab_dir), "report": report}
 
 
+def _has_raw_observation(result: object) -> bool:
+    if not isinstance(result, dict):
+        return False
+    raw = result.get("raw")
+    if isinstance(raw, str):
+        return bool(raw.strip())
+    return isinstance(raw, (dict, list)) and bool(raw)
+
+
+def source_proof_checks(plan: dict, validation: dict) -> dict[str, bool]:
+    """Check a source lab's proof contract independently of its validator."""
+    proof_contract = plan.get("exploit_contract", {})
+    vulnerable_result = validation.get("vulnerable", {})
+    patched_result = validation.get("patched", {})
+    vulnerable_only = plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION"
+    checks = {
+        "source_reproduction": plan.get("lab_type") in {
+            "SOURCE_REPRODUCTION", "END_TO_END_REPRODUCTION",
+            "VULNERABLE_ONLY_REPRODUCTION",
+        },
+        "contract_effect_defined": bool(proof_contract.get("observable_effect")),
+        "contract_evidence_defined": bool(proof_contract.get("evidence_type")),
+        "attack_executed": validation.get("attack_executed") is True,
+        "security_effect_observed": validation.get("proof_quality") == "security_effect_observed",
+        "observable_effect_recorded": bool(validation.get("observable_effect")),
+        "evidence_type_matches": validation.get("evidence_type") == proof_contract.get("evidence_type"),
+        "vulnerable_confirmed": (
+            isinstance(vulnerable_result, dict) and vulnerable_result.get("confirmed") is True
+        ),
+        "vulnerable_raw_recorded": _has_raw_observation(vulnerable_result),
+    }
+    if vulnerable_only:
+        checks.update({
+            "public_fix_not_identified": validation.get("fix_status") == "PUBLIC_FIX_NOT_IDENTIFIED",
+            "patched_not_tested": validation.get("patched_tested") is False,
+            "not_differential": validation.get("differential_confirmed") is False,
+        })
+    else:
+        checks.update({
+            "patched_not_confirmed": (
+                isinstance(patched_result, dict) and patched_result.get("confirmed") is False
+            ),
+            "patched_blocked": (
+                isinstance(patched_result, dict) and patched_result.get("blocked") is True
+            ),
+            "patched_raw_recorded": _has_raw_observation(patched_result),
+            "differential_confirmed": validation.get("differential_confirmed") is True,
+        })
+    return checks
+
+
+def _manual_verdict_matches(output: str, expected: str) -> bool:
+    return output.strip() == expected
+
+
 def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
     cve = normalize_cve(cve_value)
     lab_dir = output_root.resolve() / cve
@@ -568,53 +630,9 @@ def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
             validation = json.loads(logged.stdout)
         except json.JSONDecodeError:
             validation = {"error": logged.stderr or logged.stdout or "validator produced no JSON"}
-        vulnerable_result = validation.get("vulnerable", {})
-        patched_result = validation.get("patched", {})
-        vulnerable_confirmed = (
-            vulnerable_result.get("confirmed") is True
-            if isinstance(vulnerable_result, dict)
-            else False
-        )
-        patched_confirmed = (
-            patched_result.get("confirmed") is True
-            if isinstance(patched_result, dict)
-            else False
-        )
-        patched_blocked = (
-            patched_result.get("blocked") is True
-            if isinstance(patched_result, dict)
-            else False
-        )
         proof_contract = plan.get("exploit_contract", {})
         vulnerable_only = plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION"
-        proof_checks = {
-            "source_reproduction": plan.get("lab_type")
-            in {
-                "SOURCE_REPRODUCTION", "END_TO_END_REPRODUCTION",
-                "VULNERABLE_ONLY_REPRODUCTION",
-            },
-            "contract_effect_defined": bool(proof_contract.get("observable_effect")),
-            "contract_evidence_defined": bool(proof_contract.get("evidence_type")),
-            "attack_executed": validation.get("attack_executed") is True,
-            "security_effect_observed": validation.get("proof_quality")
-            == "security_effect_observed",
-            "observable_effect_recorded": bool(validation.get("observable_effect")),
-            "evidence_type_matches": validation.get("evidence_type")
-            == proof_contract.get("evidence_type"),
-            "vulnerable_confirmed": vulnerable_confirmed,
-        }
-        if vulnerable_only:
-            proof_checks.update({
-                "public_fix_not_identified": validation.get("fix_status")
-                == "PUBLIC_FIX_NOT_IDENTIFIED",
-                "patched_not_tested": validation.get("patched_tested") is False,
-                "not_differential": validation.get("differential_confirmed") is False,
-            })
-        else:
-            proof_checks.update({
-                "patched_not_confirmed": not patched_confirmed,
-                "patched_blocked": patched_blocked,
-            })
+        proof_checks = source_proof_checks(plan, validation)
         automatic_proof = all(proof_checks.values()) and (
             validation.get("differential_confirmed") is False
             if vulnerable_only
@@ -643,7 +661,7 @@ def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
                     )
                     passed = checked.returncode == 0 and bool(output)
                     if action == "verify":
-                        passed = passed and expected_verdict in output
+                        passed = passed and _manual_verdict_matches(output, expected_verdict)
                     manual_poc_checks[f"{target}_{action}"] = {
                         "passed": passed,
                         "exit_code": checked.returncode,

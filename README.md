@@ -212,6 +212,14 @@ cvelab --output-root "$PWD/generated-labs" auto CVE-YYYY-NNNNN \
 The history of generation, errors, repairs, and validation is saved in
 `generated-labs/CVE-YYYY-NNNNN/automation.json`.
 
+For source labs, a passing report requires the observed security effect on the
+vulnerable revision, a blocked effect on the patched revision when a public fix
+exists, and nonempty raw observations from each tested target. The manual
+`verify` actions must print the exact `REPRODUCED` or `BLOCKED` verdict. Failed
+checks are recorded in the automation history and passed to the repair step.
+An exhausted attempt budget leaves the run as a failure with its evidence saved
+for review.
+
 ## CVEs with a public fix
 
 When both the vulnerable version and the fix are available, the expected result is differential:

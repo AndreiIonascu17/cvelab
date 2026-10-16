@@ -108,7 +108,10 @@ SOURCE_SCHEMA = {
                 "additionalProperties": False,
                 "required": ["path", "content"],
                 "properties": {
-                    "path": {"type": "string"},
+                    "path": {
+                        "type": "string",
+                        "pattern": "^(adapter/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*|validator/requirements\\.txt)$",
+                    },
                     "content": {"type": "string"},
                 },
             },
@@ -132,6 +135,13 @@ VULNERABLE_ONLY_SCHEMA = {
             "validator_py", "support_services", "adapter_files",
         )
     },
+}
+
+VALIDATOR_REPAIR_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["validator_py"],
+    "properties": {"validator_py": {"type": "string", "minLength": 1}},
 }
 
 DISCOVERY_SCHEMA = {
@@ -357,7 +367,17 @@ def _snapshot(repository: Path, revision: str, destination: Path) -> None:
     archive = _run_git(["archive", "--format=tar", revision], cwd=repository, binary=True)
     destination.mkdir(parents=True, exist_ok=True)
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as bundle:
-        bundle.extractall(destination, filter="data")
+        if hasattr(tarfile, "data_filter"):
+            bundle.extractall(destination, filter="data")
+        else:
+            # Python 3.11 lacks extraction filters. Validate the Git archive
+            # before using its older extractall implementation.
+            root = destination.resolve()
+            for member in bundle.getmembers():
+                target = (root / member.name).resolve()
+                if not target.is_relative_to(root) or not (member.isfile() or member.isdir()):
+                    raise ValueError(f"Unsafe archive member: {member.name}")
+            bundle.extractall(destination)
 
 
 def _clip_context_section(content: str, limit: int) -> str:
@@ -539,6 +559,14 @@ def _validate_generated(files: list[dict], vulnerable_only: bool = False) -> Non
             ):
                 raise RuntimeError(
                     "Validator must emit nested vulnerable/patched evidence with confirmed and blocked fields"
+                )
+            if "raw" not in item["content"]:
+                raise RuntimeError(
+                    "Validator must include the actual raw observation for each tested target"
+                )
+            if not re.search(r"['\"]security_effect_observed['\"]", item["content"]):
+                raise RuntimeError(
+                    "Validator must use the exact proof_quality value security_effect_observed when proven"
                 )
             manual_contract = {
                 "CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "exploit", "verify",
@@ -731,6 +759,7 @@ def generate_source_lab(
                 "non-destructive security-boundary observation from the response or container state. A reflected value "
                 "alone is insufficient. Preserve the required JSON field names: attack_executed means the regression "
                 "input was actually delivered; vulnerable.confirmed must be computed from raw observations; set "
+                "vulnerable.raw to the actual nonempty response or serialized observation from this run; "
                 "proof_quality to security_effect_observed, patched_tested and differential_confirmed to false, and "
                 "fix_status to PUBLIC_FIX_NOT_IDENTIFIED. Exit zero only when the stated observation is reproduced. "
                 "Support the required local manual interface selected by CVELAB_MANUAL_ACTION and CVELAB_TARGET: the "
@@ -842,7 +871,12 @@ def generate_source_lab(
             "security-boundary observation from raw responses or container state. A reflected marker alone is not "
             "evidence. Preserve the required JSON field names: attack_executed means the regression input was sent; "
             "vulnerable.confirmed, patched.confirmed, patched.blocked, and differential_confirmed must be computed from "
-            "raw observations, never hard-coded. Exit zero only when the observation occurs on the affected revision "
+            "raw observations, never hard-coded. "
+            "Include nonempty vulnerable.raw and patched.raw fields with the actual response or serialized "
+            "observation from each target in this run; describe only effects supported by those observations. "
+            "Use the exact proof_quality value security_effect_observed only when the stated security effect is "
+            "observed; use inconclusive otherwise. "
+            "Exit zero only when the observation occurs on the affected revision "
             "and the fixed revision demonstrably prevents it. Implement the required local manual interface using "
             "CVELAB_MANUAL_ACTION and CVELAB_TARGET. The legacy action name exploit sends only the same regression "
             "input to the selected Docker service and prints raw output; verify performs a fresh independent check and "
@@ -853,17 +887,17 @@ def generate_source_lab(
             "final result with the literal keys attack_executed, proof_quality, observable_effect, evidence_type, "
             "vulnerable, patched, and differential_confirmed so CVELab can audit the source before execution; derive "
             "all success booleans from the current raw observations. "
-            f"Use only harmless canary data ({marker}) inside the isolated containers. Do not add arbitrary target "
-            "selection, external connectivity, host integration, elevated container permissions, sensitive-data "
-            "access, or lasting system changes. Dockerfiles may install ordinary build dependencies. Normalize copied "
-            "scripts to LF. Before using a Gradle wrapper, verify that its JAR exists; otherwise install the exact "
             "Measure confirmed the same way on both sides: one function that decides whether "
             "the exploit succeeded, called once for vulnerable and once for patched, so the two "
             "verdicts are comparable. confirmed means the security effect was observed, not that "
             "the service answered. A rejection, an error status, a thrown exception or any "
             "response without the effect is confirmed=false and blocked=true. A patched build "
             "that refuses the input is the expected outcome; recording that as a confirmation "
-            "inverts the proof. "
+            "inverts the proof. patched.confirmed and patched.blocked must never both be true. "
+            f"Use only harmless canary data ({marker}) inside the isolated containers. Do not add arbitrary target "
+            "selection, external connectivity, host integration, elevated container permissions, sensitive-data "
+            "access, or lasting system changes. Dockerfiles may install ordinary build dependencies. Normalize copied "
+            "scripts to LF. Before using a Gradle wrapper, verify that its JAR exists; otherwise install the exact "
             "declared Gradle version. Source archives have no .git directory, so initialize a local repository without "
             "a remote only if build logic requires it. Healthchecks and the validator must use the final application "
             "scheme, port, and route, and redirects must not count as healthy."
@@ -938,10 +972,11 @@ def _repair_material(lab_dir: Path) -> dict[str, str]:
         lab_dir / "patched" / "Dockerfile",
         lab_dir / "validator" / "Dockerfile",
         lab_dir / "validator" / "validator.py",
+        lab_dir / "validator" / "requirements.txt",
     ]
     adapter_dir = lab_dir / "adapter"
     if adapter_dir.is_dir():
-        candidates.extend(sorted(path for path in adapter_dir.iterdir() if path.is_file()))
+        candidates.extend(sorted(path for path in adapter_dir.rglob("*") if path.is_file()))
     material = {}
     for path in candidates:
         if not path.is_file():
@@ -950,6 +985,78 @@ def _repair_material(lab_dir: Path) -> dict[str, str]:
         if ALLOWED_GENERATED.fullmatch(relative):
             material[relative] = path.read_text(encoding="utf-8", errors="replace")[:30000]
     return material
+
+
+def repair_validator_verdict(
+    cve_value: str,
+    output_root: Path,
+    failure: dict,
+    attempt: int,
+    api_key: str | None,
+    model: str | None,
+    provider: str | None = None,
+    base_url: str | None = None,
+) -> dict:
+    """Repair validator proof fields without regenerating a working adapter."""
+    cve = normalize_cve(cve_value)
+    lab_dir = output_root.resolve() / cve
+    plan_path = lab_dir / "plan.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    material = _repair_material(lab_dir)
+    diagnostic = json.dumps(failure, ensure_ascii=True, indent=2)[:24000]
+    generated = structured_response(
+        api_key=api_key,
+        model=model,
+        schema=VALIDATOR_REPAIR_SCHEMA,
+        schema_name="cvelab_validator_verdict_repair",
+        max_output_tokens=10000,
+        instructions=(
+            "Return a complete replacement validator.py for this local defensive regression lab. "
+            "Keep the existing request, canary, service names, and manual exploit/verify interface. "
+            "Fix every listed failed_checks item using the actual raw observations; preserve the adapter. "
+            "confirmed means the attack's security effect occurred on "
+            "that target; it does not mean that the patch's protection was confirmed. When the patched "
+            "response rejects the attack and does not show the security effect, patched.confirmed must "
+            "be false and patched.blocked must be true. These fields must never both be true. "
+            "Compute every success verdict from fresh raw observations and retain truthful raw evidence. "
+            "For a proven effect, proof_quality must be the exact string security_effect_observed; use "
+            "inconclusive otherwise. Labels such as definitive and none do not satisfy CVELab's contract. "
+            "The automatic JSON must include nonempty vulnerable.raw and patched.raw fields containing the "
+            "actual response or serialized observation from this run. "
+            "Do not weaken or fake the proof, add external targets, or change the exploit input."
+        ),
+        input_text=(
+            "--- CURRENT VALIDATOR ---\n"
+            + material["validator/validator.py"]
+            + "\n--- OBSERVED FAILURE ---\n"
+            + diagnostic
+        ),
+        provider=provider,
+        base_url=base_url,
+    )
+    material["validator/validator.py"] = generated["validator_py"]
+    _validate_generated(
+        [{"path": path, "content": content} for path, content in material.items()]
+    )
+    write_text(lab_dir / "validator" / "validator.py", generated["validator_py"])
+    history = plan.get("generation", {}).get("repair_history", [])
+    history.append({
+        "attempt": attempt,
+        "kind": "validator_verdict",
+        "model": model or os.getenv("CVELAB_MODEL"),
+        "provider": resolve_provider(provider),
+        "failure": diagnostic[:8000],
+    })
+    plan.setdefault("generation", {})["repair_history"] = history
+    write_text(plan_path, json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
+    write_text(lab_dir / "validator" / "plan.json", json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
+    return {
+        "ok": True,
+        "status": "VALIDATOR_REPAIRED_UNVALIDATED",
+        "attempt": attempt,
+        "lab_dir": str(lab_dir),
+        "plan": plan,
+    }
 
 
 def repair_source_lab(
@@ -1005,7 +1112,9 @@ def repair_source_lab(
         if vulnerable_only
         else
         "Send the identical patch-derived regression input to vulnerable and patched services. Success requires the effect on "
-        "vulnerable, its absence on patched, patched.blocked=true, and differential_confirmed=true."
+        "vulnerable, its absence on patched, patched.confirmed=false, patched.blocked=true, and differential_confirmed=true. "
+        "confirmed means the attack effect occurred, not that the patch worked; patched.confirmed and "
+        "patched.blocked must never both be true."
     )
     generation = structured_response(
         api_key=api_key,
@@ -1016,16 +1125,24 @@ def repair_source_lab(
         instructions=(
             "Repair a complete authorized, local-only defensive security-regression fixture. The observed failure and "
             "container logs are authoritative: identify their root cause and return a full replacement, not a patch. "
+            "Address every listed failed_checks item; do not assert success in observable_effect when the raw response "
+            "does not show it. "
             "Do not repeat the failing design when the diagnostics disprove it. Build and run the supplied immutable "
-            "vendor source snapshots; never modify or return vendor source. Prefer the actual vendor service or binary. "
+            "vendor source snapshots; never modify or return vendor source. Every adapter_files.path must be "
+            "under adapter/ or exactly validator/requirements.txt; never return a source/ path. "
+            "Prefer the actual vendor service or binary. "
             "Use source_component only if launching the product is genuinely impractical, vendor_service when the real "
             "service starts with simulated surrounding components, and product_end_to_end only when the complete "
             "security-relevant product path executes. Disclose every simulated component. Compose must use an internal "
             "network, no host ports or mounts, services named vulnerable, patched where applicable, and validator, and "
             "list all extra services in support_services. Run containers non-root with no-new-privileges. The automatic "
             "validator must deliver the same patch-derived regression input, derive its booleans from raw observations, print one JSON document with "
-            "attack_executed, proof_quality=security_effect_observed, observable_effect, evidence_type, vulnerable, and "
-            "the required comparison fields, and exit zero only on genuine proof. It must also support independently "
+            "attack_executed, proof_quality, observable_effect, evidence_type, vulnerable, and "
+            "the required comparison fields. Use the exact proof_quality value security_effect_observed only when "
+            "the effect is observed, and inconclusive otherwise. The validator must exit zero only on genuine proof. "
+            "The JSON must include nonempty "
+            "vulnerable.raw and, when patched is tested, patched.raw with the actual response or serialized observation "
+            "from this run. Describe only effects supported by that evidence. It must also support independently "
             "runnable CVELAB_MANUAL_ACTION=exploit|verify and CVELAB_TARGET=vulnerable|patched modes; the legacy exploit action prints raw "
             "evidence and verify prints REPRODUCED or BLOCKED only after evaluating a fresh request. Never hard-code a "
             "successful result or treat canary reflection alone as proof. Preserve the regression contract unless runtime "
@@ -1072,7 +1189,7 @@ def repair_source_lab(
     new_paths = {item["path"].replace("\\", "/") for item in generated_files}
     adapter_dir = lab_dir / "adapter"
     if adapter_dir.is_dir():
-        for old_file in adapter_dir.iterdir():
+        for old_file in adapter_dir.rglob("*"):
             relative = old_file.relative_to(lab_dir).as_posix()
             if old_file.is_file() and ALLOWED_GENERATED.fullmatch(relative) and relative not in new_paths:
                 old_file.unlink()

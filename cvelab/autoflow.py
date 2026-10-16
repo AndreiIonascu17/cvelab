@@ -22,7 +22,7 @@ from pathlib import Path
 from . import progress, usage
 from .core import normalize_cve, run_lab, write_text
 from .deliverables import create_deliverables
-from .sourcegen import generate_source_lab, repair_source_lab
+from .sourcegen import generate_source_lab, repair_source_lab, repair_validator_verdict
 
 Progress = Callable[[str], None]
 
@@ -53,6 +53,34 @@ def _infrastructure_failure(message: str) -> bool:
         "cvelab_model is not set",
     )
     return any(indicator in lowered for indicator in indicators)
+
+
+def _validator_only_failure(failure: dict) -> bool:
+    """Keep a working adapter when only validator evidence or verdicts failed."""
+    if failure.get("kind") != "proof_not_verified":
+        return False
+    report = failure.get("report", {})
+    checks = report.get("proof_checks", {})
+    baseline = {
+        "source_reproduction", "contract_effect_defined", "contract_evidence_defined",
+        "attack_executed", "observable_effect_recorded", "evidence_type_matches",
+        "vulnerable_confirmed",
+    }
+    if not isinstance(checks, dict) or any(checks.get(name) is not True for name in baseline):
+        return False
+    if "patched_blocked" in checks and checks["patched_blocked"] is not True:
+        return False
+    manual_ran = bool(report.get("manual_poc_checks"))
+    failed = {
+        name for name, passed in checks.items()
+        if passed is False and (name != "manual_poc_verified" or manual_ran)
+    }
+    validator_fields = {
+        "security_effect_observed", "vulnerable_raw_recorded",
+        "patched_raw_recorded", "patched_not_confirmed", "differential_confirmed",
+        "manual_poc_verified",
+    }
+    return bool(failed) and failed <= validator_fields
 
 
 def _record(
@@ -172,6 +200,7 @@ def run_auto_workflow(
     pending_failure: dict | None = None
     repair_calls = 0
     validation_attempt = 0
+    last_repair_was_validator = False
 
     while validation_attempt < max_attempts:
         if pending_failure and not scripted_runner and not _infrastructure_failure(
@@ -180,12 +209,16 @@ def run_auto_workflow(
             if repair_calls >= max_attempts - 1:
                 break
             repair_calls += 1
+            validator_only = (
+                _validator_only_failure(pending_failure) and not last_repair_was_validator
+            )
             announce(
-                f"{cve}: repairing adapter from observed evidence "
-                f"({repair_calls}/{max_attempts - 1})"
+                f"{cve}: repairing {'validator proof' if validator_only else 'adapter'} "
+                f"from observed evidence ({repair_calls}/{max_attempts - 1})"
             )
             try:
-                repaired = repair_source_lab(
+                repair = repair_validator_verdict if validator_only else repair_source_lab
+                repaired = repair(
                     cve,
                     output_root,
                     pending_failure,
@@ -196,6 +229,7 @@ def run_auto_workflow(
                     base_url,
                 )
             except Exception as exc:
+                last_repair_was_validator = validator_only
                 attempts.append({
                     "phase": "repair",
                     "attempt": repair_calls,
@@ -219,6 +253,7 @@ def run_auto_workflow(
                 "fidelity": repaired.get("plan", {}).get("fidelity"),
             })
             plan = repaired.get("plan", plan)
+            last_repair_was_validator = validator_only
             pending_failure = None
             _record(lab_dir, attempts)
 
@@ -261,9 +296,16 @@ def run_auto_workflow(
                 )
                 delivered["automation"] = automation
                 return delivered
+            report = validated.get("report", validated)
+            checks = report.get("proof_checks", {})
+            manual_ran = bool(report.get("manual_poc_checks"))
             pending_failure = {
                 "kind": "proof_not_verified",
-                "report": validated.get("report", validated),
+                "failed_checks": [
+                    name for name, passed in checks.items()
+                    if passed is False and (name != "manual_poc_verified" or manual_ran)
+                ],
+                "report": report,
             }
             attempts.append({
                 "phase": "validation",
