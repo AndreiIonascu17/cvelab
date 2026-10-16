@@ -30,6 +30,7 @@ from .providers import (
     SELECTABLE,
     auth_headers_for,
     endpoint_for,
+    output_budget_for,
     timeout_for,
 )
 from .providers import get as get_provider
@@ -480,6 +481,9 @@ def structured_response(
         "Preserve source quotations, identifiers, and raw evidence verbatim."
     )
     provider = get_provider(selected)
+    # Asked for once here rather than at each of the six call sites that
+    # name a budget: what a model needs is a property of the model.
+    max_output_tokens = output_budget_for(selected, max_output_tokens)
     # Dispatch on the dialect, not the name: a provider that speaks one we
     # already handle needs no new request code.
     if tools and not provider.web_search:

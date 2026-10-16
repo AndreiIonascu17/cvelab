@@ -34,6 +34,7 @@ from cvelab.providers import (
     SELECTABLE,
     base_url_for,
     endpoint_for,
+    output_budget_for,
     price_for,
 )
 from cvelab.providers import get as get_provider
@@ -118,6 +119,44 @@ class NothingIsDeclaredTwiceTests(unittest.TestCase):
     def test_every_provider_resolves(self) -> None:
         for name in PROVIDERS:
             self.assertEqual(resolve_provider(name), name)
+
+
+class OutputBudgetTests(unittest.TestCase):
+    """A reasoning model spends the budget before it writes anything.
+
+    deepseek-v4-pro returned finish_reason='length' with no content at the
+    budgets that work elsewhere, and the response carried reasoning_tokens.
+    The ceiling is a property of the model, so it is declared once.
+    """
+
+    def test_a_plain_provider_is_unscaled(self) -> None:
+        self.assertEqual(output_budget_for("openai", 14000), 14000)
+
+    def test_a_reasoning_provider_gets_room(self) -> None:
+        self.assertGreater(output_budget_for("deepseek", 14000), 14000)
+
+    def test_the_scale_can_be_overridden(self) -> None:
+        with unittest.mock.patch.dict(
+            "os.environ", {"CVELAB_DEEPSEEK_OUTPUT_SCALE": "2"}
+        ):
+            self.assertEqual(output_budget_for("deepseek", 1000), 2000)
+
+    def test_a_nonsense_override_is_refused(self) -> None:
+        with unittest.mock.patch.dict(
+            "os.environ", {"CVELAB_OPENAI_OUTPUT_SCALE": "plenty"}
+        ):
+            with self.assertRaises(ValueError):
+                output_budget_for("openai", 1000)
+
+    def test_every_provider_declares_a_usable_scale(self) -> None:
+        for name, provider in PROVIDERS.items():
+            with self.subTest(provider=name):
+                self.assertGreater(provider.output_budget_scale, 0)
+                self.assertEqual(
+                    output_budget_for(name, 1000),
+                    int(1000 * provider.output_budget_scale),
+                )
+
 
 
 if __name__ == "__main__":

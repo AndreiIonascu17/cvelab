@@ -70,6 +70,11 @@ class Provider:
     # Seconds allowed per request. A hosted API answers in minutes; a local
     # model on CPU can take far longer.
     timeout_seconds: int = 600
+    # Multiplies the output budget a caller asks for. A reasoning model
+    # spends the budget thinking before it writes anything, so the same
+    # request needs a larger ceiling for the same answer. Overridden by
+    # CVELAB_<NAME>_OUTPUT_SCALE.
+    output_budget_scale: float = 1.0
     # Header used to carry the key. Anthropic takes its own; everyone else
     # uses Bearer.
     auth_header: str = "Authorization"
@@ -137,6 +142,10 @@ PROVIDERS: dict[str, Provider] = {
         web_search=False,
         # Peak hours cost double, 01:00-04:00 and 06:00-10:00 UTC on weekdays.
         # Off-peak is listed, so a peak run costs about twice what is reported.
+        # Measured: a reasoning model reports reasoning_tokens and returns
+        # finish_reason="length" with no content at budgets that suffice
+        # elsewhere, because the thinking is spent before anything is written.
+        output_budget_scale=4.0,
         models=("deepseek-flash", "deepseek-v4-pro"),
         prices={
             "deepseek-flash": (0.15, 0.60),
@@ -216,6 +225,21 @@ def timeout_for(name: str) -> int:
             f"CVELAB_{name.upper()}_TIMEOUT must be between 1 and 86400 seconds"
         )
     return value
+
+
+def output_budget_for(name: str, requested: int) -> int:
+    """Scale an output budget to what this provider needs for the same work."""
+    provider = get(name)
+    override = os.getenv(f"CVELAB_{name.upper()}_OUTPUT_SCALE")
+    scale = provider.output_budget_scale
+    if override:
+        try:
+            scale = float(override)
+        except ValueError as error:
+            raise ValueError(
+                f"CVELAB_{name.upper()}_OUTPUT_SCALE must be a number, got {override!r}"
+            ) from error
+    return max(1, int(requested * scale))
 
 
 def price_for(model: str) -> tuple[float, float] | None:
