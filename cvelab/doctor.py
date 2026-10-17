@@ -174,15 +174,27 @@ def check_report_upload() -> Check:
     report without being asked again. Something that happens by default
     should be visible by default, so the preflight states which way it is
     set rather than leaving it to be discovered from a log line.
+
+    Both wordings carry the whole fact rather than half of it. "No token"
+    used to read "reports stay on this machine", which says where they stay
+    without saying that nothing is kept on our side, or what a token would
+    change. The fix line cannot carry it: it renders only for a check that
+    did not pass, and running without a token is a supported choice rather
+    than a fault.
     """
+    endpoint = upload.endpoint()
     if not upload.find_token():
         return Check(
             "report upload", OK,
-            "off: no token, reports stay on this machine",
+            f"off: nothing is sent anywhere. This run stays on this machine "
+            f"and we keep no copy. A token from {endpoint}/app/ saves each "
+            f"report to your account, where you can open what you filed",
         )
     return Check(
         "report upload", OK,
-        f"on: reports go to {upload.endpoint()} (--no-upload to skip)",
+        f"on: each finished run files its report to your account at "
+        f"{endpoint}, exploit included. --no-poc sends the report alone, "
+        f"--no-upload sends nothing",
     )
 
 

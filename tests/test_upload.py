@@ -230,11 +230,17 @@ class EndpointTests(unittest.TestCase):
 class PreflightTests(unittest.TestCase):
     """Uploading is opt-out, so the preflight has to say which way it is set."""
 
-    def test_the_preflight_says_when_nothing_will_be_sent(self) -> None:
+    def test_the_preflight_says_nothing_is_kept_on_our_side(self) -> None:
+        # "reports stay on this machine" said where they stay without
+        # saying that we keep no copy, or what a token would change.
         from cvelab.doctor import check_report_upload
 
         with mock.patch.object(upload, "find_token", return_value=None):
-            self.assertIn("off", check_report_upload().detail)
+            detail = check_report_upload().detail
+        self.assertIn("off", detail)
+        self.assertIn("we keep no copy", detail)
+        self.assertIn("token", detail)
+        self.assertIn("your account", detail)
 
     def test_the_preflight_names_where_reports_go(self) -> None:
         from cvelab.doctor import check_report_upload
@@ -244,6 +250,10 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("on", detail)
         self.assertIn(upload.endpoint(), detail)
         self.assertIn("--no-upload", detail)
+        # The exploit travels by default now, so the line that announces
+        # the upload has to say so.
+        self.assertIn("exploit included", detail)
+        self.assertIn("--no-poc", detail)
 
 
 if __name__ == "__main__":
