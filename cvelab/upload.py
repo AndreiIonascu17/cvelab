@@ -55,6 +55,12 @@ TOKEN_FILE = Path.home() / ".config" / "cvelab" / "token"
 #: silent trim is not: anything cut is marked so the dashboard can say so.
 MAX_DOCUMENT_BYTES = 128 * 1024
 
+#: What the control plane accepts for one run. Ten documents at the
+#: per-document cap would exceed it, and a 413 loses the whole entry rather
+#: than part of it, so the payload is trimmed here instead. Real labs run
+#: 50 to 140 KiB, so this only bites a pathological one.
+MAX_PAYLOAD_BYTES = 900 * 1024
+
 #: What leaves the machine.
 #:
 #: Everything the run generated, because the corpus is what the service
@@ -148,6 +154,7 @@ def collect(
     artifacts = lab_dir / "artifacts"
     names = ALWAYS if include_poc else tuple(n for n in ALWAYS if n not in EXPLOIT)
     documents = [doc for doc in (read_document(artifacts / n) for n in names) if doc]
+    documents, dropped = fit_payload(documents)
 
     plan = _plan(lab_dir)
     revisions = plan.get("revisions") or {}
@@ -171,7 +178,28 @@ def collect(
         "cost_usd": totals["estimated_cost_usd"],
         "error": redact(str(result["error"]))[:4000] if result.get("error") else None,
         "documents": documents,
+        "dropped_documents": dropped,
     }
+
+
+def fit_payload(documents: list[dict]) -> tuple[list[dict], list[str]]:
+    """Trim to what the control plane will accept, least useful first.
+
+    ALWAYS is in priority order, so dropping from the end sheds the
+    analysis before the report and the report before the exploit.
+    """
+    total = sum(len(d["text"].encode("utf-8")) for d in documents)
+    if total <= MAX_PAYLOAD_BYTES:
+        return documents, []
+    kept, dropped, used = [], [], 0
+    for document in documents:
+        size = len(document["text"].encode("utf-8"))
+        if used + size <= MAX_PAYLOAD_BYTES:
+            kept.append(document)
+            used += size
+        else:
+            dropped.append(document["name"])
+    return kept, dropped
 
 
 def describe(payload: dict) -> str:
@@ -186,6 +214,11 @@ def describe(payload: dict) -> str:
         lines.append(f"  {document['name']:<16}{size:>8,} bytes{mark}")
     if not payload["documents"]:
         lines.append("  (no documents; metadata only)")
+    if payload.get("dropped_documents"):
+        lines.append(
+            "  too large for one upload, left out: "
+            + ", ".join(payload["dropped_documents"])
+        )
     lines.append("  the provider key is not part of this payload")
     if payload["status"] == "succeeded":
         # Saying this once per run is the difference between a corpus people

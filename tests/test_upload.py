@@ -145,6 +145,50 @@ class CollectTests(unittest.TestCase):
         self.assertNotIn("shared corpus", upload.describe(payload))
 
 
+class PayloadBudgetTests(unittest.TestCase):
+    """Ten documents at the per-document cap exceed what one upload takes.
+
+    The server refuses a body over 1 MiB with a 413, which loses the whole
+    entry rather than part of it. ALWAYS is in priority order, so trimming
+    from the end sheds the analysis before the report and the report before
+    the exploit. Real labs are 50 to 140 KiB, so this only bites a
+    pathological one -- but the cliff was introduced the moment the payload
+    went from one document to ten.
+    """
+
+    def test_a_normal_lab_is_never_trimmed(self) -> None:
+        documents = [{"name": "REPORT.md", "text": "x" * 50_000}]
+        kept, dropped = upload.fit_payload(documents)
+        self.assertEqual(kept, documents)
+        self.assertEqual(dropped, [])
+
+    def test_an_oversized_payload_is_trimmed_not_refused(self) -> None:
+        documents = [
+            {"name": f"d{i}.md", "text": "A" * upload.MAX_DOCUMENT_BYTES}
+            for i in range(10)
+        ]
+        kept, dropped = upload.fit_payload(documents)
+        self.assertTrue(kept)
+        self.assertTrue(dropped)
+        total = sum(len(d["text"].encode("utf-8")) for d in kept)
+        self.assertLessEqual(total, upload.MAX_PAYLOAD_BYTES)
+
+    def test_what_was_left_out_is_named(self) -> None:
+        documents = [
+            {"name": f"d{i}.md", "text": "A" * upload.MAX_DOCUMENT_BYTES}
+            for i in range(10)
+        ]
+        _, dropped = upload.fit_payload(documents)
+        payload = {"cve": "CVE-2024-1", "status": "failed", "outcome": None,
+                   "documents": [], "dropped_documents": dropped}
+        self.assertIn("left out", upload.describe(payload))
+        self.assertIn(dropped[0], upload.describe(payload))
+
+    def test_the_budget_stays_under_what_the_worker_accepts(self) -> None:
+        # site/worker/index.js refuses a body over 1 MiB.
+        self.assertLess(upload.MAX_PAYLOAD_BYTES, 1024 * 1024)
+
+
 class TokenTests(unittest.TestCase):
     def test_no_token_means_nothing_is_sent(self) -> None:
         with mock.patch.object(upload, "find_token", return_value=None):
