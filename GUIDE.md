@@ -321,14 +321,21 @@ The report is sent when the run finishes. What travels:
 
 | | Sent |
 |---|---|
-| `REPORT.md` | yes |
+| `REPORT.md`, `WALKTHROUGH.md`, `EVIDENCE.json`, `report.json`, `analysis.json` | yes |
 | CVE, repository, fixed revision, model, token counts, cost | yes |
-| `PoC.py`, `WALKTHROUGH.md`, `plan.json`, `report.json` | only with `--upload-poc` |
+| `PoC.py`, `manual.sh`, `PoC.ps1`, `MANUAL-POC.md`, `plan.json` | yes, unless `--no-poc` |
 | Your provider key | never |
-| The source, the images, the containers | never |
+| The source trees, the images, the containers | never |
+
+**The exploit travels with the report.** A validated run becomes an entry in
+a shared corpus that subscribers can open and run, and an entry without the
+exploit is a description of a lab rather than a lab. `--no-poc` uploads the
+report alone; the entry is kept, and marked as not runnable.
 
 The key is not in the payload, and anything that looks like a registered
-credential is replaced with `[REDACTED]` before the request is built.
+credential is replaced with `[REDACTED]` before the request is built. The
+command prints what it is sending, including whether the exploit is in it,
+before each upload.
 
 Three ways to send nothing:
 

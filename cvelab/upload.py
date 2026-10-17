@@ -55,14 +55,30 @@ TOKEN_FILE = Path.home() / ".config" / "cvelab" / "token"
 #: silent trim is not: anything cut is marked so the dashboard can say so.
 MAX_DOCUMENT_BYTES = 128 * 1024
 
-#: What may leave the machine, and when.
+#: What leaves the machine.
 #:
-#: The report is the deliverable, so it goes by default. The exploit and the
-#: plan do not: a service that collects working exploits against its own
-#: customers' software becomes a target worth attacking. Sending them is a
-#: deliberate flag, not a default.
-ALWAYS = ("REPORT.md",)
-WITH_POC = ("WALKTHROUGH.md", "MANUAL-POC.md", "PoC.py", "plan.json", "report.json")
+#: Everything the run generated, because the corpus is what the service
+#: sells and a corpus of reports without runnable labs is worth little. The
+#: exploit travels with the rest unless --no-poc says otherwise, which is
+#: the reverse of how this started: the first version sent REPORT.md alone
+#: and the exploit only on request, and that would have filled the database
+#: with descriptions of labs nobody could run.
+ALWAYS = (
+    "REPORT.md",
+    "WALKTHROUGH.md",
+    "MANUAL-POC.md",
+    "EVIDENCE.json",
+    "PoC.py",
+    "manual.sh",
+    "PoC.ps1",
+    "plan.json",
+    "report.json",
+    "analysis.json",
+)
+
+#: Withheld by --no-poc: what makes the lab reproducible rather than merely
+#: described.
+EXPLOIT = ("PoC.py", "manual.sh", "PoC.ps1", "MANUAL-POC.md", "plan.json")
 
 #: Lab status to the status the control plane stores. A status this does not
 #: know is reported as "failed" rather than guessed at.
@@ -130,7 +146,7 @@ def collect(
 ) -> dict:
     """Build the payload, reading only from the allowlist above."""
     artifacts = lab_dir / "artifacts"
-    names = ALWAYS + (WITH_POC if include_poc else ())
+    names = ALWAYS if include_poc else tuple(n for n in ALWAYS if n not in EXPLOIT)
     documents = [doc for doc in (read_document(artifacts / n) for n in names) if doc]
 
     plan = _plan(lab_dir)
@@ -175,6 +191,12 @@ def describe(payload: dict) -> str:
         # Saying this once per run is the difference between a corpus people
         # chose to join and one they were enrolled in.
         lines.append("  a validated run joins the shared corpus, unattributed")
+        exploit = [d["name"] for d in payload["documents"] if d["name"] in EXPLOIT]
+        lines.append(
+            "  the exploit is included: " + ", ".join(exploit) + " (--no-poc to withhold)"
+            if exploit
+            else "  the exploit is withheld; the entry will not be runnable"
+        )
     return "\n".join(lines)
 
 
@@ -211,7 +233,7 @@ def upload_result(
     *,
     provider: str | None = None,
     model: str | None = None,
-    include_poc: bool = False,
+    include_poc: bool = True,
     token: str | None = None,
 ) -> dict | None:
     """Upload a finished run. Returns None when no token is configured.

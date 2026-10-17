@@ -67,9 +67,9 @@ def add_upload_flags(command: argparse.ArgumentParser) -> None:
         help=f"Never send the report, even when {upload.TOKEN_VARIABLE} is set",
     )
     command.add_argument(
-        "--upload-poc",
+        "--no-poc",
         action="store_true",
-        help="Include the exploit and plan in the upload (off by default)",
+        help="Upload the report without the exploit, leaving the entry non-runnable",
     )
 
 
@@ -164,9 +164,9 @@ def parser() -> argparse.ArgumentParser:
     )
     upload_cmd.add_argument("cve")
     upload_cmd.add_argument(
-        "--upload-poc",
+        "--no-poc",
         action="store_true",
-        help="Include the exploit and plan in the upload (off by default)",
+        help="Upload the report without the exploit, leaving the entry non-runnable",
     )
     upload_cmd.add_argument(
         "--provider", choices=SELECTABLE, help="Provider that produced this lab"
@@ -278,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
         base_url = getattr(args, "base_url", None)
         if args.command == "upload":
             return upload_command(
-                args.cve, args.output_root, args.upload_poc, args.dry_run,
+                args.cve, args.output_root, not args.no_poc, args.dry_run,
                 args.provider, args.model,
             )
         if args.command == "doctor":
@@ -359,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
                 result,
                 provider=provider,
                 model=model,
-                include_poc=args.upload_poc,
+                include_poc=not args.no_poc,
             )
         return 0 if result.get("ok", True) else 2
     except KeyboardInterrupt:

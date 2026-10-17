@@ -60,19 +60,33 @@ class CollectTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
 
     def collect(self, lab: Path, **kwargs) -> dict:
-        options = {"provider": "openai", "model": "gpt-5.6-sol", "include_poc": False}
+        options = {"provider": "openai", "model": "gpt-5.6-sol", "include_poc": True}
         options.update(kwargs)
         return upload.collect(lab, RESULT, **options)
 
-    def test_only_the_report_leaves_by_default(self) -> None:
-        payload = self.collect(make_lab(self.root))
-        self.assertEqual([d["name"] for d in payload["documents"]], ["REPORT.md"])
-
-    def test_the_exploit_leaves_only_when_asked(self) -> None:
-        payload = self.collect(make_lab(self.root), include_poc=True)
-        names = [d["name"] for d in payload["documents"]]
+    def test_the_whole_lab_leaves_by_default(self) -> None:
+        # The corpus is what the service sells, and an entry nobody can run
+        # is a description of a lab rather than a lab.
+        names = [d["name"] for d in self.collect(make_lab(self.root))["documents"]]
         self.assertIn("PoC.py", names)
+        self.assertIn("REPORT.md", names)
         self.assertIn("WALKTHROUGH.md", names)
+
+    def test_no_poc_withholds_what_makes_it_runnable(self) -> None:
+        payload = self.collect(make_lab(self.root), include_poc=False)
+        names = [d["name"] for d in payload["documents"]]
+        self.assertNotIn("PoC.py", names)
+        self.assertIn("REPORT.md", names)
+        for withheld in upload.EXPLOIT:
+            self.assertNotIn(withheld, names)
+
+    def test_the_upload_says_whether_the_exploit_is_included(self) -> None:
+        lab = make_lab(self.root)
+        self.assertIn("the exploit is included", upload.describe(self.collect(lab)))
+        self.assertIn(
+            "the exploit is withheld",
+            upload.describe(self.collect(lab, include_poc=False)),
+        )
 
     def test_metadata_comes_from_the_plan(self) -> None:
         payload = self.collect(make_lab(self.root))
@@ -102,7 +116,7 @@ class CollectTests(unittest.TestCase):
             {"ok": False, "cve": "CVE-2024-12345", "status": "SOMETHING_NEW"},
             provider=None,
             model=None,
-            include_poc=False,
+            include_poc=True,
         )
         self.assertEqual(payload["status"], "failed")
 
@@ -111,7 +125,7 @@ class CollectTests(unittest.TestCase):
         self.assertTrue(set(upload.STATUS.values()) <= allowed)
 
     def test_the_payload_never_carries_a_key_field(self) -> None:
-        payload = self.collect(make_lab(self.root), include_poc=True)
+        payload = self.collect(make_lab(self.root))
         for field in ("api_key", "key", "token", "authorization"):
             self.assertNotIn(field, payload)
 
@@ -126,7 +140,7 @@ class CollectTests(unittest.TestCase):
         payload = upload.collect(
             make_lab(self.root),
             {"ok": False, "cve": "CVE-2024-12345", "status": "AUTO_REPAIR_EXHAUSTED"},
-            provider=None, model=None, include_poc=False,
+            provider=None, model=None, include_poc=True,
         )
         self.assertNotIn("shared corpus", upload.describe(payload))
 
