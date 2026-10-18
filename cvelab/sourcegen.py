@@ -489,7 +489,14 @@ def _validate_generated(files: list[dict], vulnerable_only: bool = False) -> Non
         path = item["path"].replace("\\", "/")
         pure = PurePosixPath(path)
         if pure.is_absolute() or ".." in pure.parts or not ALLOWED_GENERATED.fullmatch(path):
-            raise RuntimeError(f"Unsafe generated path rejected: {path}")
+            raise RuntimeError(
+                f"Generated path not allowed: {path}. "
+                f"{_path_remedy(path)} "
+                "The only writable paths are docker-compose.yml, "
+                ".dockerignore, vulnerable/Dockerfile, patched/Dockerfile, "
+                "validator/Dockerfile, validator/validator.py, "
+                "validator/requirements.txt, and anything under adapter/."
+            )
         lowered = item["content"].lower()
         for needle, reason in FORBIDDEN.items():
             if needle in lowered:
@@ -580,6 +587,44 @@ def _validate_generated(files: list[dict], vulnerable_only: bool = False) -> Non
                     allowed_hosts.add("patched")
                 if url not in allowed_hosts:
                     raise RuntimeError(f"Validator external target rejected: {url}")
+
+
+def _without_compose_version(content: str) -> str:
+    """Drop the top-level `version:` key from a generated Compose file.
+
+    Compose v2 ignores it and warns, and that warning is the first line of
+    every error message the file ever produces -- including the ones a
+    repair attempt has to read. Models write it from habit; removing it
+    changes nothing about the lab.
+    """
+    lines = content.splitlines(keepends=True)
+    kept = [
+        line
+        for line in lines
+        if not re.match(r"^version\s*:\s*['\"]?[0-9.]+['\"]?\s*$", line)
+    ]
+    return "".join(kept)
+
+
+def _path_remedy(path: str) -> str:
+    """Name where the file should have gone.
+
+    Refusing a path without saying what was wanted burned a generation
+    attempt five times across three ecosystems and two models, and once
+    cost a reproduction outright: every time, the model had written the
+    adapter's entry point at the root -- server.js, exploit.py, server.rb,
+    harness/Cargo.toml -- and the next attempt guessed again.
+    """
+    pure = PurePosixPath(path)
+    if pure.is_absolute():
+        return "Paths are relative to the lab directory."
+    if ".." in pure.parts:
+        return "A path may not climb out of the lab directory."
+    if len(pure.parts) == 1 and pure.suffix:
+        return f"Did you mean adapter/{pure.name}?"
+    if pure.parts and pure.parts[0] not in {"adapter", "validator", "vulnerable", "patched"}:
+        return f"Did you mean adapter/{path}?"
+    return "Put anything the adapter needs under adapter/."
 
 
 def _validate_fidelity(fidelity: dict) -> None:
@@ -781,7 +826,10 @@ def generate_source_lab(
         lab_dir = output_root.resolve() / cve
         _snapshot(repository, vulnerable, lab_dir / "source" / "vulnerable")
         for item in generated_files:
-            write_text(lab_dir / item["path"], item["content"])
+            content = item["content"]
+            if item["path"] == "docker-compose.yml":
+                content = _without_compose_version(content)
+            write_text(lab_dir / item["path"], content)
         plan = {
             "cve": cve,
             "cwe": generation["cwe"],

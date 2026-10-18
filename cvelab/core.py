@@ -309,6 +309,59 @@ def ensure_docker(docker: str, environment: dict[str, str]) -> None:
     raise RuntimeError("Docker engine recovery failed." + suffix)
 
 
+#: A ceiling for the build phase.
+#:
+#: The lab *runtime* is capped in the Compose file: 128 MB and half a core
+#: per service, on an internal network with no host ports or mounts. The
+#: build had nothing, and it is the part that runs untrusted code -- `npm
+#: install`, `cargo build` and `pip install` execute whatever the upstream
+#: dependency tree says, on every run. One runaway postinstall could take
+#: the machine down.
+#:
+#: Memory is the only ceiling Compose offers here: `docker compose build`
+#: takes -m/--memory and has no --cpus, which was checked against the
+#: installed Compose rather than assumed -- passing --cpus fails the build
+#: with "unknown flag". A CPU bound needs a cgroup around the daemon or a
+#: builder of its own, which belongs with the builder machine rather than
+#: here.
+#:
+#: Deliberately roomy: compiling Pillow or a Rust harness is real work.
+#: This exists to bound a pathological build, not to fail an honest one.
+#: CVELAB_BUILD_MEMORY overrides it, and an empty value removes it.
+DEFAULT_BUILD_MEMORY = "4g"
+
+
+def build_limits() -> list[str]:
+    """`docker compose build` flags that bound what a build may consume."""
+    memory = os.getenv("CVELAB_BUILD_MEMORY", DEFAULT_BUILD_MEMORY).strip()
+    return ["--memory", memory] if memory else []
+
+
+#: Seconds a single Docker stage may take before it is killed.
+#:
+#: There was no ceiling at all. A `cargo build` that never finishes, or an
+#: upstream server that accepts a connection and never answers, held the
+#: stage forever -- and on a serial queue that is the whole queue. Compiling
+#: two source trees is genuinely slow, so the default is generous rather
+#: than tight; CVELAB_STAGE_TIMEOUT overrides it.
+DEFAULT_STAGE_TIMEOUT = 1800
+
+
+def stage_timeout() -> int:
+    raw = os.getenv("CVELAB_STAGE_TIMEOUT")
+    if not raw:
+        return DEFAULT_STAGE_TIMEOUT
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(
+            f"CVELAB_STAGE_TIMEOUT must be a whole number of seconds, got {raw!r}"
+        ) from error
+    if value < 1:
+        raise ValueError("CVELAB_STAGE_TIMEOUT must be at least 1 second")
+    return value
+
+
 def run_docker_stage(
     command: list[str],
     *,
@@ -317,13 +370,28 @@ def run_docker_stage(
     environment: dict[str, str],
     cwd: Path,
 ) -> None:
-    result = subprocess.run(
-        command,
-        cwd=cwd,
-        env=environment,
-        capture_output=True,
-        text=True,
-    )
+    limit = stage_timeout()
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=limit,
+        )
+    except subprocess.TimeoutExpired as expired:
+        # The output so far is the only evidence of where it stalled, and a
+        # repair attempt reads it.
+        tail = "".join(
+            part.decode("utf-8", "replace") if isinstance(part, bytes) else (part or "")
+            for part in (expired.stdout, expired.stderr)
+        )[-8000:]
+        raise RuntimeError(
+            f"Docker stage '{stage}' exceeded {limit}s and was stopped. "
+            f"Raise CVELAB_STAGE_TIMEOUT if this lab is genuinely slow."
+            + (f"\nDocker output:\n{tail.strip()}" if tail.strip() else "")
+        ) from expired
     if result.returncode == 0:
         return
     engine = subprocess.run([docker, "info"], capture_output=True, text=True, env=environment)
@@ -335,6 +403,7 @@ def run_docker_stage(
             env=environment,
             capture_output=True,
             text=True,
+            timeout=limit,
         )
         if result.returncode == 0:
             return
@@ -518,7 +587,7 @@ def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
             raise RuntimeError(f"Compose preflight failed: {detail}")
         with progress.stage("building lab images"):
             run_docker_stage(
-                compose + ["build", *startup_services, "validator"],
+                compose + ["build", *build_limits(), *startup_services, "validator"],
                 stage="build",
                 docker=docker,
                 environment=environment,
