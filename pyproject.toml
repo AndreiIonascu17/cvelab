@@ -56,7 +56,7 @@ Repository = "https://github.com/AndreiIonascu17/cvelab"
 Documentation = "https://github.com/AndreiIonascu17/cvelab/blob/main/GUIDE.md"
 Changelog = "https://github.com/AndreiIonascu17/cvelab/blob/main/CHANGELOG.md"
 Issues = "https://github.com/AndreiIonascu17/cvelab/issues"
-"Security Policy" = "https://github.com/AndreiIonascu17/cvelab/blob/main/SECURITY.md"
+"Security Policy" = "https://cvelab.tech/security/"
 
 [project.scripts]
 cvelab = "cvelab.cli:main"

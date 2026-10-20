@@ -13,8 +13,8 @@ The generator does not treat a reflected marker alone as proof. A successful res
 - [Complete installation and usage guide](GUIDE.md)
 - [Linux bundle and installation](linux/README.md)
 - [Benchmark method](benchmarks/README.md)
-- [Acceptable use](ACCEPTABLE_USE.md)
-- [Security policy](SECURITY.md)
+- [Acceptable use](https://cvelab.tech/acceptable-use/)
+- [Security policy](https://cvelab.tech/security/)
 - [Contributing](CONTRIBUTING.md)
 - [Changelog](CHANGELOG.md)
 - [Roadmap](ROADMAP.md)
@@ -449,8 +449,8 @@ docker info
 
 Generated labs contain intentionally vulnerable software. Treat every lab
 directory as untrusted, and do not run labs on production hosts, on machines
-holding sensitive data, or on shared networks. The full boundaries are in
-[ACCEPTABLE_USE.md](ACCEPTABLE_USE.md).
+holding sensitive data, or on shared networks. The full boundaries are in the
+[acceptable use policy](https://cvelab.tech/acceptable-use/).
 
 To report a vulnerability in CVELab itself, follow [SECURITY.md](SECURITY.md).
 Do not open a public issue.
