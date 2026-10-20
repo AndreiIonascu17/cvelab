@@ -348,6 +348,10 @@ def _anthropic_response(
         endpoint_for("anthropic"),
         body,
         auth_headers_for("anthropic", api_key),
+        # A non-streaming request sends nothing until the answer is done, so
+        # this is the whole generation time. Left at _request_json's 180s,
+        # the provider's 600s (and CVELAB_ANTHROPIC_TIMEOUT) never applied.
+        timeout_seconds=timeout_for("anthropic"),
     )
     usage.record("anthropic", model, payload)
     stop_reason = payload.get("stop_reason")
