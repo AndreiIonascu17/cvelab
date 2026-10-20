@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-20
+
+### Added
+
+- The CLI says what the control plane decided about an upload. A validated
+  run the service refuses (HTTP 422) lists every check it failed; a rate
+  limit (HTTP 429) says which limit and how long to wait; and a filed run
+  says whether it joined the shared database or why it was kept private --
+  filed with `--no-poc`, a PoC already listed, or a full review queue. The
+  failures and the wait are also in `cvelab upload`'s JSON output.
+- Before sending, the upload summary warns when a validated run lacks a file
+  the shared database requires, rather than learning it from a refusal.
+
+### Changed
+
+- Trimming an oversized upload keeps the files the shared database requires
+  first, so a large `analysis.json` can no longer turn a shareable lab into a
+  refused one.
+- The upload summary no longer says shared entries are unattributed. They
+  carry the filing account, and are marked unverified until reviewed.
+
+## [0.6.0] - 2026-10-18
+
+The first release published to PyPI. The entries below were collected under
+Unreleased and shipped in it; the list from the earlier, unpublished 0.6.0
+(2026-09-10) is folded in at the end of Added.
+
 ### Added
 
 - `cvelab.pyz`, a single-file archive built by `scripts/build_pyz.py` and
@@ -22,13 +49,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would be sent without sending it.
 - A run report page at `/app/runs/<id>`, reachable only by the account that
   filed the run.
+- Anthropic and OpenAI-compatible local model providers.
+- Native Linux build and install bundle.
+- Autonomous Linux CVE validation workflow.
+- Vulnerable-only PoC generation when no public fix is identified.
+- Closed-source HTTP reproduction workflow backed by a local artifact catalog.
+- Inspectable manual PoC reproduction kit.
 
 ### Changed
 
-- The exploit, the plan and the raw report stay on the machine that produced
-  them unless `--upload-poc` is passed. Only `REPORT.md` is sent by default:
-  a service that collects working exploits against its customers' own
-  software is a target worth attacking.
+- An upload carries the whole lab, the exploit included, because a shared
+  entry nobody can run is worth little. `--no-poc` withholds the exploit and
+  the plan; `--no-upload` sends nothing. (An earlier draft of this entry
+  described the reverse, an `--upload-poc` flag, which was never released.)
 
 ### Fixed
 
@@ -121,16 +154,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Import ordering and a small number of lint findings were normalized across
   the package. No behavior changed.
 
-## [0.6.0] - 2026-09-10
-
-### Added
-
-- Anthropic and OpenAI-compatible local model providers.
-- Native Linux build and install bundle.
-- Autonomous Linux CVE validation workflow.
-- Vulnerable-only PoC generation when no public fix is identified.
-- Closed-source HTTP reproduction workflow backed by a local artifact catalog.
-- Inspectable manual PoC reproduction kit.
-
-[Unreleased]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/AndreiIonascu17/cvelab/releases/tag/v0.6.0
