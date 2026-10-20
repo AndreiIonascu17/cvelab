@@ -86,6 +86,30 @@ ALWAYS = (
 #: described.
 EXPLOIT = ("PoC.py", "manual.sh", "PoC.ps1", "MANUAL-POC.md", "plan.json")
 
+#: What the control plane requires before a validated run joins the shared
+#: corpus (site/worker/gate.js in cvelab-prod). Kept first when a payload has
+#: to be trimmed, because losing one of these turns a shareable lab into a
+#: refused upload.
+REQUIRED_TO_SHARE = (
+    "EVIDENCE.json",
+    "report.json",
+    "plan.json",
+    "REPORT.md",
+    "WALKTHROUGH.md",
+    "PoC.py",
+    "manual.sh",
+)
+
+#: Why a validated run was kept private, as the control plane says it.
+NOT_SHARED = {
+    "exploit_withheld": "kept private: filed without the exploit (--no-poc)",
+    "duplicate": "kept private: this PoC is already in the database",
+    "review_queue_full": (
+        "kept private: ten of your entries are already waiting for review; "
+        "upload it again once they are reviewed"
+    ),
+}
+
 #: Lab status to the status the control plane stores. A status this does not
 #: know is reported as "failed" rather than guessed at.
 STATUS = {
@@ -98,7 +122,18 @@ STATUS = {
 
 
 class UploadError(RuntimeError):
-    """The control plane refused the run, or could not be reached."""
+    """The control plane refused the run, or could not be reached.
+
+    `failures` lists the checks a refused validated run did not pass (HTTP
+    422), and `retry_after` is the wait, in seconds, a rate limit asked for
+    (HTTP 429). Both are empty otherwise.
+    """
+
+    def __init__(self, message: str, *, failures: list[str] | None = None,
+                 retry_after: int | None = None) -> None:
+        super().__init__(message)
+        self.failures = failures or []
+        self.retry_after = retry_after
 
 
 def endpoint() -> str:
@@ -185,21 +220,23 @@ def collect(
 def fit_payload(documents: list[dict]) -> tuple[list[dict], list[str]]:
     """Trim to what the control plane will accept, least useful first.
 
-    ALWAYS is in priority order, so dropping from the end sheds the
-    analysis before the report and the report before the exploit.
+    What sharing requires is kept first, then the rest in ALWAYS order, so
+    the analysis goes before anything the corpus gate checks. The kept
+    documents stay in their original order.
     """
     total = sum(len(d["text"].encode("utf-8")) for d in documents)
     if total <= MAX_PAYLOAD_BYTES:
         return documents, []
-    kept, dropped, used = [], [], 0
-    for document in documents:
+    priority = sorted(documents, key=lambda d: d["name"] not in REQUIRED_TO_SHARE)
+    kept_names, dropped, used = set(), [], 0
+    for document in priority:
         size = len(document["text"].encode("utf-8"))
         if used + size <= MAX_PAYLOAD_BYTES:
-            kept.append(document)
+            kept_names.add(document["name"])
             used += size
         else:
             dropped.append(document["name"])
-    return kept, dropped
+    return [d for d in documents if d["name"] in kept_names], dropped
 
 
 def describe(payload: dict) -> str:
@@ -223,7 +260,17 @@ def describe(payload: dict) -> str:
     if payload["status"] == "succeeded":
         # Saying this once per run is the difference between a corpus people
         # chose to join and one they were enrolled in.
-        lines.append("  a validated run joins the shared corpus, unattributed")
+        lines.append(
+            "  a validated run joins the shared database under your account, "
+            "marked unverified until it is reviewed"
+        )
+        missing = [name for name in REQUIRED_TO_SHARE if name not in
+                   {d["name"] for d in payload["documents"]}]
+        exploit_sent = any(d["name"] in ("PoC.py", "manual.sh") for d in payload["documents"])
+        if missing and exploit_sent:
+            # Said before sending: the control plane will refuse it, and a
+            # reason up front beats a 422 after the upload.
+            lines.append("  missing what sharing requires, so it will be refused: " + ", ".join(missing))
         exploit = [d["name"] for d in payload["documents"] if d["name"] in EXPLOIT]
         lines.append(
             "  the exploit is included: " + ", ".join(exploit) + " (--no-poc to withhold)"
@@ -249,15 +296,66 @@ def send(payload: dict, token: str, *, timeout: int = 30) -> dict:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", "replace")[:600]
+        raw = error.read().decode("utf-8", "replace")
+        try:
+            answer = json.loads(raw)
+        except ValueError:
+            answer = {}
+        if not isinstance(answer, dict):
+            answer = {}
         if error.code in (401, 403):
             raise UploadError(
                 f"The control plane rejected the token ({error.code}). "
                 f"Create a new one at {endpoint()}/app/ and set {TOKEN_VARIABLE}."
             ) from error
+        if error.code == 422:
+            failures = [str(f) for f in answer.get("failures") or []]
+            raise UploadError(
+                "The control plane refused the run: a validated run must carry the "
+                "artifacts CVELab generates, and these checks failed:\n"
+                + "\n".join(f"  - {failure}" for failure in failures),
+                failures=failures,
+            ) from error
+        if error.code == 429:
+            retry = _retry_after(error.headers.get("Retry-After"), answer.get("retry_after"))
+            wait = f" Try again in {_duration(retry)}." if retry else ""
+            raise UploadError(
+                f"Rate limited: {answer.get('error') or 'too many uploads'}.{wait}",
+                retry_after=retry,
+            ) from error
+        detail = answer.get("error") or raw[:600]
         raise UploadError(f"Upload failed with HTTP {error.code}: {detail}") from error
     except urllib.error.URLError as error:
         raise UploadError(f"Could not reach {endpoint()}: {error.reason}") from error
+
+
+def _retry_after(header: str | None, body: object) -> int | None:
+    for value in (header, body):
+        try:
+            seconds = int(str(value))
+        except (TypeError, ValueError):
+            continue
+        if seconds > 0:
+            return seconds
+    return None
+
+
+def _duration(seconds: int) -> str:
+    if seconds < 120:
+        return f"{seconds} seconds"
+    if seconds < 7200:
+        return f"{round(seconds / 60)} minutes"
+    return f"{round(seconds / 3600)} hours"
+
+
+def sharing(answer: dict) -> str | None:
+    """One line on whether a filed run joined the shared database, or why not."""
+    if answer.get("shared") is True:
+        return "shared: listed in the database as unverified until it is reviewed"
+    reason = answer.get("not_shared")
+    if reason:
+        return NOT_SHARED.get(reason, f"kept private: {reason}")
+    return None
 
 
 def upload_result(
@@ -290,4 +388,7 @@ def upload_result(
         return {"ok": False, "error": str(error)}
     if answer.get("url"):
         progress.step(f"stored at {answer['url']}")
+    note = sharing(answer)
+    if note:
+        progress.step(note)
     return answer
