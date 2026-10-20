@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-10-20
+
+### Fixed
+
+- Claude models could not generate a lab. They think by default, the
+  thinking is billed against `max_tokens`, and Claude Haiku 5.5 ran out of
+  budget with the lab's JSON half written (`stop_reason: max_tokens`), on
+  every CVE. The Anthropic output budget is now four times larger, as
+  DeepSeek's already was; the largest request is 64,000 tokens, under every
+  current model's 128K limit. With it, Claude Haiku 5.5 reproduced 9 of 10
+  benchmark entries for $0.31 in total.
+- Anthropic requests ignored their timeout and waited at most 180 seconds
+  for a non-streaming answer. They now use the provider's 600 seconds, or
+  `CVELAB_ANTHROPIC_TIMEOUT`.
+
+### Changed
+
+- The acceptable use and security policies are maintained on cvelab.tech
+  (`/acceptable-use/`, `/security/`). `ACCEPTABLE_USE.md` keeps the required
+  conditions and `SECURITY.md` keeps how to report; both name the pages as
+  authoritative. The package's "Security Policy" URL points there too.
+
 ## [0.6.1] - 2026-10-20
 
 ### Added
@@ -154,6 +176,7 @@ Unreleased and shipped in it; the list from the earlier, unpublished 0.6.0
 - Import ordering and a small number of lint findings were normalized across
   the package. No behavior changed.
 
-[Unreleased]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/AndreiIonascu17/cvelab/releases/tag/v0.6.0
