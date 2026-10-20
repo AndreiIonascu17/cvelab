@@ -14,7 +14,7 @@
 
 """A local run may send its report to a control plane; it must send nothing else.
 
-The point of the BYOK tier is that the provider key stays on the machine that
+The point of the BYOC (bring your own credits) tier is that the provider key stays on the machine that
 ran the lab. These tests fail if uploading ever starts carrying more than the
 run produced, or if it happens without being asked for.
 """
