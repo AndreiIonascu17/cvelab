@@ -134,7 +134,7 @@ class CollectTests(unittest.TestCase):
         # Enrolling people in a corpus without saying so is the one thing
         # this feature must not do.
         payload = self.collect(make_lab(self.root))
-        self.assertIn("shared corpus", upload.describe(payload))
+        self.assertIn("shared database", upload.describe(payload))
 
     def test_a_failed_run_does_not_claim_to_be_shared(self) -> None:
         payload = upload.collect(
@@ -142,7 +142,7 @@ class CollectTests(unittest.TestCase):
             {"ok": False, "cve": "CVE-2024-12345", "status": "AUTO_REPAIR_EXHAUSTED"},
             provider=None, model=None, include_poc=True,
         )
-        self.assertNotIn("shared corpus", upload.describe(payload))
+        self.assertNotIn("shared database", upload.describe(payload))
 
 
 class PayloadBudgetTests(unittest.TestCase):
@@ -258,3 +258,85 @@ class PreflightTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def http_error(code: int, body: object, headers: dict | None = None):
+    import email.message
+    import io
+    import urllib.error
+
+    message = email.message.Message()
+    for key, value in (headers or {}).items():
+        message[key] = value
+    raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+    return urllib.error.HTTPError(
+        "https://cvelab.tech/api/runs", code, "error", message, io.BytesIO(raw)
+    )
+
+
+class ControlPlaneAnswerTests(unittest.TestCase):
+    """What the CLI says when the control plane refuses, limits or keeps a run."""
+
+    def send_with(self, error) -> upload.UploadError:
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(upload.UploadError) as caught:
+                upload.send({"cve": "CVE-2024-12345"}, "cvelab_token")
+        return caught.exception
+
+    def test_a_refused_run_names_every_failed_check(self) -> None:
+        failures = ["EVIDENCE.json is missing", "the attack was not executed"]
+        error = self.send_with(http_error(422, {"error": "x", "failures": failures}))
+        self.assertEqual(error.failures, failures)
+        for failure in failures:
+            self.assertIn(failure, str(error))
+
+    def test_a_rate_limit_says_how_long_to_wait(self) -> None:
+        error = self.send_with(
+            http_error(429, {"error": "At most 20 runs an hour per account.",
+                             "retry_after": 600}, {"Retry-After": "600"})
+        )
+        self.assertEqual(error.retry_after, 600)
+        self.assertIn("20 runs an hour", str(error))
+        self.assertIn("10 minutes", str(error))
+
+    def test_a_non_json_error_still_reports_its_status(self) -> None:
+        error = self.send_with(http_error(502, b"<html>bad gateway</html>"))
+        self.assertIn("502", str(error))
+
+    def test_a_shared_run_says_so(self) -> None:
+        self.assertIn("unverified", upload.sharing({"ok": True, "shared": True}))
+
+    def test_every_reason_for_keeping_a_run_private_is_explained(self) -> None:
+        for reason in ("exploit_withheld", "duplicate", "review_queue_full"):
+            note = upload.sharing({"ok": True, "shared": False, "not_shared": reason})
+            self.assertTrue(note.startswith("kept private: "))
+            self.assertNotIn(reason, note)
+
+    def test_an_unknown_reason_is_shown_rather_than_dropped(self) -> None:
+        note = upload.sharing({"shared": False, "not_shared": "something_new"})
+        self.assertIn("something_new", note)
+
+    def test_a_run_that_was_never_a_candidate_says_nothing(self) -> None:
+        self.assertIsNone(upload.sharing({"ok": True, "shared": False}))
+
+
+class SharingRequirementTests(unittest.TestCase):
+    def test_what_sharing_requires_survives_trimming(self) -> None:
+        big = "x" * (upload.MAX_PAYLOAD_BYTES // 2)
+        documents = [{"name": "analysis.json", "text": big, "truncated": False},
+                     {"name": "PoC.ps1", "text": big, "truncated": False}]
+        documents += [{"name": name, "text": "y" * 1000, "truncated": False}
+                      for name in upload.REQUIRED_TO_SHARE]
+        kept, dropped = upload.fit_payload(documents)
+        names = [d["name"] for d in kept]
+        for name in upload.REQUIRED_TO_SHARE:
+            self.assertIn(name, names)
+        self.assertTrue(dropped)
+        self.assertEqual(names, [d["name"] for d in documents if d["name"] in names])
+
+    def test_a_validated_run_missing_evidence_is_warned_before_sending(self) -> None:
+        payload = {
+            "cve": "CVE-2024-12345", "status": "succeeded", "outcome": "VALIDATED",
+            "documents": [{"name": "PoC.py", "text": "print(1)", "truncated": False}],
+        }
+        self.assertIn("will be refused", upload.describe(payload))

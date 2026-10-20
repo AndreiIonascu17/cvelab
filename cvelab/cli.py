@@ -255,8 +255,16 @@ def upload_command(
     try:
         answer = upload.send(payload, token)
     except upload.UploadError as error:
-        print(json.dumps({"ok": False, "error": str(error)}, indent=2), file=sys.stderr)
+        refusal = {"ok": False, "error": str(error)}
+        if error.failures:
+            refusal["failures"] = error.failures
+        if error.retry_after:
+            refusal["retry_after"] = error.retry_after
+        print(json.dumps(refusal, indent=2), file=sys.stderr)
         return 1
+    note = upload.sharing(answer)
+    if note:
+        progress.step(note)
     print(json.dumps(answer, indent=2))
     return 0
 
