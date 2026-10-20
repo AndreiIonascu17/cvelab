@@ -113,6 +113,13 @@ PROVIDERS: dict[str, Provider] = {
         auth_format="{key}",
         extra_headers={"anthropic-version": "2023-06-01"},
         web_search=True,
+        # Current Claude models think by default, and the thinking is billed
+        # against max_tokens like everything else. Measured on Claude Haiku
+        # 5.5 at effort low: a 14,000-token generation budget ran out with the
+        # JSON half written (stop_reason max_tokens), the same failure the
+        # DeepSeek scale below was added for. Four times keeps the largest
+        # request at 64,000 tokens, under every current model's 128K cap.
+        output_budget_scale=4.0,
         models=(
             "claude-opus-5-5",
             "claude-sonnet-5-5",
