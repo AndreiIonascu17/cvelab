@@ -36,6 +36,7 @@ import os
 import urllib.error
 import urllib.request
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 
 from . import __version__, progress, usage
@@ -164,9 +165,68 @@ def read_document(path: Path) -> dict | None:
     encoded = text.encode("utf-8")
     truncated = len(encoded) > MAX_DOCUMENT_BYTES
     if truncated:
-        # Cut on a character boundary, not a byte one.
-        text = encoded[:MAX_DOCUMENT_BYTES].decode("utf-8", "ignore")
+        # A JSON document cut at the end no longer parses, so it is shortened
+        # from the inside instead. Anything else, or JSON that will not fit
+        # that way, is cut on a character boundary, not a byte one.
+        trimmed = fit_json(text, MAX_DOCUMENT_BYTES) if path.suffix == ".json" else None
+        text = trimmed or encoded[:MAX_DOCUMENT_BYTES].decode("utf-8", "ignore")
     return {"name": path.name, "text": text, "truncated": truncated}
+
+
+#: fit_json() never cuts a string below this, so the short fields a reader or
+#: the share gate looks at (cve, status, lab_type, proof checks) stay whole.
+MIN_STRING_CAP = 1024
+
+
+def fit_json(text: str, limit: int) -> str | None:
+    """A JSON document shortened inside its strings, so that it still parses.
+
+    Every string longer than one cap keeps its head and says how much it
+    lost, and the cap is the highest that brings the document under `limit`.
+    In practice one field is enormous, the validator's raw output, and that
+    is the one that gives way. None when the text is not JSON, or when even
+    MIN_STRING_CAP leaves it too large.
+    """
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+    longest = max(_string_lengths(value), default=0)
+    best, low, high = None, MIN_STRING_CAP, longest
+    while low <= high:
+        cap = (low + high) // 2
+        candidate = json.dumps(_cap_strings(value, cap), indent=2)
+        if len(candidate.encode("utf-8")) <= limit:
+            best, low = candidate, cap + 1
+        else:
+            high = cap - 1
+    return best
+
+
+def _string_lengths(value: object) -> Iterator[int]:
+    if isinstance(value, str):
+        yield len(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _string_lengths(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _string_lengths(item)
+
+
+def _cap_strings(value: object, cap: int) -> object:
+    if isinstance(value, str):
+        if len(value) <= cap:
+            return value
+        lost = len(value[cap:].encode("utf-8"))
+        shortened = f"{value[:cap]}... [{lost:,} bytes trimmed]"
+        # Just over the cap, the note would be longer than what it replaces.
+        return shortened if len(shortened) < len(value) else value
+    if isinstance(value, dict):
+        return {key: _cap_strings(item, cap) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_cap_strings(item, cap) for item in value]
+    return value
 
 
 def _plan(lab_dir: Path) -> dict:

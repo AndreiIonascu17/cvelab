@@ -110,6 +110,46 @@ class CollectTests(unittest.TestCase):
             len(document["text"].encode("utf-8")), upload.MAX_DOCUMENT_BYTES
         )
 
+    def test_an_oversized_json_document_still_parses(self) -> None:
+        # A run on CVE-2026-109618 wrote a 395 KB validator transcript into
+        # EVIDENCE.json; a byte cut left JSON that nothing could read.
+        raw = "HTTP/1.1 200 OK\n" + "x" * (3 * upload.MAX_DOCUMENT_BYTES)
+        evidence = {
+            "cve": "CVE-2024-12345",
+            "status": "REAL_SOURCE_POC_VALIDATED",
+            "validation": {"vulnerable": {"raw": raw}, "patched": {"raw": "403"}},
+            "automation": {"attempts": [{"error": "e" * 16000}]},
+        }
+        lab = make_lab(self.root)
+        (lab / "artifacts" / "EVIDENCE.json").write_text(json.dumps(evidence, indent=2))
+        document = upload.read_document(lab / "artifacts" / "EVIDENCE.json")
+
+        self.assertTrue(document["truncated"])
+        self.assertLessEqual(
+            len(document["text"].encode("utf-8")), upload.MAX_DOCUMENT_BYTES
+        )
+        kept = json.loads(document["text"])
+        self.assertEqual(kept["cve"], evidence["cve"])
+        self.assertEqual(kept["status"], evidence["status"])
+        self.assertEqual(kept["validation"]["patched"], {"raw": "403"})
+        self.assertEqual(kept["automation"], evidence["automation"])
+        trimmed = kept["validation"]["vulnerable"]["raw"]
+        self.assertTrue(trimmed.startswith("HTTP/1.1 200 OK\n"))
+        self.assertTrue(trimmed.endswith("bytes trimmed]"))
+
+    def test_json_that_cannot_be_shortened_inside_is_still_cut(self) -> None:
+        # Many short strings: no single field can give way.
+        crowd = json.dumps(["y" * 100] * 2000)
+        self.assertIsNone(upload.fit_json(crowd, upload.MAX_DOCUMENT_BYTES))
+        self.assertIsNone(upload.fit_json("{not json", upload.MAX_DOCUMENT_BYTES))
+        lab = make_lab(self.root)
+        (lab / "artifacts" / "report.json").write_text(crowd)
+        document = upload.read_document(lab / "artifacts" / "report.json")
+        self.assertTrue(document["truncated"])
+        self.assertLessEqual(
+            len(document["text"].encode("utf-8")), upload.MAX_DOCUMENT_BYTES
+        )
+
     def test_an_unknown_outcome_is_not_called_a_success(self) -> None:
         payload = upload.collect(
             make_lab(self.root),
