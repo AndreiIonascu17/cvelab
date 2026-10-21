@@ -292,3 +292,119 @@ class ConfirmedSemanticsTests(unittest.TestCase):
             with self.subTest(prompt=number):
                 head = block[:2000]
                 self.assertIn(self.SENTENCE, head)
+
+
+class AdapterFilesTests(unittest.TestCase):
+    """adapter_files are written last, so they must not replace a canonical file.
+
+    One named docker-compose.yml or validator/Dockerfile overwrote the copy
+    the canonicalisers had just pinned, and every later check with it.
+    """
+
+    def test_a_canonical_name_is_refused(self) -> None:
+        from cvelab.sourcegen import _adapter_files
+
+        for path in ("docker-compose.yml", "./docker-compose.yml", "validator/Dockerfile",
+                     "Validator/Dockerfile", "validator\\validator.py", ".dockerignore",
+                     "vulnerable/Dockerfile", "patched/Dockerfile"):
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(RuntimeError, "field of its own"):
+                    _adapter_files([{"path": path, "content": "x"}])
+
+    def test_the_adapter_tree_and_validator_requirements_are_fine(self) -> None:
+        from cvelab.sourcegen import _adapter_files
+
+        files = [{"path": "adapter/server.js", "content": "x"},
+                 {"path": "validator/requirements.txt", "content": "requests\n"}]
+        self.assertEqual(_adapter_files(files), files)
+
+    def test_every_generation_path_uses_it(self) -> None:
+        source = (Path(__file__).resolve().parent.parent / "cvelab" / "sourcegen.py").read_text(encoding="utf-8")
+        self.assertEqual(source.count('_adapter_files(generation["adapter_files"])'), 3)
+        self.assertNotIn('*generation["adapter_files"]', source.replace('*_adapter_files(generation["adapter_files"])', ""))
+        # And the written lab is checked against what Docker would run.
+        self.assertEqual(source.count("_enforce_compose_policy(lab_dir)"), 3)
+
+
+class ComposePolicyAtGenerationTests(unittest.TestCase):
+    def test_it_is_skipped_without_docker(self) -> None:
+        from unittest import mock
+
+        from cvelab import sourcegen
+
+        with mock.patch.object(sourcegen, "docker_executable", side_effect=RuntimeError("Docker CLI was not found")), \
+                mock.patch.object(sourcegen.policy, "enforce") as enforce:
+            sourcegen._enforce_compose_policy(Path("/labs/CVE-2026-0001"))
+        enforce.assert_not_called()
+
+    def test_it_uses_the_command_and_environment_a_run_uses(self) -> None:
+        from unittest import mock
+
+        from cvelab import sourcegen
+
+        with mock.patch.object(sourcegen, "docker_executable", return_value="/usr/bin/docker"), \
+                mock.patch.object(sourcegen.policy, "enforce") as enforce:
+            sourcegen._enforce_compose_policy(Path("/labs/CVE-2026-0001"))
+        compose, lab, environment = enforce.call_args.args
+        self.assertEqual(compose[:4], ["/usr/bin/docker", "compose", "-p", "cve-2026-0001"])
+        self.assertEqual(environment["COMPOSE_DISABLE_ENV_FILE"], "1")
+
+
+class GitRevisionTests(unittest.TestCase):
+    """A revision from a model, plan.json or the command line reaches git.
+
+    `--output=/path` as a revision is an option to `git diff`, which writes
+    the file. A model answering from web search is not a trusted source.
+    """
+
+    def test_commits_tags_and_branches_are_accepted(self) -> None:
+        from cvelab.sourcegen import _safe_revision
+
+        for value in ("a" * 40, "deadbee", "v1.2.3", "release/1.0", "refs/tags/v2.0.0-rc1",
+                      "1.2.3+build", f"{'a' * 40}^", "abc1234~2"):
+            with self.subTest(value=value):
+                self.assertEqual(_safe_revision(value, "revision"), value)
+
+    def test_options_and_odd_syntax_are_refused(self) -> None:
+        from cvelab.sourcegen import _safe_revision
+
+        for value in ("--output=/tmp/x", "-n", "a..b", "HEAD@{1}", "main:path", "x y",
+                      "refs//x", "x.lock", "x/", "", None, "../x", "a\nb"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "not a commit id"):
+                    _safe_revision(value, "revision")
+
+    def test_every_git_call_ends_its_options(self) -> None:
+        source = (Path(__file__).resolve().parent.parent / "cvelab" / "sourcegen.py").read_text(encoding="utf-8")
+        for call in ('"archive", "--format=tar", "--end-of-options"',
+                     '"diff", "--no-ext-diff", "--unified=80", "--end-of-options"',
+                     '"diff", "--name-only", "--end-of-options"',
+                     '"ls-tree", "-r", "--name-only", "--end-of-options"',
+                     '"show", "--end-of-options"',
+                     '"--no-checkout", "--end-of-options"'):
+            with self.subTest(call=call):
+                self.assertIn(call, source)
+        self.assertEqual(source.count('"fetch", "--force", "--end-of-options", "origin"'), 2)
+        self.assertEqual(source.count('"rev-parse", "--verify", "--end-of-options"'), 2)
+
+    def test_a_discovered_revision_is_validated(self) -> None:
+        from unittest import mock
+
+        from cvelab import sourcegen
+
+        discovery = {
+            "status": "SOURCE_READY", "artifact_type": "library",
+            "repository_url": "https://github.com/example/widget", "fixed_ref": "--output=/tmp/pwned",
+            "vulnerable_ref": None, "vendor_artifact": None, "rationale": "", "evidence_urls": [],
+        }
+        with mock.patch.object(sourcegen, "collect_cve", return_value={"cve": "CVE-2026-0001", "references": []}), \
+                mock.patch.object(sourcegen, "resolve_source_via_osv", return_value=None), \
+                mock.patch.object(sourcegen, "ai_is_configured", return_value=True), \
+                mock.patch.object(sourcegen, "provider_supports_web_search", return_value=True), \
+                mock.patch.object(sourcegen, "discover_source_with_ai", return_value=discovery), \
+                mock.patch.object(sourcegen, "_run_git") as git:
+            with self.assertRaisesRegex(ValueError, "source discovery returned"):
+                sourcegen.generate_source_lab(
+                    "CVE-2026-0001", Path("/nonexistent"), None, None, None, "k", "m", "openai"
+                )
+        git.assert_not_called()

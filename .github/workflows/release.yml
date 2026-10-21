@@ -15,41 +15,62 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
       - id: version
         run: |
           set -Eeuo pipefail
           project="$(python -c 'import tomllib,pathlib;print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          # A release is a tag, and only a tag. A dispatch on a branch used to
+          # skip this comparison and go on to publish whatever the branch
+          # held; dispatching on the tag itself still works for a re-run.
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+            echo "Releases run from a v* tag, not from $GITHUB_REF_TYPE $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
           tag="${GITHUB_REF_NAME#v}"
-          if [[ "$GITHUB_REF_TYPE" == "tag" && "$project" != "$tag" ]]; then
+          if [[ "$project" != "$tag" ]]; then
             echo "Tag v$tag does not match pyproject version $project" >&2
             exit 1
           fi
           echo "version=$project" >> "$GITHUB_OUTPUT"
 
-  build:
-    name: Build artifacts
+  test:
+    name: Test the tagged commit
     needs: verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
-      - run: python -m pip install --upgrade pip build twine
+      - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[dev]"
       - name: Run the test suite
         run: pytest
+
+  build:
+    name: Build artifacts
+    # The dev tools are unpinned and run arbitrary code at install time, so
+    # they stay out of the job whose output is published and attested. This
+    # job installs only what building needs.
+    needs: [verify, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --upgrade pip build twine
       - name: Build sdist and wheel
         run: python -m build
       - name: Check metadata
         run: twine check --strict dist/*
       - name: Build the Linux bundle
         run: bash scripts/build-linux.sh "$PWD/dist-linux"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-artifacts
           path: |
@@ -66,7 +87,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-artifacts
           path: artifacts
@@ -74,27 +95,32 @@ jobs:
         run: |
           mkdir -p dist
           cp artifacts/dist/* dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
 
   github-release:
     name: Publish the GitHub release
     needs: [verify, build]
     runs-on: ubuntu-latest
+    # Behind a reviewer like PyPI. Without it, anyone who could push a v* tag
+    # published a release carrying this repository's build provenance.
+    environment:
+      name: release
+      url: https://github.com/${{ github.repository }}/releases
     permissions:
       contents: write
       id-token: write
       attestations: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-artifacts
           path: artifacts
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: "artifacts/dist/*, artifacts/dist-linux/*.tar.gz"
       - name: Publish
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           name: CVELab ${{ needs.verify.outputs.version }}
           generate_release_notes: true

@@ -34,9 +34,10 @@ Native Linux is the recommended platform. Windows remains supported through Dock
 - Linux or Windows 10/11.
 - Python 3.11 or newer.
 - Docker Engine on Linux or Docker Desktop on Windows.
-- Git available in `PATH`.
+- Git 2.30 or newer available in `PATH`.
 - Bash, Make, and curl for E2E profiles that use Shipyard/Kind.
 - WSL with a Kali distribution is required for Shipyard only on Windows.
+  Shipyard runs the lab's script on the host, so it needs `CVELAB_ALLOW_HOST_RUNNER=1`.
 - An OpenAI or Anthropic API key, or a local OpenAI-compatible model server, for automatic adapter generation.
 - Legal access to the product and any required license for closed-source software.
 
@@ -174,7 +175,16 @@ export CVELAB_OPENAI_BASE_URL=https://gateway.internal/v1
 export CVELAB_DEEPSEEK_TIMEOUT=120
 export CVELAB_LOCAL_API_KEY=YOUR_KEY # optional local authentication
 export CVELAB_LOCAL_TIMEOUT=1800      # optional local request timeout
+
+# Limits for a running lab service that sets none of its own; empty removes one:
+export CVELAB_RUNTIME_MEMORY=2g
+export CVELAB_RUNTIME_CPUS=2
+export CVELAB_RUNTIME_PIDS=1024
 ```
+
+A key is never sent over plain `http://` to another machine: use `https://`, or
+`http://` on loopback. `http://` to a LAN host works when no key is set. `--key VALUE`
+prints a warning, because the value shows in the process list; `--key` alone prompts.
 
 With `--provider auto`, `CVELAB_BASE_URL` selects local, an Anthropic key without an
 OpenAI key selects Anthropic, and OpenAI is the fallback. Local endpoints do not provide
@@ -443,6 +453,13 @@ docker info
 
 - Labs are intended for authorized research.
 - Generated services are restricted to loopback and the internal Docker network.
+- Before any build, `run` checks the resolved Compose model against an allowlist:
+  internal networks only, no host ports, mounts, devices, capabilities, privileged
+  mode, host namespaces, `env_file`, secrets, `include` or `extends`, and builds only
+  from inside the lab. Docker gets a minimal environment without your keys or tokens.
+- A `plan.json` runner that executes a lab script on the host needs
+  `CVELAB_ALLOW_HOST_RUNNER=1`.
+- SIGTERM, SIGHUP and Ctrl+C stop the lab's containers before CVELab exits.
 - Payloads must be nondestructive.
 - Do not scan or attack external targets.
 - Any test on a system you do not own requires explicit authorization.

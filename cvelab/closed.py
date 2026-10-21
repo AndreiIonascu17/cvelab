@@ -25,6 +25,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .core import runtime_flags
+
 _CVE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 _MAX_BODY = 64 * 1024
 _MAX_RESPONSE = 1024 * 1024
@@ -96,6 +98,7 @@ def _container_request(
     output = _docker(
         "run", "--rm", "--network", network_name,
         "--security-opt", "no-new-privileges:true",
+        *runtime_flags(),
         "-e", f"CVELAB_BASE={base_url}",
         "-e", f"CVELAB_REQUEST={json.dumps(spec, separators=(',', ':'))}",
         "python:3.13-alpine", "python", "-c", _PROBE_CODE,
@@ -198,6 +201,9 @@ def _run_variant(
             "--label", f"io.cvelab.cve={cve}",
             "--label", f"io.cvelab.run={token}",
             "--security-opt", "no-new-privileges:true",
+            # The image is the user's or a model's pick, and ran with no
+            # ceiling at all; these are the ones a Compose lab gets.
+            *runtime_flags(),
             "--network", network_name, image,
         )
         base_url = f"http://{name}:{port}"

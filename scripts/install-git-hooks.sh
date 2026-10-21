@@ -19,8 +19,10 @@
 
 set -Eeuo pipefail
 
-ROOT="$(git rev-parse --show-toplevel)"
-HOOK="$ROOT/.git/hooks/pre-commit"
+# --git-path, not .git/hooks: in a worktree .git is a file, and the hooks
+# live in the common directory or wherever core.hooksPath points.
+HOOK="$(git rev-parse --path-format=absolute --git-path hooks/pre-commit)"
+mkdir -p "$(dirname "$HOOK")"
 
 if [[ -e "$HOOK" && ! -L "$HOOK" ]] && ! grep -q 'cvelab secret scan' "$HOOK"; then
   printf 'A pre-commit hook already exists and was not written by CVELab:\n  %s\n' "$HOOK" >&2
@@ -42,17 +44,29 @@ PATTERNS=(
   'AKIA[0-9A-Z]{16}'
   'gh[pousr]_[A-Za-z0-9]{36,}'
   'AIza[0-9A-Za-z_-]{35}'
+  'github_pat_[A-Za-z0-9_]{60,}'
+  '[sr]k_(live|test)_[A-Za-z0-9]{20,}'
+  'whsec_[A-Za-z0-9]{24,}'
+  'cf[a-z]t_[A-Za-z0-9_]{40,}'
+  'GOCSPX-[A-Za-z0-9_-]{24,}'
+  'xox[abprs]-[A-Za-z0-9-]{20,}'
+  # The control plane's KEK has no prefix, only a shape: 32 bytes of base64
+  # assigned to its name. A bare base64 string cannot be told from a hash.
+  'KEY_ENCRYPTION_KEY["'"'"' ]*[:=]["'"'"' ]*[A-Za-z0-9+/]{43}='
   '-----BEGIN [A-Z ]*PRIVATE KEY-----'
 )
 
-staged="$(git diff --cached --name-only --diff-filter=ACM)"
+# R as well: a renamed file can carry new content under its new name.
+staged="$(git diff --cached --name-only --diff-filter=ACMR)"
 [[ -z "$staged" ]] && exit 0
 
 found=0
 while IFS= read -r file; do
   [[ -f "$file" ]] || continue
   # Only the added lines, so pre-existing content is not re-reported.
-  added="$(git diff --cached -U0 -- "$file" | grep '^+' | grep -v '^+++' || true)"
+  # --text, or a binary file is reported as "Binary files differ" and its
+  # content is never looked at.
+  added="$(git diff --cached --text -U0 -- "$file" | grep -a '^+' | grep -av '^+++' || true)"
   # Test fixtures and documentation need values shaped like credentials.
   # An explicit marker is auditable; a looser pattern would not be.
   added="$(printf '%s' "$added" | grep -v 'pragma: allowlist secret' || true)"

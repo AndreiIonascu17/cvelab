@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -101,6 +102,60 @@ class SecretRedactionTests(unittest.TestCase):
                 with mock.patch.dict("os.environ", {variable: SENTINEL}, clear=False):
                     register_environment_secrets()
                 self.assertNotIn(SENTINEL, redact(f"leaked {SENTINEL}"))
+
+    def test_other_credentials_and_the_upload_token_are_registered(self) -> None:
+        # The upload token goes to the control plane in a header; quoted in a
+        # report, it would go to anyone who can open the entry.
+        from cvelab import upload
+        from cvelab.core import CREDENTIAL_VARIABLES
+
+        for variable in CREDENTIAL_VARIABLES:
+            with self.subTest(variable=variable):
+                core._SECRETS.clear()
+                with mock.patch.dict("os.environ", {variable: SENTINEL}, clear=False):
+                    register_environment_secrets()
+                self.assertNotIn(SENTINEL, redact(f"leaked {SENTINEL}"))
+        with tempfile.TemporaryDirectory() as temporary:
+            token_file = Path(temporary) / "token"
+            token_file.write_text("cvelab_0123456789abcdef\n", encoding="utf-8")
+            core._SECRETS.clear()
+            with mock.patch.dict("os.environ", {upload.TOKEN_VARIABLE: ""}), \
+                    mock.patch.object(upload, "TOKEN_FILE", token_file):
+                register_environment_secrets()
+        self.assertEqual(redact("token cvelab_0123456789abcdef"), "token [REDACTED]")
+
+    def test_the_repair_prompt_is_redacted(self) -> None:
+        # Validator and Docker output can quote whatever reached a container,
+        # and the repair loop sends it to the provider.
+        from cvelab import sourcegen
+
+        register_secret(SENTINEL)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lab = root / "CVE-2026-0001"
+            lab.mkdir()
+            (lab / "plan.json").write_text(json.dumps({
+                "repository": "https://github.com/example/widget.git",
+                "revisions": {"vulnerable": "a" * 40, "patched": "b" * 40},
+            }))
+            (lab / "dossier.json").write_text("{}")
+            key = hashlib.sha256(b"https://github.com/example/widget.git").hexdigest()[:16]
+            (root / ".source-cache" / key).mkdir(parents=True)
+            sent = {}
+
+            def capture(**kwargs):
+                sent.update(kwargs)
+                raise RuntimeError("stop after the request is built")
+
+            failure = {"kind": "runtime_error", "error": f"validator printed {SENTINEL}"}
+            with mock.patch.object(sourcegen, "_source_context", return_value="context"), \
+                    mock.patch.object(sourcegen, "structured_response", side_effect=capture):
+                with self.assertRaisesRegex(RuntimeError, "stop after"):
+                    sourcegen.repair_source_lab(
+                        "CVE-2026-0001", root, failure, 1, "key", "model", "openai", None
+                    )
+        self.assertNotIn(SENTINEL, sent["input_text"])
+        self.assertIn("[REDACTED]", sent["input_text"])
 
     def test_short_values_are_not_registered(self) -> None:
         # Redacting a short string would mangle ordinary text instead of

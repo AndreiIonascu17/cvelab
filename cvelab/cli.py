@@ -17,8 +17,10 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import signal
 import sys
 from pathlib import Path
+from typing import Any
 
 from . import __version__, progress, upload, usage
 from .ai import resolve_provider
@@ -269,17 +271,83 @@ def upload_command(
     return 0
 
 
+class Terminated(BaseException):
+    """A termination signal, raised where the program happens to be.
+
+    Only a `finally` stopped a lab, and SIGTERM or SIGHUP -- a closed
+    terminal, systemd stopping a unit, a parent's timeout -- ended the
+    process without running it, leaving the containers up. Raising turns
+    the signal into an unwinding the teardown sees. It derives from
+    BaseException, as KeyboardInterrupt does, so the `except Exception`
+    blocks that record a failed attempt and retry do not mistake it for one.
+    """
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+#: SIGBREAK is what Windows sends on Ctrl+Break and when the console closes.
+TERMINATION_SIGNALS = tuple(
+    name for name in ("SIGTERM", "SIGHUP", "SIGBREAK") if hasattr(signal, name)
+)
+
+
+def _terminate(signum: int, _frame: object) -> None:
+    # Once: a second signal must not abort the teardown the first started.
+    # SIGKILL still ends it.
+    for name in TERMINATION_SIGNALS:
+        signal.signal(getattr(signal, name), signal.SIG_IGN)
+    raise Terminated(signum)
+
+
+def _install_signal_handlers() -> dict[int, Any]:
+    previous: dict[int, Any] = {}
+    for name in TERMINATION_SIGNALS:
+        number = getattr(signal, name)
+        # A signal ignored on the way in stays ignored: under nohup, a
+        # hangup is supposed to leave the run alone.
+        if signal.getsignal(number) == signal.SIG_IGN:
+            continue
+        try:
+            previous[number] = signal.signal(number, _terminate)
+        except ValueError:
+            # Not the main thread: an embedding program owns the signals.
+            break
+    return previous
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.quiet:
         progress.silence()
     register_environment_secrets()
+    previous_handlers = _install_signal_handlers()
+    try:
+        return _run_command(args)
+    except Terminated as stopped:
+        print(f"Terminated by signal {stopped.signum}.", file=sys.stderr)
+        return 128 + stopped.signum
+    finally:
+        for number, handler in previous_handlers.items():
+            signal.signal(number, handler)
+
+
+def _run_command(args: argparse.Namespace) -> int:
     try:
         api_key = getattr(args, "key", None)
         if api_key == "__PROMPT__":
             selected_provider = resolve_provider(getattr(args, "provider", None))
             provider_label = get_provider(selected_provider).label
             api_key = getpass.getpass(f"{provider_label} API key: ")
+        elif api_key:
+            # Printed even under --quiet: it is about the key, not progress.
+            variable = get_provider(resolve_provider(getattr(args, "provider", None))).key_variable
+            print(
+                "warning: --key VALUE is visible to other users in the process list; "
+                f"set {variable} or pass --key alone to be prompted",
+                file=sys.stderr,
+            )
         register_secret(api_key)
         model = getattr(args, "model", None)
         provider = getattr(args, "provider", None)

@@ -28,14 +28,23 @@ import uuid
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
-from . import progress
+from . import policy, progress
 from .ai import (
     ai_is_configured,
     provider_supports_web_search,
     resolve_provider,
     structured_response,
 )
-from .core import CVE_PATTERN, collect_cve, normalize_cve, write_text
+from .core import (
+    CVE_PATTERN,
+    collect_cve,
+    compose_command,
+    docker_environment,
+    docker_executable,
+    normalize_cve,
+    redact,
+    write_text,
+)
 
 SOURCE_SCHEMA = {
     "type": "object",
@@ -250,6 +259,22 @@ OSV_VULN_URL = "https://api.osv.dev/v1/vulns/{cve}"
 OSV_TIMEOUT_SECONDS = 20
 # A hexadecimal commit id, not a tag or a branch: the lab must be reproducible.
 COMMIT_ID = re.compile(r"[0-9a-f]{7,40}")
+# A revision that arrives from outside -- the command line, plan.json, or a
+# model's answer from web search -- before it reaches git: a commit id or a
+# plain tag or branch name, optionally followed by ^ or ~N. It cannot start
+# with "-", so git cannot read it as an option such as --output=<file>; every
+# git call that takes one passes --end-of-options as well, which needs Git
+# 2.30 or newer.
+GIT_REVISION = re.compile(r"([A-Za-z0-9_][A-Za-z0-9._/+-]{0,199})((?:[~^][0-9]{0,3})*)")
+
+
+def _safe_revision(value: object, label: str) -> str:
+    text = str(value or "").strip()
+    match = GIT_REVISION.fullmatch(text)
+    name = match.group(1) if match else ""
+    if not match or ".." in name or "//" in name or name.endswith((".", "/", ".lock")):
+        raise ValueError(f"The {label} is not a commit id or a plain tag or branch name: {text!r}")
+    return text
 
 
 def resolve_source_via_osv(cve: str, timeout: int = OSV_TIMEOUT_SECONDS) -> tuple[str, str] | None:
@@ -354,7 +379,7 @@ def discover_source_with_ai(
 
 
 def _snapshot(repository: Path, revision: str, destination: Path) -> None:
-    archive = _run_git(["archive", "--format=tar", revision], cwd=repository, binary=True)
+    archive = _run_git(["archive", "--format=tar", "--end-of-options", revision], cwd=repository, binary=True)
     destination.mkdir(parents=True, exist_ok=True)
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as bundle:
         bundle.extractall(destination, filter="data")
@@ -378,9 +403,16 @@ def _source_context(
     dossier: dict,
     max_chars: int | None = None,
 ) -> str:
-    diff = _run_git(["diff", "--no-ext-diff", "--unified=80", vulnerable_ref, fixed_ref], cwd=repository)
-    files = _run_git(["diff", "--name-only", vulnerable_ref, fixed_ref], cwd=repository).splitlines()
-    tree = _run_git(["ls-tree", "-r", "--name-only", fixed_ref], cwd=repository).splitlines()
+    diff = _run_git(
+        ["diff", "--no-ext-diff", "--unified=80", "--end-of-options", vulnerable_ref, fixed_ref],
+        cwd=repository,
+    )
+    files = _run_git(
+        ["diff", "--name-only", "--end-of-options", vulnerable_ref, fixed_ref], cwd=repository
+    ).splitlines()
+    tree = _run_git(
+        ["ls-tree", "-r", "--name-only", "--end-of-options", fixed_ref], cwd=repository
+    ).splitlines()
     useful_names = {
         "package.json", "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt",
         "pom.xml", "build.gradle", "build.gradle.kts", "go.mod", "Cargo.toml", "composer.json",
@@ -389,7 +421,7 @@ def _source_context(
     excerpts = []
     for path in list(dict.fromkeys(files + [item for item in tree if PurePosixPath(item).name in useful_names]))[:24]:
         try:
-            content = _run_git(["show", f"{fixed_ref}:{path}"], cwd=repository)
+            content = _run_git(["show", "--end-of-options", f"{fixed_ref}:{path}"], cwd=repository)
         except RuntimeError:
             continue
         excerpts.append(f"\n--- FILE {path} (fixed revision) ---\n{content[:12000]}")
@@ -653,6 +685,49 @@ def _validate_support_services(services: list[str], compose: str) -> None:
             raise RuntimeError(f"Compose support service is missing: {service}")
 
 
+#: The files a generation answer carries in fields of their own.
+CANONICAL_FILES = frozenset({
+    "docker-compose.yml", ".dockerignore", "vulnerable/Dockerfile",
+    "patched/Dockerfile", "validator/Dockerfile", "validator/validator.py",
+})
+
+
+def _adapter_files(files: list[dict]) -> list[dict]:
+    """Refuse an adapter file that would replace one with a field of its own.
+
+    Adapter files are written after the canonical ones, so one named
+    docker-compose.yml or validator/Dockerfile replaced the copy that
+    _canonicalize_compose_builds or _canonicalize_validator_dockerfile had
+    just pinned, and the layout every later check assumes went with it.
+    Compared case-insensitively, as the file system on Windows and macOS
+    compares names.
+    """
+    canonical = {name.lower() for name in CANONICAL_FILES}
+    for item in files:
+        path = PurePosixPath(str(item.get("path", "")).replace("\\", "/")).as_posix()
+        if path.lower() in canonical:
+            raise RuntimeError(
+                f"Adapter file not allowed: {path}. It has a field of its own in the answer; "
+                "adapter_files is for anything else, under adapter/."
+            )
+    return files
+
+
+def _enforce_compose_policy(lab_dir: Path) -> None:
+    """Check a written lab the way run_lab will, when Docker is installed.
+
+    run_lab enforces this before every build, so nothing here is the last
+    line. Finding out now turns a refusal into feedback for the next
+    generation instead of a spent validation attempt. `docker compose config`
+    needs the CLI and not the engine.
+    """
+    try:
+        docker = docker_executable()
+    except RuntimeError:
+        return
+    policy.enforce(compose_command(docker, lab_dir), lab_dir, docker_environment(docker))
+
+
 
 
 def generate_source_lab(
@@ -686,14 +761,21 @@ def generate_source_lab(
             candidate_repo = discovery.get("repository_url")
             candidate_fixed = discovery.get("fixed_ref")
             if candidate_repo and candidate_fixed:
-                resolved = (_safe_repo_url(candidate_repo), candidate_fixed)
-                vulnerable_ref = vulnerable_ref or discovery.get("vulnerable_ref")
+                resolved = (
+                    _safe_repo_url(candidate_repo),
+                    _safe_revision(candidate_fixed, "fixed revision source discovery returned"),
+                )
+                if not vulnerable_ref and discovery.get("vulnerable_ref"):
+                    vulnerable_ref = _safe_revision(
+                        discovery["vulnerable_ref"], "vulnerable revision source discovery returned"
+                    )
         elif discovery["status"] == "VULNERABLE_ONLY":
             candidate_repo = discovery.get("repository_url")
             candidate_vulnerable = discovery.get("vulnerable_ref")
             if candidate_repo and candidate_vulnerable:
                 vulnerable_only_resolved = (
-                    _safe_repo_url(candidate_repo), candidate_vulnerable
+                    _safe_repo_url(candidate_repo),
+                    _safe_revision(candidate_vulnerable, "vulnerable revision source discovery returned"),
                 )
     if not resolved and not vulnerable_only_resolved:
         status = discovery.get("status") if discovery else "INSUFFICIENT_DATA"
@@ -719,32 +801,37 @@ def generate_source_lab(
     vulnerable_only = resolved is None
     if vulnerable_only:
         repo_url, vulnerable = vulnerable_only_resolved
+        vulnerable = _safe_revision(vulnerable, "vulnerable revision")
         fixed = None
     else:
         repo_url, fixed = resolved
+        fixed = _safe_revision(fixed, "fixed revision")
     cache_key = hashlib.sha256(repo_url.encode()).hexdigest()[:16]
     repository = output_root.resolve() / ".source-cache" / cache_key
     repository.parent.mkdir(parents=True, exist_ok=True)
     if not repository.exists():
         with progress.stage(f"cloning {repo_url}"):
-            _run_git(["clone", "--filter=blob:none", "--no-checkout", repo_url, str(repository)])
+            _run_git([
+                "clone", "--filter=blob:none", "--no-checkout", "--end-of-options",
+                repo_url, str(repository),
+            ])
     else:
         with progress.stage("fetching updates"):
             _run_git(["fetch", "--force", "origin"], cwd=repository)
     if fixed:
-        _run_git(["fetch", "--force", "origin", fixed], cwd=repository)
-        _run_git(["rev-parse", "--verify", f"{fixed}^{{commit}}"], cwd=repository)
-        vulnerable = vulnerable_ref or f"{fixed}^"
+        _run_git(["fetch", "--force", "--end-of-options", "origin", fixed], cwd=repository)
+        _run_git(["rev-parse", "--verify", "--end-of-options", f"{fixed}^{{commit}}"], cwd=repository)
+        vulnerable = _safe_revision(vulnerable_ref, "vulnerable revision") if vulnerable_ref else f"{fixed}^"
     else:
-        _run_git(["fetch", "--force", "origin", vulnerable], cwd=repository)
-    _run_git(["rev-parse", "--verify", f"{vulnerable}^{{commit}}"], cwd=repository)
+        _run_git(["fetch", "--force", "--end-of-options", "origin", vulnerable], cwd=repository)
+    _run_git(["rev-parse", "--verify", "--end-of-options", f"{vulnerable}^{{commit}}"], cwd=repository)
 
     marker = "CVELAB-" + uuid.uuid4().hex
     feedback_suffix = ""
     if generation_feedback:
         feedback_suffix = (
             "\n\n--- PREVIOUS CVELAB PREFLIGHT FAILURES ---\n"
-            + json.dumps(generation_feedback[-3:], ensure_ascii=True, indent=2)[:6000]
+            + redact(json.dumps(generation_feedback[-3:], ensure_ascii=True, indent=2))[:6000]
             + "\nReturn a complete replacement adapter that specifically corrects every listed failure."
         )
     if vulnerable_only:
@@ -818,7 +905,7 @@ def generate_source_lab(
                 "content": _canonicalize_validator_dockerfile(generation["validator_dockerfile"]),
             },
             {"path": "validator/validator.py", "content": generation["validator_py"]},
-            *generation["adapter_files"],
+            *_adapter_files(generation["adapter_files"]),
         ]
         _validate_generated(generated_files, vulnerable_only=True)
         _validate_fidelity(generation["fidelity"])
@@ -830,6 +917,7 @@ def generate_source_lab(
             if item["path"] == "docker-compose.yml":
                 content = _without_compose_version(content)
             write_text(lab_dir / item["path"], content)
+        _enforce_compose_policy(lab_dir)
         plan = {
             "cve": cve,
             "cwe": generation["cwe"],
@@ -933,7 +1021,7 @@ def generate_source_lab(
             "content": _canonicalize_validator_dockerfile(generation["validator_dockerfile"]),
         },
         {"path": "validator/validator.py", "content": generation["validator_py"]},
-        *generation["adapter_files"],
+        *_adapter_files(generation["adapter_files"]),
     ]
     _validate_generated(generated_files)
     _validate_fidelity(generation["fidelity"])
@@ -944,6 +1032,7 @@ def generate_source_lab(
     _snapshot(repository, fixed, lab_dir / "source" / "patched")
     for item in generated_files:
         write_text(lab_dir / item["path"], item["content"])
+    _enforce_compose_policy(lab_dir)
     plan = {
         "cve": cve,
         "cwe": generation["cwe"],
@@ -1027,6 +1116,10 @@ def repair_source_lab(
     fixed = revisions.get("patched")
     if not repo_url or not vulnerable:
         raise RuntimeError("Automatic repair is missing repository provenance")
+    # plan.json is part of the lab and reaches git below.
+    vulnerable = _safe_revision(vulnerable, "vulnerable revision in plan.json")
+    if fixed is not None:
+        fixed = _safe_revision(fixed, "fixed revision in plan.json")
     cache_key = hashlib.sha256(repo_url.encode()).hexdigest()[:16]
     repository = output_root.resolve() / ".source-cache" / cache_key
     if not repository.is_dir():
@@ -1041,7 +1134,10 @@ def repair_source_lab(
         dossier,
         max_chars=30000 if local_provider else None,
     )
-    diagnostic = json.dumps(failure, ensure_ascii=True, indent=2)[
+    # Docker and validator output can quote whatever reached a container, and
+    # this goes to the provider: redacted before it is cut, so a cut cannot
+    # leave half a secret behind.
+    diagnostic = redact(json.dumps(failure, ensure_ascii=True, indent=2))[
         :12000 if local_provider else 40000
     ]
     current = json.dumps(_repair_material(lab_dir), ensure_ascii=True, indent=2)[
@@ -1112,7 +1208,7 @@ def repair_source_lab(
             3,
             {"path": "patched/Dockerfile", "content": generation["patched_dockerfile"]},
         )
-    generated_files.extend(generation["adapter_files"])
+    generated_files.extend(_adapter_files(generation["adapter_files"]))
     _validate_generated(generated_files, vulnerable_only=vulnerable_only)
     _validate_fidelity(generation["fidelity"])
     _validate_support_services(generation["support_services"], compose)
@@ -1126,6 +1222,7 @@ def repair_source_lab(
                 old_file.unlink()
     for item in generated_files:
         write_text(lab_dir / item["path"], item["content"])
+    _enforce_compose_policy(lab_dir)
 
     history = plan.get("generation", {}).get("repair_history", [])
     history.append({
