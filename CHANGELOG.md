@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-10-21
+
+### Fixed
+
+- An upload cut an oversized document at its last byte, which for JSON
+  leaves text nothing can parse, so the control plane refused a validated
+  run whose `EVIDENCE.json` carried a 395 KB validator transcript. A JSON
+  document over 128 KiB is now shortened inside its long strings instead,
+  each ending with how many bytes it lost, so it still parses; strings under
+  1 KiB are never touched. It is still marked truncated, and cvelab.tech
+  accepts `EVIDENCE.json` and `report.json` trimmed this way.
+
 ## [0.6.2] - 2026-10-20
 
 ### Fixed
@@ -176,7 +188,8 @@ Unreleased and shipped in it; the list from the earlier, unpublished 0.6.0
 - Import ordering and a small number of lint findings were normalized across
   the package. No behavior changed.
 
-[Unreleased]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.3...HEAD
+[0.6.3]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/AndreiIonascu17/cvelab/releases/tag/v0.6.0
