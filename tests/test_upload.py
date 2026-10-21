@@ -344,10 +344,13 @@ class ControlPlaneAnswerTests(unittest.TestCase):
         self.assertIn("502", str(error))
 
     def test_a_shared_run_says_so(self) -> None:
-        self.assertIn("unverified", upload.sharing({"ok": True, "shared": True}))
+        self.assertIn("awaiting review", upload.sharing({"ok": True, "shared": True}))
 
     def test_every_reason_for_keeping_a_run_private_is_explained(self) -> None:
-        for reason in ("exploit_withheld", "duplicate", "review_queue_full"):
+        for reason in (
+            "exploit_withheld", "duplicate", "review_queue_full",
+            "script_not_generated", "poc_rejected", "earlier_entry_rejected",
+        ):
             note = upload.sharing({"ok": True, "shared": False, "not_shared": reason})
             self.assertTrue(note.startswith("kept private: "))
             self.assertNotIn(reason, note)

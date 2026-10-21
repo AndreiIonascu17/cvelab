@@ -74,7 +74,7 @@ to a fabricated PoC or one attributed to an unverified revision.
 
 - Python 3.11 or newer.
 - The Python `venv` module.
-- Git.
+- Git 2.30 or newer.
 - A running Docker Engine.
 - The Docker Compose plugin.
 - Internet access for public sources, images, and the API.
@@ -224,7 +224,14 @@ Local endpoints do not supply web search. Provide exact `--repo`, `--vulnerable-
 and `--fixed-ref` overrides when they are not already present in the CVE record.
 
 Do not publish the key in Git, screenshots, shell history, or reports. Revoke
-any exposed key immediately.
+any exposed key immediately. `--key VALUE` works but prints a warning, because
+other users of the machine can read it in the process list; prefer `--key` alone
+or the environment variable.
+
+A key is never sent over plain HTTP to another machine: a `--base-url` of
+`http://` is accepted for `127.0.0.1`, `localhost` and `[::1]`, and for any host
+when no key is configured (Ollama on a LAN, for example). Use `https://` for a
+gateway that needs a key.
 
 ## 5. End-to-end execution
 
@@ -278,7 +285,37 @@ cvelab --output-root "$HOME/cvelab-labs" run CVE-YYYY-NNNNN --keep
 ```
 
 Normal cleanup is restricted to the lab's Compose project. Do not use
-`docker system prune --volumes` for this workflow.
+`docker system prune --volumes` for this workflow. The project is always named
+after the lab directory, whatever `name:` the Compose file sets, so containers
+kept with `--keep` are stopped with:
+
+```bash
+cd "$HOME/cvelab-labs/CVE-YYYY-NNNNN"
+docker compose -p cve-yyyy-nnnnn -f docker-compose.yml down --volumes
+```
+
+A lab is untrusted input, whether a model generated it or someone sent it to
+you. Before anything is built, `run` resolves `docker-compose.yml` with
+`docker compose config` and refuses it unless every service stays on internal
+networks, without host ports, mounts, devices, extra capabilities, privileged
+mode, host namespaces, `env_file`, secrets or configs, and builds only from
+inside the lab directory. `include` and `extends` are refused, and so is a
+`${VARIABLE}` that the host environment would fill. The refusal names each
+service and key. Docker is given only the environment variables it needs, not
+your API keys or tokens.
+
+While it runs, a service that sets no limit of its own is bounded at 2 GB of
+memory, two CPUs and 1,024 processes. Change these with `CVELAB_RUNTIME_MEMORY`
+(for example `4g`), `CVELAB_RUNTIME_CPUS` (for example `1.5`) and
+`CVELAB_RUNTIME_PIDS`; an empty value removes that limit. The build is bounded
+separately by `CVELAB_BUILD_MEMORY` (default `4g`).
+
+Stopping a run with Ctrl+C, SIGTERM or SIGHUP, including closing the terminal,
+stops the lab's containers before the process exits.
+
+A few hand-curated labs set a `runner` in `plan.json` that runs the lab's own
+script on the host, outside Docker. CVELab refuses it unless
+`CVELAB_ALLOW_HOST_RUNNER=1` is set; read the script before setting it.
 
 ## 7. Deliverables
 
@@ -350,7 +387,9 @@ cvelab upload CVE-2024-12345 --dry-run    # print what would be sent
 cvelab upload CVE-2024-12345
 ```
 
-Self-hosting the control plane: set `CVELAB_ENDPOINT` to its origin.
+Self-hosting the control plane: set `CVELAB_ENDPOINT` to its origin. It must
+be `https://`; plain `http://` is accepted only for `localhost`, `127.0.0.1` or
+`[::1]`, such as a local `wrangler dev`.
 
 ## 9. Manual reproduction
 
@@ -404,6 +443,14 @@ id
 
 The generator performs preflight checks for `docker-compose.yml`, Dockerfiles,
 and the validator. An incomplete adapter is rejected before the build.
+
+### Compose policy refused this lab
+
+The lab's `docker-compose.yml` asks Docker for something CVELab does not allow,
+and each line of the message names the service and the key. During `auto` the
+refusal is fed back to the next generation attempt. For a lab you wrote or
+received, remove the key; if the word `include` or `extends` appears only in a
+comment, reword the comment.
 
 ### Missing public fix
 

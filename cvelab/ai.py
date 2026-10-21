@@ -31,6 +31,7 @@ from .providers import (
     auth_headers_for,
     endpoint_for,
     output_budget_for,
+    require_private_transport,
     timeout_for,
 )
 from .providers import get as get_provider
@@ -296,6 +297,7 @@ def _openai_response(
         body["tool_choice"] = "auto"
     if include:
         body["include"] = include
+    require_private_transport(endpoint_for("openai"), api_key)
     payload = _request_json(
         "OpenAI",
         endpoint_for("openai"),
@@ -343,6 +345,7 @@ def _anthropic_response(
             for tool in tools
             if tool.get("type") == "web_search"
         ]
+    require_private_transport(endpoint_for("anthropic"), api_key)
     payload = _request_json(
         "Anthropic",
         endpoint_for("anthropic"),
@@ -405,6 +408,7 @@ def _chat_completions_response(
         url = base if base.endswith("/chat/completions") else base + "/chat/completions"
     else:
         url = endpoint_for(provider_name, base_url)
+    require_private_transport(url, api_key)
     headers = auth_headers_for(provider_name, api_key)
     timeout = _local_timeout() if provider_name == "local" else timeout_for(provider_name)
 

@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- A lab's Compose file is checked on what Docker will run, not on its text.
+  The old checks were substrings, and a quoted `"privileged": true`,
+  `network_mode: "host"`, flow-style `"volumes": [...]`, a second network
+  that was not internal, a service with no `networks:` (it landed on the
+  default bridge) or `internal: true` in a comment all passed. `run` now
+  resolves the file with `docker compose config` before anything is built,
+  for generated labs and copied ones alike, and refuses any service key,
+  build option, network or top-level section not on an allowlist, naming the
+  service and key. `include` and `extends`, which Compose merges invisibly,
+  are refused in the raw file; `env_file`, secrets, configs, extra build
+  contexts and contexts outside the lab are refused; a `${VAR}` the host
+  environment would fill is refused. Every project is named after its lab
+  directory, so a lab's `name:` can no longer point teardown at another
+  project, and the lab's own `.env` is not read.
+- Docker no longer receives the whole environment. A build arg of
+  `${ANTHROPIC_API_KEY}` resolved to the real key; Compose now gets only
+  what it needs (PATH, HOME, locale, temporary directories, `DOCKER_*`,
+  `BUILDKIT_*`, `BUILDX_*`, `COMPOSE_*` except the variables that add files,
+  proxies, and the Windows essentials).
+- Running lab services are bounded: a service that sets no limit of its own
+  gets 2 GB of memory, two CPUs and 1,024 processes. `CVELAB_RUNTIME_MEMORY`,
+  `CVELAB_RUNTIME_CPUS` and `CVELAB_RUNTIME_PIDS` change them; an empty value
+  removes one. `cvelab closed` applies the same limits to the images it runs.
+- A `runner` in `plan.json`, which runs a lab's script on the host outside
+  Docker, needs `CVELAB_ALLOW_HOST_RUNNER=1`. The script must be inside the
+  lab once symlinks are followed, and a WSL distribution must be a plain name.
+- SIGTERM and SIGHUP (and SIGBREAK on Windows) now stop the lab before the
+  process exits, with status 128 plus the signal. A closed terminal, systemd
+  or a parent's timeout used to leave the containers running.
+- The upload token, `GITHUB_TOKEN`, `GH_TOKEN`, `AWS_SECRET_ACCESS_KEY`,
+  `AWS_SESSION_TOKEN` and `HF_TOKEN` are redacted like provider keys, and the
+  failure output a repair attempt sends to the provider is redacted first.
+- An adapter file can no longer replace `docker-compose.yml`, a Dockerfile
+  or `validator.py` after they were checked.
+- Revisions from source discovery, `plan.json` and the command line must be
+  a commit id or a plain tag or branch name, and git is called with
+  `--end-of-options`, which needs Git 2.30 or newer.
+- `CVELAB_ENDPOINT` must be `https://`, or `http://` to localhost,
+  127.0.0.1 or [::1]. A provider base URL may be plain `http://` to another
+  host only when no API key is sent, as for Ollama on a LAN.
+- `--key VALUE` prints a warning: the value is visible in the process list.
+  `--key` alone prompts for it, or set the provider's key variable.
+
+### Changed
+
+- A shared run is described as listed and awaiting review: cvelab.tech now
+  releases an entry's documents to subscribers only once it has been
+  reviewed. The three new reasons it gives for keeping a run private (a
+  `manual.sh` or `PoC.ps1` that is not the generated one, a PoC rejected in
+  review, an earlier rejected entry for the same CVE) are explained.
+
 ## [0.6.3] - 2026-10-21
 
 ### Fixed

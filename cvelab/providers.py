@@ -28,8 +28,10 @@ user's choice. These are defaults, not decisions made for anyone.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 # How a provider expects to be spoken to. The dispatch reads this rather than
 # the provider's name, so a new provider that speaks an existing dialect needs
@@ -206,6 +208,32 @@ def base_url_for(name: str, override: str | None = None) -> str:
         return override.rstrip("/")
     variable = f"CVELAB_{name.upper()}_BASE_URL"
     return (os.getenv(variable) or get(name).base_url).rstrip("/")
+
+
+def is_loopback(url: str) -> bool:
+    """Whether a URL names this machine: localhost, 127.0.0.0/8 or ::1."""
+    host = (urlparse(url).hostname or "").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def require_private_transport(url: str, key: str | None) -> None:
+    """Refuse to send a key in clear text to anything but this machine.
+
+    `--base-url http://...` was accepted for every provider, and the key
+    went with it to whoever was on the path. Plain HTTP stays allowed where
+    it is the norm -- a local server on loopback, or one on the LAN with no
+    key at all, as Ollama usually runs.
+    """
+    if key and urlparse(url).scheme.lower() == "http" and not is_loopback(url):
+        raise ValueError(
+            f"Refusing to send an API key over plain HTTP to {urlparse(url).hostname}; "
+            "use an https:// base URL, or http:// only on this machine"
+        )
 
 
 def auth_headers_for(name: str, key: str | None) -> dict[str, str]:

@@ -38,12 +38,15 @@ import urllib.request
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
+from urllib.parse import urlparse
 
 from . import __version__, progress, usage
 from .core import redact
+from .providers import is_loopback
 
 # A default, not a constant: a self-hosted control plane sets CVELAB_ENDPOINT.
 DEFAULT_ENDPOINT = "https://cvelab.tech"
+ENDPOINT_VARIABLE = "CVELAB_ENDPOINT"
 
 TOKEN_VARIABLE = "CVELAB_TOKEN"
 TOKEN_PREFIX = "cvelab_"
@@ -109,6 +112,14 @@ NOT_SHARED = {
         "kept private: ten of your entries are already waiting for review; "
         "upload it again once they are reviewed"
     ),
+    "script_not_generated": (
+        "kept private: manual.sh or PoC.ps1 is not the script CVELab writes; "
+        "regenerate the lab rather than editing them"
+    ),
+    "poc_rejected": "kept private: this PoC was rejected in review",
+    "earlier_entry_rejected": (
+        "kept private: an earlier entry of yours for this CVE was rejected in review"
+    ),
 }
 
 #: Lab status to the status the control plane stores. A status this does not
@@ -138,7 +149,24 @@ class UploadError(RuntimeError):
 
 
 def endpoint() -> str:
-    return os.getenv("CVELAB_ENDPOINT", DEFAULT_ENDPOINT).rstrip("/")
+    return os.getenv(ENDPOINT_VARIABLE, DEFAULT_ENDPOINT).rstrip("/")
+
+
+def insecure_endpoint() -> str | None:
+    """Why the endpoint may not carry a token, or None when it may.
+
+    The token travels in a header and the exploit in the body, so plain
+    HTTP is refused except to this machine, where a control plane under
+    `wrangler dev` listens on http://localhost:8787.
+    """
+    url = endpoint()
+    scheme = urlparse(url).scheme.lower()
+    if scheme == "https" or (scheme == "http" and is_loopback(url)):
+        return None
+    return (
+        f"{ENDPOINT_VARIABLE} is {url}; uploads need https://, "
+        "or http:// to localhost, 127.0.0.1 or [::1]"
+    )
 
 
 def find_token() -> str | None:
@@ -322,7 +350,7 @@ def describe(payload: dict) -> str:
         # chose to join and one they were enrolled in.
         lines.append(
             "  a validated run joins the shared database under your account, "
-            "marked unverified until it is reviewed"
+            "listed as awaiting review; subscribers can open it once it is reviewed"
         )
         missing = [name for name in REQUIRED_TO_SHARE if name not in
                    {d["name"] for d in payload["documents"]}]
@@ -341,6 +369,9 @@ def describe(payload: dict) -> str:
 
 
 def send(payload: dict, token: str, *, timeout: int = 30) -> dict:
+    refusal = insecure_endpoint()
+    if refusal:
+        raise UploadError(refusal)
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         f"{endpoint()}/api/runs",
@@ -411,7 +442,7 @@ def _duration(seconds: int) -> str:
 def sharing(answer: dict) -> str | None:
     """One line on whether a filed run joined the shared database, or why not."""
     if answer.get("shared") is True:
-        return "shared: listed in the database as unverified until it is reviewed"
+        return "shared: listed as awaiting review; subscribers can open it once it is reviewed"
     reason = answer.get("not_shared")
     if reason:
         return NOT_SHARED.get(reason, f"kept private: {reason}")

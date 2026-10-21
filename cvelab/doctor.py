@@ -35,7 +35,8 @@ from pathlib import Path
 
 from . import upload
 from .ai import _local_base_url, _provider_key, resolve_provider
-from .providers import auth_headers_for, base_url_for
+from .core import docker_environment
+from .providers import auth_headers_for, base_url_for, require_private_transport
 from .providers import get as get_provider
 
 OK = "ok"
@@ -79,9 +80,10 @@ class Report:
         }
 
 
-def _run(command: list[str], timeout: int = 20) -> subprocess.CompletedProcess | None:
+def _run(command: list[str], timeout: int = 20,
+         env: dict[str, str] | None = None) -> subprocess.CompletedProcess | None:
     try:
-        return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(command, capture_output=True, text=True, timeout=timeout, env=env)
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -122,7 +124,10 @@ def check_docker_daemon() -> Check:
     if not docker:
         return Check("docker daemon", FAIL, "docker CLI not found",
                      "Install Docker Engine, or Docker Desktop on Windows.")
-    completed = _run([docker, "info", "--format", "{{.ServerVersion}}"], timeout=30)
+    # The environment a run gives Docker, which is not all of the shell's:
+    # a check that passes here should mean the run reaches the same engine.
+    completed = _run([docker, "info", "--format", "{{.ServerVersion}}"], timeout=30,
+                     env=docker_environment(docker))
     if completed is None:
         return Check("docker daemon", FAIL, "docker info did not respond",
                      "Start the Docker service and try again.")
@@ -139,7 +144,7 @@ def check_compose() -> Check:
     docker = shutil.which("docker")
     if not docker:
         return Check("docker compose", FAIL, "docker CLI not found")
-    completed = _run([docker, "compose", "version", "--short"])
+    completed = _run([docker, "compose", "version", "--short"], env=docker_environment(docker))
     if completed is None or completed.returncode != 0:
         return Check("docker compose", FAIL, "the Compose plugin is not available",
                      "Install the docker-compose-plugin package.")
@@ -183,6 +188,10 @@ def check_report_upload() -> Check:
     than a fault.
     """
     endpoint = upload.endpoint()
+    refusal = upload.insecure_endpoint()
+    if refusal and upload.find_token():
+        return Check("report upload", FAIL, refusal,
+                     f"Set {upload.ENDPOINT_VARIABLE} to an https:// origin, or unset it.")
     if not upload.find_token():
         return Check(
             "report upload", OK,
@@ -240,6 +249,11 @@ def check_provider_reachable(provider: str | None, api_key: str | None,
     else:
         base = base_url_for(selected, base_url)
     url = base + provider.models_path
+    try:
+        require_private_transport(url, key)
+    except ValueError as exc:
+        return Check("provider reachable", FAIL, str(exc),
+                     "Point --base-url at https://, or run the server on this machine.")
     headers = auth_headers_for(selected, key)
 
     request = urllib.request.Request(url, headers=headers, method="GET")
