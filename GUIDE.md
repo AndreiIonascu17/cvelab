@@ -147,9 +147,9 @@ Install the resulting bundle:
 
 ```bash
 cd dist-linux
-sha256sum --check cvelab-0.6.3-linux.tar.gz.sha256
-tar -xzf cvelab-0.6.3-linux.tar.gz
-cd cvelab-0.6.3-linux
+sha256sum --check cvelab-0.6.4-linux.tar.gz.sha256
+tar -xzf cvelab-0.6.4-linux.tar.gz
+cd cvelab-0.6.4-linux
 ./install.sh
 ```
 
