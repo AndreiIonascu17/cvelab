@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A lab whose two variants could differ for any reason but the fix is
+  refused before it is built. vulnerable/Dockerfile and patched/Dockerfile,
+  and their Compose services, may differ only in the snapshot they copy, in
+  labels carrying their own name, in package versions and in commit ids,
+  and the adapter may not compare against the variant name. A TanStack
+  Start lab passed validation with a harness that read `ROLE=vulnerable`,
+  never ran TanStack code, and said so in its own fidelity report.
+
+### Fixed
+
+- A Dockerfile that copies a file its build context does not hold is
+  refused before Docker runs, with the file, the context it is built from
+  and the closest file the answer does contain. Docker reported it as a
+  checksum failure deep in the build log, and the repair given that log
+  tended to repeat it: 15 of 27 failed builds across three benchmark
+  batches were this, most of them a validator copying from adapter/. A
+  target that copies the whole lab directory is refused too: it put both
+  snapshots in one image and the vendor tree one level deeper than the build
+  expected. The generation and repair prompts now state the fixed build
+  contexts.
+
 ## [0.6.7] - 2026-10-23
 
 ### Security

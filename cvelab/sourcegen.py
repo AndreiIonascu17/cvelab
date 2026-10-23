@@ -14,12 +14,15 @@
 
 from __future__ import annotations
 
+import difflib
+import fnmatch
 import hashlib
 import io
 import json
 import os
 import posixpath
 import re
+import shlex
 import shutil
 import subprocess
 import tarfile
@@ -576,6 +579,268 @@ def _canonicalize_validator_dockerfile(content: str) -> str:
     for source, target in replacements.items():
         content = content.replace(source, target)
     return content
+
+
+#: Where each image is built from, as _canonicalize_compose_builds pins it.
+BUILD_CONTEXTS = {
+    "vulnerable/Dockerfile": "",
+    "patched/Dockerfile": "",
+    "validator/Dockerfile": "validator/",
+}
+
+#: What the CLI itself puts in the validator's context, besides the answer.
+VALIDATOR_CONTEXT_EXTRAS = ("plan.json",)
+
+_HEREDOC = re.compile(r"<<-?\s*[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']?")
+
+
+def _dockerfile_instructions(content: str) -> list[str]:
+    """Instructions with continuations joined, comments and heredoc bodies dropped."""
+    instructions: list[str] = []
+    pending = ""
+    terminator = None
+    for raw in content.splitlines():
+        stripped = raw.strip()
+        if terminator is not None:
+            if stripped == terminator:
+                terminator = None
+            continue
+        if not pending and (not stripped or stripped.startswith("#")):
+            continue
+        if stripped.endswith("\\"):
+            pending += stripped[:-1] + " "
+            continue
+        instruction = (pending + stripped).strip()
+        pending = ""
+        instructions.append(instruction)
+        heredoc = _HEREDOC.search(instruction)
+        if heredoc:
+            terminator = heredoc.group(1)
+    if pending.strip():
+        instructions.append(pending.strip())
+    return instructions
+
+
+def _copy_sources(instruction: str) -> list[str]:
+    """The context paths a COPY or ADD reads; empty for any other instruction."""
+    match = re.match(r"(?i)^(COPY|ADD)\s+(.*)$", instruction)
+    if not match:
+        return []
+    rest = match.group(2).strip()
+    if "<<" in rest:
+        return []  # a heredoc writes the file inline
+    if rest.startswith("["):
+        try:
+            args = json.loads(rest)
+        except ValueError:
+            return []
+        if not isinstance(args, list):
+            return []
+        args = [str(arg) for arg in args]
+    else:
+        try:
+            args = shlex.split(rest)
+        except ValueError:
+            args = rest.split()
+    flags = [arg for arg in args if arg.startswith("--")]
+    if any(flag.startswith("--from") for flag in flags):
+        return []  # copies from another stage, not from the context
+    args = [arg for arg in args if not arg.startswith("--")]
+    if len(args) < 2:
+        return []
+    return [
+        source for source in args[:-1]
+        if "://" not in source and "$" not in source
+    ]
+
+
+def _in_context(source: str, context: str, generated: set[str], lab_dir: Path) -> bool:
+    relative = posixpath.normpath(source.replace("\\", "/")).lstrip("/")
+    if relative in ("", "."):
+        return True
+    entries = {path[len(context):] for path in generated if path.startswith(context)}
+    if context == "validator/":
+        entries.update(VALIDATOR_CONTEXT_EXTRAS)
+    glob = any(char in relative for char in "*?[")
+    if glob:
+        if any(fnmatch.fnmatch(entry, relative) for entry in entries):
+            return True
+    elif relative in entries or any(entry.startswith(relative + "/") for entry in entries):
+        return True
+    if context or relative.split("/", 1)[0] == "adapter" or relative in generated:
+        # The answer is the only source of adapter files and of the
+        # validator's context: a stale file from an earlier attempt is
+        # removed before the build, so the disk does not count.
+        return False
+    # Inputs the CLI prepared itself, such as source/vulnerable.
+    if glob:
+        return any(lab_dir.glob(relative))
+    return (lab_dir / relative).exists()
+
+
+def _check_build_inputs(files: list[dict], lab_dir: Path, vulnerable_only: bool = False) -> None:
+    """Refuse a Dockerfile that copies something its build context does not hold.
+
+    Docker reports that as a checksum failure deep in a long log, after the
+    images before it were built, and a repair given the log tends to repeat
+    the mistake: in one series of benchmark runs this was 15 of 27 failed
+    builds. Checked here, it costs nothing and says exactly what is wrong.
+    """
+    generated = {item["path"].replace("\\", "/") for item in files}
+    contents = {item["path"].replace("\\", "/"): item["content"] for item in files}
+    problems = []
+    for dockerfile, context in BUILD_CONTEXTS.items():
+        if dockerfile not in contents:
+            continue
+        for instruction in _dockerfile_instructions(contents[dockerfile]):
+            for source in _copy_sources(instruction):
+                whole = posixpath.normpath(source.replace("\\", "/")).lstrip("/") in ("", ".")
+                if whole and not context:
+                    variant = dockerfile.split("/", 1)[0]
+                    problems.append(
+                        f"{dockerfile} copies {source}, the whole lab directory: both snapshots, the "
+                        "adapter and the other variant's files land in one image, and the vendor tree "
+                        f"is under source/{variant}/ rather than at the destination. Copy "
+                        f"source/{variant}/ and the adapter files it needs instead."
+                    )
+                    continue
+                if _in_context(source, context, generated, lab_dir):
+                    continue
+                relative = posixpath.normpath(source.replace("\\", "/")).lstrip("/")
+                if relative.startswith("../"):
+                    problems.append(f"{dockerfile} copies {source}, which is outside its build context.")
+                elif context == "validator/":
+                    problems.append(
+                        f"{dockerfile} copies {source}, but the validator image is built from "
+                        "validator/ alone, which holds validator.py, requirements.txt and plan.json. "
+                        "Nothing under adapter/ or source/ reaches it: put what the probe needs in "
+                        "validator.py, or run it from the target service."
+                    )
+                else:
+                    candidates = [path for path in generated if not path.startswith("validator/")]
+                    close = difflib.get_close_matches(relative, candidates, n=1)
+                    hint = f" The closest file in this answer is {close[0]}." if close else ""
+                    problems.append(
+                        f"{dockerfile} copies {source}, which does not exist. Its build context is "
+                        "the lab directory: the vendor snapshots are source/vulnerable and "
+                        "source/patched, and adapter/ holds only the adapter files in this answer."
+                        + hint
+                    )
+    if problems:
+        raise RuntimeError("A Dockerfile COPY cannot work as written:\n- " + "\n- ".join(problems))
+    if not vulnerable_only:
+        _check_variant_parity(contents)
+
+
+_HEX_RUN = re.compile(r"\b[0-9a-f]{7,40}\b")
+_PARENT_REF = re.compile(r"(?:~\d*|\^\d*)(?=[\"']?$|[\"'\s;&|)])")
+_VERSIONED = re.compile(r"^(.*?(?:@|==|=|:|-))v?(\d+(?:\.\d+)*[\w.+-]*)$")
+_VARIANT_SWITCH = re.compile(
+    r"""(?:[!=]==?|\bis\b|\bin\b|\bcase\b)\s*[\(\[]?\s*['"`](vulnerable|patched)['"`]"""
+    r"""|['"`](vulnerable|patched)['"`]\s*[!=]==?"""
+)
+
+
+def _benign_token_pair(vulnerable: str, patched: str) -> bool:
+    """Whether two tokens differ in a way that cannot switch behaviour by itself.
+
+    Allowed: the variant's own name inside a label (an image tag, a database
+    name, `CVELAB_REVISION=vulnerable`), two versions of the same package
+    (`lodash@4.17.21` and `lodash@4.17.23`), two commit ids, and the fix's
+    parent written as `REF~1` against `REF`. Whether the
+    adapter then branches on a label is checked separately.
+    """
+    if vulnerable.replace("vulnerable", "<variant>") == patched.replace("patched", "<variant>"):
+        return True
+    if _HEX_RUN.sub("<commit>", vulnerable) == _HEX_RUN.sub("<commit>", patched):
+        return True
+    # The fix's parent, written as `REF~1` or `REF^`, against the fix itself.
+    if _PARENT_REF.sub("", vulnerable) == patched:
+        return True
+    left, right = _VERSIONED.match(vulnerable), _VERSIONED.match(patched)
+    return bool(left and right and left.group(1) == right.group(1))
+
+
+def _same_but_for_variant(vulnerable: str, patched: str) -> bool:
+    if vulnerable == patched:
+        return True
+    left, right = vulnerable.split(), patched.split()
+    if len(left) != len(right):
+        return False
+    return all(a == b or _benign_token_pair(a, b) for a, b in zip(left, right, strict=True))
+
+
+def _compose_service_lines(compose: str, service: str) -> list[str]:
+    match = re.search(
+        rf"(?ms)^  {re.escape(service)}:\s*\n(.*?)(?=^  [A-Za-z0-9_.-]+:\s*$|^[A-Za-z]|\Z)",
+        compose,
+    )
+    if not match:
+        return []
+    return [
+        line.rstrip() for line in match.group(1).splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def _check_variant_parity(contents: dict[str, str]) -> None:
+    """Refuse a lab whose two variants differ in anything that could stand in for the fix.
+
+    A harness that reads `ROLE=vulnerable` and branches on it, or a command
+    that differs between the two services, produces a differential without
+    running the vendor code at all. The two images may differ in the
+    snapshot they copy, in labels carrying their own name, in the version of
+    a package they install and in the commit they check out; the adapter,
+    which runs unchanged in both, must not compare against the variant name.
+    """
+    pairs = []
+    vulnerable_file = contents.get("vulnerable/Dockerfile")
+    patched_file = contents.get("patched/Dockerfile")
+    if vulnerable_file is not None and patched_file is not None:
+        pairs.append((
+            "vulnerable/Dockerfile and patched/Dockerfile",
+            _dockerfile_instructions(vulnerable_file),
+            _dockerfile_instructions(patched_file),
+        ))
+    compose = contents.get("docker-compose.yml")
+    if compose:
+        pairs.append((
+            "The vulnerable and patched Compose services",
+            _compose_service_lines(compose, "vulnerable"),
+            _compose_service_lines(compose, "patched"),
+        ))
+    for where, vulnerable, patched in pairs:
+        mismatch = None
+        if len(vulnerable) != len(patched):
+            longer, shorter = (vulnerable, patched) if len(vulnerable) > len(patched) else (patched, vulnerable)
+            extra = next((line for line in longer if line not in shorter), longer[-1])
+            mismatch = (extra, "(nothing)") if longer is vulnerable else ("(nothing)", extra)
+        else:
+            for a, b in zip(vulnerable, patched, strict=True):
+                if not _same_but_for_variant(a, b):
+                    mismatch = (a, b)
+                    break
+        if mismatch:
+            raise RuntimeError(
+                f"{where} may differ only in the source snapshot they copy, in labels that "
+                "carry their own name, in package versions and in commit ids, so that any "
+                "difference in behaviour comes from the vendor code. The vulnerable side has "
+                f"`{mismatch[0].strip()}` where the patched side has `{mismatch[1].strip()}`. "
+                "A lab whose variants are configured or started differently demonstrates that "
+                "difference, not the vulnerability."
+            )
+    for path, content in sorted(contents.items()):
+        if not path.startswith("adapter/"):
+            continue
+        switch = _VARIANT_SWITCH.search(content)
+        if switch:
+            word = switch.group(1) or switch.group(2)
+            raise RuntimeError(
+                f"{path} compares against the variant name '{word}'. The adapter runs unchanged "
+                "in both images and must not decide what to do by which one it is in: a lab "
+                "that branches on the variant demonstrates that branch, not the vulnerability. "
+                "Run the vendor code from the snapshot and let the fix make the difference."
+            )
 
 
 def _validate_generated(files: list[dict], vulnerable_only: bool = False) -> None:
@@ -1213,6 +1478,7 @@ def generate_source_lab(
             *_adapter_files(generation["adapter_files"]),
         ]
         _validate_generated(generated_files, vulnerable_only=True)
+        _check_build_inputs(generated_files, lab_dir, vulnerable_only=True)
         _validate_fidelity(generation["fidelity"])
         _validate_support_services(generation["support_services"], generation["docker_compose"])
         _remove_stale_adapter_files(lab_dir, {item["path"] for item in generated_files})
@@ -1303,7 +1569,14 @@ def generate_source_lab(
             "inverts the proof. "
             "Source archives have no .git directory, so initialize a local repository without "
             "a remote only if build logic requires it. Healthchecks and the validator must use the final application "
-            "scheme, port, and route, and redirects must not count as healthy."
+            "scheme, port, and route, and redirects must not count as healthy. "
+            "Build contexts are fixed: vulnerable and patched build from the lab directory, where the vendor "
+            "snapshots are source/vulnerable and source/patched and adapter/ holds only the adapter files you "
+            "return; the validator builds from validator/ alone, so its Dockerfile can copy only validator.py and "
+            "requirements.txt. Every COPY source must exist in its context. vulnerable/Dockerfile and "
+            "patched/Dockerfile, and their Compose services, must be identical except for the snapshot they "
+            "copy, labels carrying their own name, package versions and commit ids; the adapter runs unchanged "
+            "in both and must never compare against the variant name."
         ),
         input_text=context + feedback_suffix,
         provider=provider,
@@ -1325,6 +1598,7 @@ def generate_source_lab(
         *_adapter_files(generation["adapter_files"]),
     ]
     _validate_generated(generated_files)
+    _check_build_inputs(generated_files, lab_dir)
     _validate_fidelity(generation["fidelity"])
     _validate_support_services(generation["support_services"], generation["docker_compose"])
 
@@ -1518,6 +1792,13 @@ def repair_source_lab(
             "container logs are authoritative: identify their root cause and return a full replacement, not a patch. "
             "Do not repeat the failing design when the diagnostics disprove it. Build and run the supplied immutable "
             "vendor source snapshots; never modify or return vendor source. Prefer the actual vendor service or binary. "
+            "Build contexts are fixed: vulnerable and patched build from the lab directory, where the vendor "
+            "snapshots are source/vulnerable and source/patched and adapter/ holds only the adapter files you "
+            "return; the validator builds from validator/ alone, so its Dockerfile can copy only validator.py and "
+            "requirements.txt. Every COPY source must exist in its context. vulnerable/Dockerfile and "
+            "patched/Dockerfile, and their Compose services, must be identical except for the snapshot they "
+            "copy, labels carrying their own name, package versions and commit ids; the adapter runs unchanged "
+            "in both and must never compare against the variant name. "
             "Use source_component only if launching the product is genuinely impractical, vendor_service when the real "
             "service starts with simulated surrounding components, and product_end_to_end only when the complete "
             "security-relevant product path executes. Disclose every simulated component. Compose must use an internal "
@@ -1566,6 +1847,7 @@ def repair_source_lab(
         )
     generated_files.extend(_adapter_files(generation["adapter_files"]))
     _validate_generated(generated_files, vulnerable_only=vulnerable_only)
+    _check_build_inputs(generated_files, lab_dir, vulnerable_only=vulnerable_only)
     _validate_fidelity(generation["fidelity"])
     _validate_support_services(generation["support_services"], compose)
 
