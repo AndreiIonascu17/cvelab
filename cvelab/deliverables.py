@@ -179,8 +179,10 @@ but leaves setup, exploitation, evidence verification, and cleanup as separate i
 
 ## Kali/Linux
 
+Run these from the lab's `artifacts/` directory, the one this file is in:
+
 ```bash
-cd "{artifacts}"
+cd {cve}/artifacts
 sed -n '1,260p' PoC.py
 bash manual.sh setup vulnerable
 bash manual.sh exploit vulnerable

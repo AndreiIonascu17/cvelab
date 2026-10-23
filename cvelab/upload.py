@@ -181,7 +181,35 @@ def find_token() -> str | None:
     return token or None
 
 
-def read_document(path: Path) -> dict | None:
+def strip_local_paths(text: str, lab_dir: Path) -> str:
+    """Replace this machine's paths with ones that say nothing about it.
+
+    A lab's documents quote the paths it ran from: Docker and Compose errors
+    name the lab directory, tool output names the home directory. In the
+    shared database that shows the filer's user name and how their disk is
+    laid out. The lab directory becomes its own name, which is the CVE, and
+    anything else under the home directory becomes `~`.
+    """
+    replacements: dict[str, str] = {}
+    for root in (lab_dir, lab_dir.resolve()):
+        if str(root) not in ("", "/", "."):
+            replacements[str(root)] = lab_dir.name
+    home = str(Path.home())
+    if home not in ("", "/"):
+        replacements.setdefault(home, "~")
+    # Longest first, so the lab directory wins over the home directory it
+    # sits under.
+    for old in sorted(replacements, key=len, reverse=True):
+        new = replacements[old]
+        text = text.replace(old, new)
+        # A Windows path inside JSON text has its backslashes doubled.
+        escaped = json.dumps(old)[1:-1]
+        if escaped != old:
+            text = text.replace(escaped, json.dumps(new)[1:-1])
+    return text
+
+
+def read_document(path: Path, lab_dir: Path | None = None) -> dict | None:
     """One file, redacted, trimmed if it is enormous, or None if absent."""
     try:
         text = path.read_text(encoding="utf-8")
@@ -190,6 +218,7 @@ def read_document(path: Path) -> dict | None:
     # Files were written through write_text and are already redacted. Doing it
     # again costs nothing and covers anything assembled another way.
     text = redact(text)
+    text = strip_local_paths(text, lab_dir if lab_dir is not None else path.parent.parent)
     encoded = text.encode("utf-8")
     truncated = len(encoded) > MAX_DOCUMENT_BYTES
     if truncated:
@@ -276,7 +305,7 @@ def collect(
     """Build the payload, reading only from the allowlist above."""
     artifacts = lab_dir / "artifacts"
     names = ALWAYS if include_poc else tuple(n for n in ALWAYS if n not in EXPLOIT)
-    documents = [doc for doc in (read_document(artifacts / n) for n in names) if doc]
+    documents = [doc for doc in (read_document(artifacts / n, lab_dir) for n in names) if doc]
     documents, dropped = fit_payload(documents)
 
     plan = _plan(lab_dir)
@@ -299,7 +328,11 @@ def collect(
         "input_tokens": totals["input_tokens"],
         "output_tokens": totals["output_tokens"],
         "cost_usd": totals["estimated_cost_usd"],
-        "error": redact(str(result["error"]))[:4000] if result.get("error") else None,
+        "error": (
+            strip_local_paths(redact(str(result["error"])), lab_dir)[:4000]
+            if result.get("error")
+            else None
+        ),
         "documents": documents,
         "dropped_documents": dropped,
     }

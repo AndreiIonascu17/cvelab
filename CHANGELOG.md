@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- A shared lab no longer shows where, or as whom, it was generated.
+  MANUAL-POC.md told the reader to `cd` into the lab's absolute path, and
+  Docker and Compose errors kept in EVIDENCE.json, report.json and plan.json
+  quoted it too, so a published entry carried the filer's user name and
+  folder layout. The guide now says `cd CVE-…/artifacts`, and every
+  uploaded document and error has the lab directory replaced by its name
+  and anything else under the home directory by `~`.
+
 ## [0.6.6] - 2026-10-23
 
 ### Added
