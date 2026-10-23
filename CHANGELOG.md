@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generation attempt or one of the three repairs. Rerunning the failed
   entries of three benchmark batches, half of the repair budget went to
   layout refusals the model repeated. The refusals are kept in plan.json.
+- When the fix also shipped in an npm or PyPI release, the prompt offers
+  the last vulnerable and the first patched version, resolved from GitHub's
+  reviewed advisory and the registry, so a lab for a large monorepo can
+  install the two instead of building the source. Most framework labs
+  (Next.js, Nuxt, Storybook, Astro, Sentry) failed in that build. The pair
+  is kept in plan.json; `CVELAB_PUBLISHED_RELEASES=off` turns it off.
 
 - A lab whose two variants could differ for any reason but the fix is
   refused before it is built. vulnerable/Dockerfile and patched/Dockerfile,
