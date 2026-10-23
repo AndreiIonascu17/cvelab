@@ -161,6 +161,19 @@ class LabPreflightTests(unittest.TestCase):
             "patched/Dockerfile": target("4.17.23"),
         }), self.lab)
 
+    def test_labels_and_quoted_versions_are_allowed(self) -> None:
+        def target(variant: str, version: str) -> str:
+            return (
+                "FROM node:22-alpine\n"
+                f'LABEL org.cvelab.variant="{variant}" org.cvelab.package="storybook@{version}"\n'
+                f'RUN npm install "storybook@{version}"\n'
+                "COPY adapter/app/server.py /opt/app/server.py\n"
+            )
+        _check_build_inputs(self.files(**{
+            "vulnerable/Dockerfile": target("vulnerable", "10.6.1"),
+            "patched/Dockerfile": target("patched", "10.6.2"),
+        }), self.lab)
+
     def test_an_adapter_that_branches_on_the_variant_is_refused(self) -> None:
         message = self.refused(self.files(**{
             "adapter/app/server.py": "import os\nif os.environ['CVELAB_REVISION'] == 'vulnerable':\n    leak()\n",

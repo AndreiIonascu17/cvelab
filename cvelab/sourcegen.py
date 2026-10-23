@@ -748,18 +748,24 @@ def _benign_token_pair(vulnerable: str, patched: str) -> bool:
     Allowed: the variant's own name inside a label (an image tag, a database
     name, `CVELAB_REVISION=vulnerable`), two versions of the same package
     (`lodash@4.17.21` and `lodash@4.17.23`), two commit ids, and the fix's
-    parent written as `REF~1` against `REF`. Whether the
-    adapter then branches on a label is checked separately.
+    parent written as `REF~1` against `REF`. Quotes and punctuation around a
+    token, as in `pkg="name@1.2.3"`, are ignored. Whether the adapter then
+    branches on a label is checked separately.
     """
     if vulnerable.replace("vulnerable", "<variant>") == patched.replace("patched", "<variant>"):
         return True
-    if _HEX_RUN.sub("<commit>", vulnerable) == _HEX_RUN.sub("<commit>", patched):
-        return True
-    # The fix's parent, written as `REF~1` or `REF^`, against the fix itself.
-    if _PARENT_REF.sub("", vulnerable) == patched:
-        return True
-    left, right = _VERSIONED.match(vulnerable), _VERSIONED.match(patched)
-    return bool(left and right and left.group(1) == right.group(1))
+    trim = "\"'`;,()"
+    for left, right in ((vulnerable, patched), (vulnerable.strip(trim), patched.strip(trim))):
+        if left == right:
+            return True
+        if _HEX_RUN.sub("<commit>", left) == _HEX_RUN.sub("<commit>", right):
+            return True
+        if _PARENT_REF.sub("", left) == right:
+            return True
+        versioned_left, versioned_right = _VERSIONED.match(left), _VERSIONED.match(right)
+        if versioned_left and versioned_right and versioned_left.group(1) == versioned_right.group(1):
+            return True
+    return False
 
 
 def _same_but_for_variant(vulnerable: str, patched: str) -> bool:
@@ -784,6 +790,14 @@ def _compose_service_lines(compose: str, service: str) -> list[str]:
     ]
 
 
+def _runtime_instructions(content: str) -> list[str]:
+    """Dockerfile instructions that can change what the image does; LABEL is metadata only."""
+    return [
+        line for line in _dockerfile_instructions(content)
+        if not re.match(r"(?i)^LABEL\s", line)
+    ]
+
+
 def _check_variant_parity(contents: dict[str, str]) -> None:
     """Refuse a lab whose two variants differ in anything that could stand in for the fix.
 
@@ -791,7 +805,8 @@ def _check_variant_parity(contents: dict[str, str]) -> None:
     that differs between the two services, produces a differential without
     running the vendor code at all. The two images may differ in the
     snapshot they copy, in labels carrying their own name, in the version of
-    a package they install and in the commit they check out; the adapter,
+    a package they install and in the commit they check out, and LABEL
+    instructions are ignored as metadata; the adapter,
     which runs unchanged in both, must not compare against the variant name.
     """
     pairs = []
@@ -800,8 +815,8 @@ def _check_variant_parity(contents: dict[str, str]) -> None:
     if vulnerable_file is not None and patched_file is not None:
         pairs.append((
             "vulnerable/Dockerfile and patched/Dockerfile",
-            _dockerfile_instructions(vulnerable_file),
-            _dockerfile_instructions(patched_file),
+            _runtime_instructions(vulnerable_file),
+            _runtime_instructions(patched_file),
         ))
     compose = contents.get("docker-compose.yml")
     if compose:
