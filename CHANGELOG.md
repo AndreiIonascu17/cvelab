@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.7] - 2026-10-23
+
 ### Security
 
 - A shared lab no longer shows where, or as whom, it was generated.
@@ -346,7 +348,8 @@ Unreleased and shipped in it; the list from the earlier, unpublished 0.6.0
 - Import ordering and a small number of lint findings were normalized across
   the package. No behavior changed.
 
-[Unreleased]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.6...HEAD
+[Unreleased]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.7...HEAD
+[0.6.7]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.6...v0.6.7
 [0.6.6]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.5...v0.6.6
 [0.6.5]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.4...v0.6.5
 [0.6.4]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.3...v0.6.4
