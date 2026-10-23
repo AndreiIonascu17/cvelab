@@ -20,6 +20,7 @@ from pathlib import Path
 from unittest import mock
 
 from cvelab.autoflow import run_auto_workflow
+from cvelab.core import CVERecordNotFound
 
 
 class AutonomousWorkflowTests(unittest.TestCase):
@@ -65,6 +66,25 @@ class AutonomousWorkflowTests(unittest.TestCase):
                     "CVE-2026-12345", root, None, None, None,
                     "key", "model", False, max_attempts=4, progress=lambda _: None,
                     provider="anthropic",
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "AUTO_GENERATION_FAILED")
+            self.assertEqual(generate.call_count, 1)
+            self.assertEqual(len(result["attempts"]), 1)
+
+    def test_missing_cve_record_is_not_retried(self) -> None:
+        # The record is missing at CVE.org and at GitHub: a second request
+        # gets the same answer, so the run stops after one attempt.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with mock.patch(
+                "cvelab.autoflow.generate_source_lab",
+                side_effect=CVERecordNotFound("CVE API returned HTTP 404 for CVE-2026-12345"),
+            ) as generate:
+                result = run_auto_workflow(
+                    "CVE-2026-12345", root, None, None, None,
+                    "key", "model", False, max_attempts=4, progress=lambda _: None,
                 )
 
             self.assertFalse(result["ok"])
