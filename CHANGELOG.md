@@ -50,6 +50,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A Nuxt lab was refused for `adapter/fixture/app/pages/admin/[slug].vue`,
+  the only way Nuxt names that route. An adapter path may now carry the
+  characters file-based routers use: `[slug]`, `[...all]`, `(group)`,
+  `@modal`, `+page.svelte`, `posts.$id.tsx`, `[id=int]`. Characters no
+  platform can hold in a name are still refused, and so is leaving the
+  lab directory.
 - A lab could pass by reading the fix out of the source instead of running
   it. An Electron lab returned
   `readFileSync(guest-window-manager.ts).includes('if (navigate) {')` as its

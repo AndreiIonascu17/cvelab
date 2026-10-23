@@ -237,6 +237,24 @@ class AdapterTreeTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(self.allowed(path))
 
+    def test_file_based_routes_are_allowed(self) -> None:
+        for path in (
+            "adapter/fixture/app/pages/admin/[slug].vue",
+            "adapter/site/src/pages/[...all].astro",
+            "adapter/app/(group)/@modal/[[...rest]]/page.tsx",
+            "adapter/kit/src/routes/+page.svelte",
+            "adapter/remix/app/routes/posts.$id.tsx",
+            "adapter/kit/src/routes/[id=int]/+page.ts",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(self.allowed(path))
+
+    def test_names_no_platform_can_hold_are_still_refused(self) -> None:
+        for path in ("adapter/a b.js", "adapter/a:b.js", "adapter/a*b", "adapter/a?b", "adapter/a|b",
+                     'adapter/a"b', "adapter/a<b>", "adapter/a\\b.js"):
+            with self.subTest(path=path):
+                self.assertFalse(self.allowed(path))
+
     def test_escaping_the_directory_is_still_refused(self) -> None:
         for path in ("../etc/passwd", "/etc/passwd", "adapter/../../x", "adapter/"):
             with self.subTest(path=path):
