@@ -33,7 +33,7 @@ from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
-from . import policy, progress, research
+from . import policy, progress, releases, research
 from .ai import (
     ai_is_configured,
     provider_supports_web_search,
@@ -1578,6 +1578,8 @@ def generate_source_lab(
             "plan": plan,
         }
     context = _prompt_context(repository, vulnerable, fixed, dossier, hint, listing, brief, context_limit)
+    published = releases.find_releases(cve)
+    context += releases.render(published)
     def _ask(refused: str) -> dict:
         return structured_response(
             api_key=api_key,
@@ -1695,6 +1697,7 @@ def generate_source_lab(
     }
     write_text(lab_dir / "dossier.json", json.dumps(dossier, indent=2, ensure_ascii=True) + "\n")
     plan["contract_refusals"] = refusals
+    plan["published_releases"] = published
     write_text(lab_dir / "plan.json", json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
     write_text(lab_dir / "validator" / "plan.json", json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
     return {"ok": True, "status": "GENERATED_UNVALIDATED", "lab_dir": str(lab_dir), "plan": plan}
@@ -1828,6 +1831,7 @@ def repair_source_lab(
         repository, vulnerable, fixed or vulnerable, dossier, hint, listing, brief,
         30000 if local_provider else research.prompt_budget(False) * 5 // 8,
     )
+    context += releases.render(plan.get("published_releases") or [])
     current = json.dumps(
         _repair_material(lab_dir, 24000 if local_provider else 120000), ensure_ascii=True, indent=2
     )

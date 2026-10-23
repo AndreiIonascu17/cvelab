@@ -412,6 +412,7 @@ class SourceLabResearchTests(unittest.TestCase):
             mock.patch.object(sourcegen, "collect_cve", return_value=dossier),
             mock.patch.object(sourcegen, "resolve_source", return_value=(self.URL, self.fixed)),
             mock.patch.object(sourcegen, "_enforce_compose_policy"),
+            mock.patch.object(sourcegen.releases, "find_releases", return_value=[]),
             mock.patch.object(sourcegen, "structured_response", side_effect=self.model),
             mock.patch.object(research, "structured_response", side_effect=self.model),
         ]
