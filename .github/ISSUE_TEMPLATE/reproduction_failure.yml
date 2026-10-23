@@ -88,6 +88,6 @@ body:
     attributes:
       label: Environment
       description: CVELab version, OS, Python version, Docker version.
-      placeholder: "cvelab 0.6.4, Debian 13, Python 3.13.2, Docker 28.1.1"
+      placeholder: "cvelab 0.6.5, Debian 13, Python 3.13.2, Docker 28.1.1"
     validations:
       required: true
