@@ -188,10 +188,16 @@ GITLAB_COMMIT = re.compile(
 # adapter/vulnerable/package.json. Depth is not what makes a path unsafe;
 # escaping the directory is, and that is still refused by the absolute and
 # ".." checks at the call site.
+#
+# A name may also carry the characters file-based routers give meaning to:
+# [slug].vue and [...all].astro, (group)/@modal/page.tsx, +page.svelte,
+# posts.$id.tsx, [id=int]. A Nuxt lab was refused for
+# adapter/fixture/app/pages/admin/[slug].vue, which is the only way Nuxt
+# spells that route. All of them are valid file names on Windows too.
 ALLOWED_GENERATED = re.compile(
     r"^(docker-compose\.yml|\.dockerignore|(?:vulnerable|patched)/Dockerfile|"
     r"validator/(?:Dockerfile|validator\.py|requirements\.txt)|"
-    r"adapter/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)$"
+    r"adapter/[A-Za-z0-9_.\-\[\]()@+$=~]+(?:/[A-Za-z0-9_.\-\[\]()@+$=~]+)*)$"
 )
 FORBIDDEN = {
     "privileged:": "privileged containers",
