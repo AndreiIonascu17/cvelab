@@ -48,6 +48,8 @@ class VersionTests(unittest.TestCase):
         self.assertFalse(releases.in_range("1.169.39", ">= 1.143.12, < 1.169.39"))
         self.assertTrue(releases.in_range("19.2.25", "<= 19.2.25"))
         self.assertFalse(releases.in_range("1.0.0", ""))
+        self.assertTrue(releases.in_range("10.75.1", ">= 10.0.0-alpha.0, < 10.75.2"))
+        self.assertFalse(releases.in_range("11.0.0", ">= 11.0.0-alpha.0, < 11.0.0-rc.1"))
 
 
 class PickTests(unittest.TestCase):
