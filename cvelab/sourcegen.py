@@ -29,6 +29,7 @@ import tarfile
 import urllib.error
 import urllib.request
 import uuid
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
@@ -1279,6 +1280,49 @@ def _prompt_context(
     ) + brief_text
 
 
+def contract_retries() -> int:
+    """How often an answer refused before the build is asked for again (CVELAB_CONTRACT_RETRIES)."""
+    raw = os.getenv("CVELAB_CONTRACT_RETRIES", "").strip()
+    try:
+        value = int(raw) if raw else 2
+    except ValueError:
+        value = 2
+    return max(0, min(value, 5))
+
+
+def _answer_until_valid(
+    ask: Callable[[str], dict], check: Callable[[dict], list[dict]]
+) -> tuple[dict, list[dict], list[str]]:
+    """Ask the model, and ask again while its answer breaks the lab contract.
+
+    The contract is everything checked before Docker runs: the file layout,
+    the build inputs, variant parity, fidelity and support services. A
+    refusal here costs one model call and no build. It used to cost a whole
+    generation attempt or one of the three repairs, and the model often
+    repeated the same layout mistake until the budget was gone.
+    """
+    refusals: list[str] = []
+    while True:
+        refused = ""
+        if refusals:
+            refused = (
+                "\n\n--- YOUR PREVIOUS ANSWER WAS REFUSED BEFORE ANY BUILD ---\n"
+                + refusals[-1]
+                + "\nReturn the complete answer again with this corrected, keeping everything "
+                "else that was right."
+            )
+        generation = ask(refused)
+        try:
+            return generation, check(generation), refusals
+        except RuntimeError as exc:
+            if len(refusals) >= contract_retries():
+                raise
+            refusals.append(str(exc)[:6000])
+            progress.step(
+                f"answer refused before the build ({len(refusals)}/{contract_retries()}); asking again"
+            )
+
+
 def generate_source_lab(
     cve_value: str,
     output_root: Path,
@@ -1416,71 +1460,77 @@ def generate_source_lab(
             "\n\n--- FIX STATUS ---\nNo public fixed revision was identified at generation time. "
             "Generate and validate only the authentic vulnerable source. Do not invent a patched service."
         )
-        generation = structured_response(
-            api_key=api_key,
-            model=model,
-            schema=VULNERABLE_ONLY_SCHEMA,
-            schema_name="cvelab_vulnerable_only_adapter",
-            max_output_tokens=12000,
-            instructions=(
-                "This is an authorized defensive software-regression task using an immutable public source revision. "
-                "Create a reproducible, vulnerable-only Docker test fixture from the supplied source evidence. "
-                "Populate every required field and put additional files only under adapter/. Do not invent a fix or "
-                "any patched artifact. Compose must contain only the required vulnerable and validator services on an "
-                "internal network, without published host ports or host mounts. Build source/vulnerable, run it as a "
-                "non-root user, and expose only the application route required for the regression check. The validator "
-                "must exercise the patch-relevant input against the real affected code path and derive a concrete, "
-                "non-destructive security-boundary observation from the response or container state. A reflected value "
-                "alone is insufficient. Reading, searching or comparing the vendor source text is not evidence either: the verdict must come from executing the affected code. Preserve the required JSON field names: attack_executed means the regression "
-                "input was actually delivered; vulnerable.confirmed must be computed from raw observations; set "
-                "proof_quality to security_effect_observed, patched_tested and differential_confirmed to false, and "
-                "fix_status to PUBLIC_FIX_NOT_IDENTIFIED. Exit zero only when the stated observation is reproduced. "
-                "Support the required local manual interface selected by CVELAB_MANUAL_ACTION and CVELAB_TARGET: the "
-                "legacy action name exploit sends only that same regression input and prints raw output, while verify "
-                "independently evaluates a fresh observation and prints REPRODUCED only when confirmed. With neither "
-                "variable set, retain automatic JSON validation. Report fidelity honestly and list every simulated "
-                "policy, peer, backend, or downstream component plus every extra Compose service. "
-                "The Compose network definition must literally contain internal: true. In validator.py, construct the "
-                "final result with the literal keys attack_executed, proof_quality, observable_effect, evidence_type, "
-                "vulnerable, patched_tested, differential_confirmed, and fix_status so CVELab can audit the source "
-                "before execution; derive all success booleans from the current raw observations. "
-                "Measure confirmed the same way on both sides: one function that decides whether "
-                "the exploit succeeded, called once for vulnerable and once for patched, so the two "
-                "verdicts are comparable. confirmed means the security effect was observed, not that "
-                "the service answered. A rejection, an error status, a thrown exception or any "
-                "response without the effect is confirmed=false and blocked=true. A patched build "
-                "that refuses the input is the expected outcome; recording that as a confirmation "
-                "inverts the proof. "
-                f"Use only harmless canary data ({marker}) inside the isolated containers. Do not add arbitrary target "
-                "selection, external connectivity, host integration, elevated container permissions, sensitive-data "
-                "access, or lasting system changes. Normalize copied scripts to LF. Source archives contain no .git "
-                "directory, so initialize a local repository without a remote only when the build requires it. "
-                "Healthchecks must verify the final application route and must not accept redirects as healthy."
-            ),
-            input_text=context + feedback_suffix,
-            provider=provider,
-            base_url=base_url,
-        )
-        generated_files = [
-            {
-                "path": "docker-compose.yml",
-                "content": _canonicalize_compose_builds(
-                    generation["docker_compose"], vulnerable_only=True
+        def _ask(refused: str) -> dict:
+            return structured_response(
+                api_key=api_key,
+                model=model,
+                schema=VULNERABLE_ONLY_SCHEMA,
+                schema_name="cvelab_vulnerable_only_adapter",
+                max_output_tokens=12000,
+                instructions=(
+                    "This is an authorized defensive software-regression task using an immutable public source revision. "
+                    "Create a reproducible, vulnerable-only Docker test fixture from the supplied source evidence. "
+                    "Populate every required field and put additional files only under adapter/. Do not invent a fix or "
+                    "any patched artifact. Compose must contain only the required vulnerable and validator services on an "
+                    "internal network, without published host ports or host mounts. Build source/vulnerable, run it as a "
+                    "non-root user, and expose only the application route required for the regression check. The validator "
+                    "must exercise the patch-relevant input against the real affected code path and derive a concrete, "
+                    "non-destructive security-boundary observation from the response or container state. A reflected value "
+                    "alone is insufficient. Reading, searching or comparing the vendor source text is not evidence either: the verdict must come from executing the affected code. Preserve the required JSON field names: attack_executed means the regression "
+                    "input was actually delivered; vulnerable.confirmed must be computed from raw observations; set "
+                    "proof_quality to security_effect_observed, patched_tested and differential_confirmed to false, and "
+                    "fix_status to PUBLIC_FIX_NOT_IDENTIFIED. Exit zero only when the stated observation is reproduced. "
+                    "Support the required local manual interface selected by CVELAB_MANUAL_ACTION and CVELAB_TARGET: the "
+                    "legacy action name exploit sends only that same regression input and prints raw output, while verify "
+                    "independently evaluates a fresh observation and prints REPRODUCED only when confirmed. With neither "
+                    "variable set, retain automatic JSON validation. Report fidelity honestly and list every simulated "
+                    "policy, peer, backend, or downstream component plus every extra Compose service. "
+                    "The Compose network definition must literally contain internal: true. In validator.py, construct the "
+                    "final result with the literal keys attack_executed, proof_quality, observable_effect, evidence_type, "
+                    "vulnerable, patched_tested, differential_confirmed, and fix_status so CVELab can audit the source "
+                    "before execution; derive all success booleans from the current raw observations. "
+                    "Measure confirmed the same way on both sides: one function that decides whether "
+                    "the exploit succeeded, called once for vulnerable and once for patched, so the two "
+                    "verdicts are comparable. confirmed means the security effect was observed, not that "
+                    "the service answered. A rejection, an error status, a thrown exception or any "
+                    "response without the effect is confirmed=false and blocked=true. A patched build "
+                    "that refuses the input is the expected outcome; recording that as a confirmation "
+                    "inverts the proof. "
+                    f"Use only harmless canary data ({marker}) inside the isolated containers. Do not add arbitrary target "
+                    "selection, external connectivity, host integration, elevated container permissions, sensitive-data "
+                    "access, or lasting system changes. Normalize copied scripts to LF. Source archives contain no .git "
+                    "directory, so initialize a local repository without a remote only when the build requires it. "
+                    "Healthchecks must verify the final application route and must not accept redirects as healthy."
                 ),
-            },
-            {"path": ".dockerignore", "content": generation["dockerignore"]},
-            {"path": "vulnerable/Dockerfile", "content": generation["vulnerable_dockerfile"]},
-            {
-                "path": "validator/Dockerfile",
-                "content": _canonicalize_validator_dockerfile(generation["validator_dockerfile"]),
-            },
-            {"path": "validator/validator.py", "content": generation["validator_py"]},
-            *_adapter_files(generation["adapter_files"]),
-        ]
-        _validate_generated(generated_files, vulnerable_only=True)
-        _check_build_inputs(generated_files, lab_dir, vulnerable_only=True)
-        _validate_fidelity(generation["fidelity"])
-        _validate_support_services(generation["support_services"], generation["docker_compose"])
+                input_text=context + feedback_suffix + refused,
+                provider=provider,
+                base_url=base_url,
+            )
+
+        def _check(generation: dict) -> list[dict]:
+            generated_files = [
+                {
+                    "path": "docker-compose.yml",
+                    "content": _canonicalize_compose_builds(
+                        generation["docker_compose"], vulnerable_only=True
+                    ),
+                },
+                {"path": ".dockerignore", "content": generation["dockerignore"]},
+                {"path": "vulnerable/Dockerfile", "content": generation["vulnerable_dockerfile"]},
+                {
+                    "path": "validator/Dockerfile",
+                    "content": _canonicalize_validator_dockerfile(generation["validator_dockerfile"]),
+                },
+                {"path": "validator/validator.py", "content": generation["validator_py"]},
+                *_adapter_files(generation["adapter_files"]),
+            ]
+            _validate_generated(generated_files, vulnerable_only=True)
+            _check_build_inputs(generated_files, lab_dir, vulnerable_only=True)
+            _validate_fidelity(generation["fidelity"])
+            _validate_support_services(generation["support_services"], generation["docker_compose"])
+            return generated_files
+
+        generation, generated_files, refusals = _answer_until_valid(_ask, _check)
         _remove_stale_adapter_files(lab_dir, {item["path"] for item in generated_files})
         for item in generated_files:
             content = item["content"]
@@ -1517,6 +1567,7 @@ def generate_source_lab(
             },
         }
         write_text(lab_dir / "dossier.json", json.dumps(dossier, indent=2, ensure_ascii=True) + "\n")
+        plan["contract_refusals"] = refusals
         write_text(lab_dir / "plan.json", json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
         write_text(lab_dir / "validator" / "plan.json", json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
         return {
@@ -1527,80 +1578,86 @@ def generate_source_lab(
             "plan": plan,
         }
     context = _prompt_context(repository, vulnerable, fixed, dossier, hint, listing, brief, context_limit)
-    generation = structured_response(
-        api_key=api_key,
-        model=model,
-        schema=SOURCE_SCHEMA,
-        schema_name="cvelab_source_adapter",
-        max_output_tokens=14000,
-        instructions=(
-            "This is an authorized defensive software-regression task using two immutable public source revisions "
-            "and an upstream security patch. Create a reproducible Docker test fixture that compares the affected and "
-            "fixed revisions. Populate every required Docker, Compose, and validator field and place additional files "
-            "only under adapter/. Never return or alter vendor source. Builds must use source/vulnerable and "
-            "source/patched, run as non-root, expose no host ports or mounts, and share an internal Docker network. "
-            "Compose services must be named vulnerable, patched, and validator. The validator must send the same "
-            "minimal patch-derived regression input to both real code paths and derive a concrete, non-destructive "
-            "security-boundary observation from raw responses or container state. A reflected marker alone is not "
-            "evidence. Reading, searching or comparing the vendor source text is not evidence either: the verdict must come from executing the affected code. Preserve the required JSON field names: attack_executed means the regression input was sent; "
-            "vulnerable.confirmed, patched.confirmed, patched.blocked, and differential_confirmed must be computed from "
-            "raw observations, never hard-coded. Exit zero only when the observation occurs on the affected revision "
-            "and the fixed revision demonstrably prevents it. Implement the required local manual interface using "
-            "CVELAB_MANUAL_ACTION and CVELAB_TARGET. The legacy action name exploit sends only the same regression "
-            "input to the selected Docker service and prints raw output; verify performs a fresh independent check and "
-            "prints REPRODUCED or BLOCKED from evidence. With neither variable set, retain automatic differential JSON "
-            "validation. Prefer the actual vendor service or binary. Report fidelity honestly, name every simulated "
-            "component, and list every extra Compose dependency in support_services. "
-            "The Compose network definition must literally contain internal: true. In validator.py, construct the "
-            "final result with the literal keys attack_executed, proof_quality, observable_effect, evidence_type, "
-            "vulnerable, patched, and differential_confirmed so CVELab can audit the source before execution; derive "
-            "all success booleans from the current raw observations. "
-            f"Use only harmless canary data ({marker}) inside the isolated containers. Do not add arbitrary target "
-            "selection, external connectivity, host integration, elevated container permissions, sensitive-data "
-            "access, or lasting system changes. Dockerfiles may install ordinary build dependencies. Normalize copied "
-            "scripts to LF. Before using a Gradle wrapper, verify that its JAR exists; otherwise install the exact "
-            "declared Gradle version. "
-            "Measure confirmed the same way on both sides: one function that decides whether "
-            "the exploit succeeded, called once for vulnerable and once for patched, so the two "
-            "verdicts are comparable. confirmed means the security effect was observed, not that "
-            "the service answered. A rejection, an error status, a thrown exception or any "
-            "response without the effect is confirmed=false and blocked=true. A patched build "
-            "that refuses the input is the expected outcome; recording that as a confirmation "
-            "inverts the proof. "
-            "Source archives have no .git directory, so initialize a local repository without "
-            "a remote only if build logic requires it. Healthchecks and the validator must use the final application "
-            "scheme, port, and route, and redirects must not count as healthy. "
-            "Build contexts are fixed: vulnerable and patched build from the lab directory, where the vendor "
-            "snapshots are source/vulnerable and source/patched and adapter/ holds only the adapter files you "
-            "return; the validator builds from validator/ alone, so its Dockerfile can copy only validator.py and "
-            "requirements.txt. Every COPY source must exist in its context. vulnerable/Dockerfile and "
-            "patched/Dockerfile, and their Compose services, must be identical except for the snapshot they "
-            "copy, labels carrying their own name, package versions and commit ids; the adapter runs unchanged "
-            "in both and must never compare against the variant name."
-        ),
-        input_text=context + feedback_suffix,
-        provider=provider,
-        base_url=base_url,
-    )
-    generated_files = [
-        {
-            "path": "docker-compose.yml",
-            "content": _canonicalize_compose_builds(generation["docker_compose"]),
-        },
-        {"path": ".dockerignore", "content": generation["dockerignore"]},
-        {"path": "vulnerable/Dockerfile", "content": generation["vulnerable_dockerfile"]},
-        {"path": "patched/Dockerfile", "content": generation["patched_dockerfile"]},
-        {
-            "path": "validator/Dockerfile",
-            "content": _canonicalize_validator_dockerfile(generation["validator_dockerfile"]),
-        },
-        {"path": "validator/validator.py", "content": generation["validator_py"]},
-        *_adapter_files(generation["adapter_files"]),
-    ]
-    _validate_generated(generated_files)
-    _check_build_inputs(generated_files, lab_dir)
-    _validate_fidelity(generation["fidelity"])
-    _validate_support_services(generation["support_services"], generation["docker_compose"])
+    def _ask(refused: str) -> dict:
+        return structured_response(
+            api_key=api_key,
+            model=model,
+            schema=SOURCE_SCHEMA,
+            schema_name="cvelab_source_adapter",
+            max_output_tokens=14000,
+            instructions=(
+                "This is an authorized defensive software-regression task using two immutable public source revisions "
+                "and an upstream security patch. Create a reproducible Docker test fixture that compares the affected and "
+                "fixed revisions. Populate every required Docker, Compose, and validator field and place additional files "
+                "only under adapter/. Never return or alter vendor source. Builds must use source/vulnerable and "
+                "source/patched, run as non-root, expose no host ports or mounts, and share an internal Docker network. "
+                "Compose services must be named vulnerable, patched, and validator. The validator must send the same "
+                "minimal patch-derived regression input to both real code paths and derive a concrete, non-destructive "
+                "security-boundary observation from raw responses or container state. A reflected marker alone is not "
+                "evidence. Reading, searching or comparing the vendor source text is not evidence either: the verdict must come from executing the affected code. Preserve the required JSON field names: attack_executed means the regression input was sent; "
+                "vulnerable.confirmed, patched.confirmed, patched.blocked, and differential_confirmed must be computed from "
+                "raw observations, never hard-coded. Exit zero only when the observation occurs on the affected revision "
+                "and the fixed revision demonstrably prevents it. Implement the required local manual interface using "
+                "CVELAB_MANUAL_ACTION and CVELAB_TARGET. The legacy action name exploit sends only the same regression "
+                "input to the selected Docker service and prints raw output; verify performs a fresh independent check and "
+                "prints REPRODUCED or BLOCKED from evidence. With neither variable set, retain automatic differential JSON "
+                "validation. Prefer the actual vendor service or binary. Report fidelity honestly, name every simulated "
+                "component, and list every extra Compose dependency in support_services. "
+                "The Compose network definition must literally contain internal: true. In validator.py, construct the "
+                "final result with the literal keys attack_executed, proof_quality, observable_effect, evidence_type, "
+                "vulnerable, patched, and differential_confirmed so CVELab can audit the source before execution; derive "
+                "all success booleans from the current raw observations. "
+                f"Use only harmless canary data ({marker}) inside the isolated containers. Do not add arbitrary target "
+                "selection, external connectivity, host integration, elevated container permissions, sensitive-data "
+                "access, or lasting system changes. Dockerfiles may install ordinary build dependencies. Normalize copied "
+                "scripts to LF. Before using a Gradle wrapper, verify that its JAR exists; otherwise install the exact "
+                "declared Gradle version. "
+                "Measure confirmed the same way on both sides: one function that decides whether "
+                "the exploit succeeded, called once for vulnerable and once for patched, so the two "
+                "verdicts are comparable. confirmed means the security effect was observed, not that "
+                "the service answered. A rejection, an error status, a thrown exception or any "
+                "response without the effect is confirmed=false and blocked=true. A patched build "
+                "that refuses the input is the expected outcome; recording that as a confirmation "
+                "inverts the proof. "
+                "Source archives have no .git directory, so initialize a local repository without "
+                "a remote only if build logic requires it. Healthchecks and the validator must use the final application "
+                "scheme, port, and route, and redirects must not count as healthy. "
+                "Build contexts are fixed: vulnerable and patched build from the lab directory, where the vendor "
+                "snapshots are source/vulnerable and source/patched and adapter/ holds only the adapter files you "
+                "return; the validator builds from validator/ alone, so its Dockerfile can copy only validator.py and "
+                "requirements.txt. Every COPY source must exist in its context. vulnerable/Dockerfile and "
+                "patched/Dockerfile, and their Compose services, must be identical except for the snapshot they "
+                "copy, labels carrying their own name, package versions and commit ids; the adapter runs unchanged "
+                "in both and must never compare against the variant name."
+            ),
+            input_text=context + feedback_suffix + refused,
+            provider=provider,
+            base_url=base_url,
+        )
+
+    def _check(generation: dict) -> list[dict]:
+        generated_files = [
+            {
+                "path": "docker-compose.yml",
+                "content": _canonicalize_compose_builds(generation["docker_compose"]),
+            },
+            {"path": ".dockerignore", "content": generation["dockerignore"]},
+            {"path": "vulnerable/Dockerfile", "content": generation["vulnerable_dockerfile"]},
+            {"path": "patched/Dockerfile", "content": generation["patched_dockerfile"]},
+            {
+                "path": "validator/Dockerfile",
+                "content": _canonicalize_validator_dockerfile(generation["validator_dockerfile"]),
+            },
+            {"path": "validator/validator.py", "content": generation["validator_py"]},
+            *_adapter_files(generation["adapter_files"]),
+        ]
+        _validate_generated(generated_files)
+        _check_build_inputs(generated_files, lab_dir)
+        _validate_fidelity(generation["fidelity"])
+        _validate_support_services(generation["support_services"], generation["docker_compose"])
+        return generated_files
+
+    generation, generated_files, refusals = _answer_until_valid(_ask, _check)
 
     _remove_stale_adapter_files(lab_dir, {item["path"] for item in generated_files})
     for item in generated_files:
@@ -1637,6 +1694,7 @@ def generate_source_lab(
         },
     }
     write_text(lab_dir / "dossier.json", json.dumps(dossier, indent=2, ensure_ascii=True) + "\n")
+    plan["contract_refusals"] = refusals
     write_text(lab_dir / "plan.json", json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
     write_text(lab_dir / "validator" / "plan.json", json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
     return {"ok": True, "status": "GENERATED_UNVALIDATED", "lab_dir": str(lab_dir), "plan": plan}
@@ -1781,75 +1839,82 @@ def repair_source_lab(
         "Send the identical patch-derived regression input to vulnerable and patched services. Success requires the effect on "
         "vulnerable, its absence on patched, patched.blocked=true, and differential_confirmed=true."
     )
-    generation = structured_response(
-        api_key=api_key,
-        model=model,
-        schema=VULNERABLE_ONLY_SCHEMA if vulnerable_only else SOURCE_SCHEMA,
-        schema_name="cvelab_autonomous_adapter_repair",
-        max_output_tokens=16000,
-        instructions=(
-            "Repair a complete authorized, local-only defensive security-regression fixture. The observed failure and "
-            "container logs are authoritative: identify their root cause and return a full replacement, not a patch. "
-            "Do not repeat the failing design when the diagnostics disprove it. Build and run the supplied immutable "
-            "vendor source snapshots; never modify or return vendor source. Prefer the actual vendor service or binary. "
-            "Build contexts are fixed: vulnerable and patched build from the lab directory, where the vendor "
-            "snapshots are source/vulnerable and source/patched and adapter/ holds only the adapter files you "
-            "return; the validator builds from validator/ alone, so its Dockerfile can copy only validator.py and "
-            "requirements.txt. Every COPY source must exist in its context. vulnerable/Dockerfile and "
-            "patched/Dockerfile, and their Compose services, must be identical except for the snapshot they "
-            "copy, labels carrying their own name, package versions and commit ids; the adapter runs unchanged "
-            "in both and must never compare against the variant name. "
-            "Use source_component only if launching the product is genuinely impractical, vendor_service when the real "
-            "service starts with simulated surrounding components, and product_end_to_end only when the complete "
-            "security-relevant product path executes. Disclose every simulated component. Compose must use an internal "
-            "network, no host ports or mounts, services named vulnerable, patched where applicable, and validator, and "
-            "list all extra services in support_services. Run containers non-root with no-new-privileges. The automatic "
-            "validator must deliver the same patch-derived regression input, derive its booleans from raw observations, print one JSON document with "
-            "attack_executed, proof_quality=security_effect_observed, observable_effect, evidence_type, vulnerable, and "
-            "the required comparison fields, and exit zero only on genuine proof. It must also support independently "
-            "runnable CVELAB_MANUAL_ACTION=exploit|verify and CVELAB_TARGET=vulnerable|patched modes; the legacy exploit action prints raw "
-            "evidence and verify prints REPRODUCED or BLOCKED only after evaluating a fresh request. Never hard-code a "
-            "successful result or treat canary reflection alone as proof. Reading, searching or comparing the vendor source text is not evidence either: the verdict must come from executing the affected code. Preserve the regression contract unless runtime "
-            "evidence shows it is technically wrong. Keep all interaction inside the internal Docker network, accept "
-            "only fixed service names, use harmless canary data, and add no host integration, elevated permissions, "
-            "sensitive-data access, external connectivity, or lasting system changes. "
-            + variant_contract
-        ),
-        input_text=(
-            context
-            + "\n\n--- FAILED ADAPTER ---\n"
-            + current
-            + "\n\n--- OBSERVED FAILURE (AUTOMATIC ATTEMPT "
-            + str(attempt)
-            + ") ---\n"
-            + diagnostic
-        ),
-        provider=provider,
-        base_url=base_url,
-    )
-    compose = _canonicalize_compose_builds(
-        generation["docker_compose"], vulnerable_only=vulnerable_only
-    )
-    generated_files = [
-        {"path": "docker-compose.yml", "content": compose},
-        {"path": ".dockerignore", "content": generation["dockerignore"]},
-        {"path": "vulnerable/Dockerfile", "content": generation["vulnerable_dockerfile"]},
-        {
-            "path": "validator/Dockerfile",
-            "content": _canonicalize_validator_dockerfile(generation["validator_dockerfile"]),
-        },
-        {"path": "validator/validator.py", "content": generation["validator_py"]},
-    ]
-    if not vulnerable_only:
-        generated_files.insert(
-            3,
-            {"path": "patched/Dockerfile", "content": generation["patched_dockerfile"]},
+    def _ask(refused: str) -> dict:
+        return structured_response(
+            api_key=api_key,
+            model=model,
+            schema=VULNERABLE_ONLY_SCHEMA if vulnerable_only else SOURCE_SCHEMA,
+            schema_name="cvelab_autonomous_adapter_repair",
+            max_output_tokens=16000,
+            instructions=(
+                "Repair a complete authorized, local-only defensive security-regression fixture. The observed failure and "
+                "container logs are authoritative: identify their root cause and return a full replacement, not a patch. "
+                "Do not repeat the failing design when the diagnostics disprove it. Build and run the supplied immutable "
+                "vendor source snapshots; never modify or return vendor source. Prefer the actual vendor service or binary. "
+                "Build contexts are fixed: vulnerable and patched build from the lab directory, where the vendor "
+                "snapshots are source/vulnerable and source/patched and adapter/ holds only the adapter files you "
+                "return; the validator builds from validator/ alone, so its Dockerfile can copy only validator.py and "
+                "requirements.txt. Every COPY source must exist in its context. vulnerable/Dockerfile and "
+                "patched/Dockerfile, and their Compose services, must be identical except for the snapshot they "
+                "copy, labels carrying their own name, package versions and commit ids; the adapter runs unchanged "
+                "in both and must never compare against the variant name. "
+                "Use source_component only if launching the product is genuinely impractical, vendor_service when the real "
+                "service starts with simulated surrounding components, and product_end_to_end only when the complete "
+                "security-relevant product path executes. Disclose every simulated component. Compose must use an internal "
+                "network, no host ports or mounts, services named vulnerable, patched where applicable, and validator, and "
+                "list all extra services in support_services. Run containers non-root with no-new-privileges. The automatic "
+                "validator must deliver the same patch-derived regression input, derive its booleans from raw observations, print one JSON document with "
+                "attack_executed, proof_quality=security_effect_observed, observable_effect, evidence_type, vulnerable, and "
+                "the required comparison fields, and exit zero only on genuine proof. It must also support independently "
+                "runnable CVELAB_MANUAL_ACTION=exploit|verify and CVELAB_TARGET=vulnerable|patched modes; the legacy exploit action prints raw "
+                "evidence and verify prints REPRODUCED or BLOCKED only after evaluating a fresh request. Never hard-code a "
+                "successful result or treat canary reflection alone as proof. Reading, searching or comparing the vendor source text is not evidence either: the verdict must come from executing the affected code. Preserve the regression contract unless runtime "
+                "evidence shows it is technically wrong. Keep all interaction inside the internal Docker network, accept "
+                "only fixed service names, use harmless canary data, and add no host integration, elevated permissions, "
+                "sensitive-data access, external connectivity, or lasting system changes. "
+                + variant_contract
+            ),
+            input_text=(
+                context
+                + "\n\n--- FAILED ADAPTER ---\n"
+                + current
+                + "\n\n--- OBSERVED FAILURE (AUTOMATIC ATTEMPT "
+                + str(attempt)
+                + ") ---\n"
+                + diagnostic
+                + refused
+            ),
+            provider=provider,
+            base_url=base_url,
         )
-    generated_files.extend(_adapter_files(generation["adapter_files"]))
-    _validate_generated(generated_files, vulnerable_only=vulnerable_only)
-    _check_build_inputs(generated_files, lab_dir, vulnerable_only=vulnerable_only)
-    _validate_fidelity(generation["fidelity"])
-    _validate_support_services(generation["support_services"], compose)
+
+    def _check(generation: dict) -> list[dict]:
+        compose = _canonicalize_compose_builds(
+            generation["docker_compose"], vulnerable_only=vulnerable_only
+        )
+        generated_files = [
+            {"path": "docker-compose.yml", "content": compose},
+            {"path": ".dockerignore", "content": generation["dockerignore"]},
+            {"path": "vulnerable/Dockerfile", "content": generation["vulnerable_dockerfile"]},
+            {
+                "path": "validator/Dockerfile",
+                "content": _canonicalize_validator_dockerfile(generation["validator_dockerfile"]),
+            },
+            {"path": "validator/validator.py", "content": generation["validator_py"]},
+        ]
+        if not vulnerable_only:
+            generated_files.insert(
+                3,
+                {"path": "patched/Dockerfile", "content": generation["patched_dockerfile"]},
+            )
+        generated_files.extend(_adapter_files(generation["adapter_files"]))
+        _validate_generated(generated_files, vulnerable_only=vulnerable_only)
+        _check_build_inputs(generated_files, lab_dir, vulnerable_only=vulnerable_only)
+        _validate_fidelity(generation["fidelity"])
+        _validate_support_services(generation["support_services"], compose)
+        return generated_files
+
+    generation, generated_files, refusals = _answer_until_valid(_ask, _check)
 
     _remove_stale_adapter_files(lab_dir, {item["path"].replace("\\", "/") for item in generated_files})
     for item in generated_files:
@@ -1858,6 +1923,7 @@ def repair_source_lab(
 
     history = plan.get("generation", {}).get("repair_history", [])
     history.append({
+        "contract_refusals": refusals,
         "attempt": attempt,
         "model": model or os.getenv("CVELAB_MODEL"),
         "provider": resolve_provider(provider),
