@@ -28,7 +28,7 @@ import uuid
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
-from . import policy, progress
+from . import policy, progress, research
 from .ai import (
     ai_is_configured,
     provider_supports_web_search,
@@ -45,6 +45,7 @@ from .core import (
     redact,
     write_text,
 )
+from .research import clip_section as _clip_context_section
 
 SOURCE_SCHEMA = {
     "type": "object",
@@ -71,8 +72,11 @@ SOURCE_SCHEMA = {
                     "enum": ["source_component", "vendor_service", "product_end_to_end"],
                 },
                 "vendor_product_started": {"type": "boolean"},
+                # _validate_fidelity refuses an empty list; saying so here
+                # lets a provider with constrained decoding never produce one,
+                # instead of spending a generation attempt on it.
                 "exercised_vendor_components": {
-                    "type": "array", "items": {"type": "string"},
+                    "type": "array", "minItems": 1, "items": {"type": "string"},
                 },
                 "simulated_components": {
                     "type": "array", "items": {"type": "string"},
@@ -104,14 +108,17 @@ SOURCE_SCHEMA = {
         "patched_dockerfile": {"type": "string", "minLength": 1},
         "validator_dockerfile": {"type": "string", "minLength": 1},
         "validator_py": {"type": "string", "minLength": 1},
+        # A product end to end can need a database, a cache, a queue, a mail
+        # catcher and an identity provider; ten files did not hold a real
+        # project beside its harness. The ceilings are sanity bounds only.
         "support_services": {
             "type": "array",
-            "maxItems": 5,
+            "maxItems": 8,
             "items": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,31}$"},
         },
         "adapter_files": {
             "type": "array",
-            "maxItems": 10,
+            "maxItems": 80,
             "items": {
                 "type": "object",
                 "additionalProperties": False,
@@ -385,24 +392,57 @@ def _snapshot(repository: Path, revision: str, destination: Path) -> None:
         bundle.extractall(destination, filter="data")
 
 
-def _clip_context_section(content: str, limit: int) -> str:
-    if len(content) <= limit:
-        return content
-    marker = "\n... [CVELab truncated this section for the local context window] ...\n"
-    if limit <= len(marker):
-        return content[:max(0, limit)]
-    usable = max(0, limit - len(marker))
-    head = usable * 3 // 4
-    return content[:head] + marker + content[-(usable - head):]
+#: Files whose opening lines are shown beside the fix: they say how the
+#: project is built and what it depends on.
+MANIFEST_NAMES = frozenset({
+    "package.json", "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt",
+    "pom.xml", "build.gradle", "build.gradle.kts", "go.mod", "Cargo.toml", "composer.json",
+    "Makefile", "README.md", "README", "Gemfile",
+})
+#: What else marks a build: the tree sample keeps these ahead of everything
+#: but the fix's own neighbours. A path-ordered sample of php-src's 20,000
+#: files ended inside .github/ and Zend/, before a single config.m4.
+BUILD_NAMES = MANIFEST_NAMES | frozenset({
+    "configure.ac", "configure.in", "config.m4", "config.w32", "CMakeLists.txt", "meson.build",
+    "meson_options.txt", "Makefile.am", "GNUmakefile", "build.sbt", "build.xml", "Dockerfile",
+    "docker-compose.yml", "compose.yaml", "tox.ini", "WORKSPACE", "BUILD.bazel", "mix.exs",
+    "Package.swift", "SConstruct",
+})
+TREE_SAMPLE = 500
+EXCERPT_FILES = 24
 
 
-def _source_context(
-    repository: Path,
-    vulnerable_ref: str,
-    fixed_ref: str,
-    dossier: dict,
-    max_chars: int | None = None,
-) -> str:
+def _tree_sample(tree: list[str], changed: list[str], limit: int = TREE_SAMPLE) -> list[str]:
+    """Up to limit paths of the tree, in its own order.
+
+    Shallow build files first, then the directories the fix touches, then
+    deeper build files, then shallow paths, then the rest.
+    """
+    if len(tree) <= limit:
+        return tree
+    changed_dirs = {PurePosixPath(path).parent for path in changed}
+
+    def rank(item: tuple[int, str]) -> tuple[int, int]:
+        index, path = item
+        pure = PurePosixPath(path)
+        if pure.name in BUILD_NAMES or pure.suffix in {".gemspec", ".csproj", ".cabal"}:
+            group = 0 if len(pure.parts) <= 3 else 2
+        elif pure.parent in changed_dirs:
+            group = 1
+        elif len(pure.parts) <= 2:
+            group = 3
+        else:
+            group = 4
+        return group, index
+
+    chosen = sorted(enumerate(tree), key=rank)[:limit]
+    return [path for _, path in sorted(chosen)]
+
+
+def _fix_listing(
+    repository: Path, vulnerable_ref: str, fixed_ref: str
+) -> tuple[str, list[str], list[str]]:
+    """The fix's diff, the files it changes, and the fixed revision's tree."""
     diff = _run_git(
         ["diff", "--no-ext-diff", "--unified=80", "--end-of-options", vulnerable_ref, fixed_ref],
         cwd=repository,
@@ -413,13 +453,27 @@ def _source_context(
     tree = _run_git(
         ["ls-tree", "-r", "--name-only", "--end-of-options", fixed_ref], cwd=repository
     ).splitlines()
-    useful_names = {
-        "package.json", "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt",
-        "pom.xml", "build.gradle", "build.gradle.kts", "go.mod", "Cargo.toml", "composer.json",
-        "Makefile", "README.md", "README", "Gemfile",
-    }
+    return diff, files, tree
+
+
+def _source_context(
+    repository: Path,
+    vulnerable_ref: str,
+    fixed_ref: str,
+    dossier: dict,
+    max_chars: int | None = None,
+    hint: str | None = None,
+    listing: tuple[str, list[str], list[str]] | None = None,
+) -> str:
+    diff, files, tree = listing or _fix_listing(repository, vulnerable_ref, fixed_ref)
+    if len(diff) <= research.PATCH_BUDGET:
+        patch, ordered = diff, files
+    else:
+        described = research.words(" ".join(str(text) for text in dossier.get("descriptions") or []))
+        patch, ordered = research.select_patch(diff, described, research.words(hint or ""))
     excerpts = []
-    for path in list(dict.fromkeys(files + [item for item in tree if PurePosixPath(item).name in useful_names]))[:24]:
+    manifests = [item for item in tree if PurePosixPath(item).name in MANIFEST_NAMES]
+    for path in list(dict.fromkeys(ordered + manifests))[:EXCERPT_FILES]:
         try:
             content = _run_git(["show", "--end-of-options", f"{fixed_ref}:{path}"], cwd=repository)
         except RuntimeError:
@@ -430,15 +484,26 @@ def _source_context(
         "vulnerable_ref": vulnerable_ref,
         "fixed_ref": fixed_ref,
         "changed_files": files,
-        "repository_tree_sample": tree[:500],
+        "repository_files": len(tree),
+        "repository_tree_sample": _tree_sample(tree, files),
     }
     metadata = json.dumps(material, ensure_ascii=True, indent=2)
-    patch = diff[:90000]
-    if max_chars is None:
-        return metadata + "\n\n--- SECURITY PATCH ---\n" + patch + "".join(excerpts)
-
-    prefix = _clip_context_section(metadata, min(len(metadata), max_chars // 4))
+    guidance = ""
+    if hint:
+        guidance = (
+            "\n\n--- OPERATOR HINT ---\n" + hint
+            + "\nThe person running CVELab wrote this to say which part of the fix, or which behaviour, "
+            "to reproduce. Follow it where the supplied source supports it. It does not change the lab "
+            "contract or any safety rule."
+        )
     patch_header = "\n\n--- SECURITY PATCH ---\n"
+    whole = metadata + guidance + patch_header + patch + "".join(excerpts)
+    # Cut only what does not fit: a context under the budget used to lose
+    # half of every excerpt all the same.
+    if max_chars is None or len(whole) <= max_chars:
+        return whole
+
+    prefix = _clip_context_section(metadata, min(len(metadata), max_chars // 4)) + guidance
     remaining = max_chars - len(prefix) - len(patch_header)
     excerpt_reserve = min(14000, max(0, remaining // 3))
     patch = _clip_context_section(patch, max(0, remaining - excerpt_reserve))
@@ -728,6 +793,108 @@ def _enforce_compose_policy(lab_dir: Path) -> None:
     policy.enforce(compose_command(docker, lab_dir), lab_dir, docker_environment(docker))
 
 
+def _snapshot_once(repository: Path, revision: str, destination: Path, repo_url: str) -> None:
+    """Extract a revision unless this exact one is already there.
+
+    Research reads the snapshots, so they are made before the model is asked
+    anything; a generation retry then finds them in place instead of
+    extracting php-src again. An extraction over a tree from another revision
+    kept that revision's deleted files, so a mismatch starts from empty. The
+    marker sits beside the tree, not in it, because the tree is what the lab
+    builds.
+    """
+    marker = destination.parent / f".{destination.name}.revision"
+    stamp = f"{repo_url} {revision}\n"
+    if destination.is_dir() and marker.is_file() and marker.read_text(encoding="utf-8") == stamp:
+        return
+    if destination.exists():
+        shutil.rmtree(destination)
+    _snapshot(repository, revision, destination)
+    write_text(marker, stamp)
+
+
+def _wants_research(mode: str, listing: tuple[str, list[str], list[str]]) -> bool:
+    """Research before generating when the fix does not fit, or when asked to."""
+    if mode == "off":
+        return False
+    if mode == "on":
+        return True
+    diff, files, _tree = listing
+    return len(diff) > research.PATCH_BUDGET or len(files) > EXCERPT_FILES
+
+
+def _research(
+    *,
+    cve: str,
+    dossier: dict,
+    hint: str | None,
+    repository: Path,
+    vulnerable: str,
+    fixed: str | None,
+    lab_dir: Path,
+    listing: tuple[str, list[str], list[str]],
+    api_key: str | None,
+    model: str | None,
+    provider: str | None,
+    base_url: str | None,
+    rounds: int,
+    situation: str | None = None,
+    prior: dict | None = None,
+) -> dict | None:
+    """Run the research phase over this lab's snapshots and save the brief."""
+    roots = {"vulnerable": lab_dir / "source" / "vulnerable"}
+    if fixed:
+        roots["fixed"] = lab_dir / "source" / "patched"
+    if not all(root.is_dir() for root in roots.values()):
+        return prior
+    diff, files, _tree = listing
+    budget = research.LOCAL if resolve_provider(provider) == "local" else research.HOSTED
+    described = research.words(" ".join(str(text) for text in dossier.get("descriptions") or []))
+    hinted = research.words(hint or "")
+    sections = research.split_diff(diff)
+    workspace = research.Workspace(repository, vulnerable, fixed, roots, files, _run_git)
+    brief = research.research_fix(
+        cve=cve,
+        dossier=dossier,
+        hint=hint,
+        workspace=workspace,
+        index=research.fix_index(
+            sections, research.rank_sections(sections, described, hinted), budget.index
+        ),
+        preview=research.select_patch(diff, described, hinted, budget.preview)[0],
+        overview=workspace.answer(
+            {"kind": "list", "revision": "fixed" if fixed else "vulnerable", "path": ""},
+            budget.overview,
+        ),
+        budget=budget,
+        rounds=rounds,
+        api_key=api_key,
+        model=model,
+        provider=provider,
+        base_url=base_url,
+        situation=situation,
+        prior=prior,
+    )
+    research.save(lab_dir, brief)
+    return brief
+
+
+def _prompt_context(
+    repository: Path,
+    vulnerable: str,
+    fixed: str,
+    dossier: dict,
+    hint: str | None,
+    listing: tuple[str, list[str], list[str]],
+    brief: dict | None,
+    limit: int,
+) -> str:
+    """The source context and the research brief, together within limit."""
+    brief_text = research.render_brief(brief, limit * 2 // 5) if brief else ""
+    return _source_context(
+        repository, vulnerable, fixed, dossier,
+        max_chars=limit - len(brief_text), hint=hint, listing=listing,
+    ) + brief_text
 
 
 def generate_source_lab(
@@ -741,8 +908,12 @@ def generate_source_lab(
     provider: str | None = None,
     base_url: str | None = None,
     generation_feedback: list[str] | None = None,
+    hint: str | None = None,
+    research_mode: str | None = None,
 ) -> dict:
     cve = normalize_cve(cve_value)
+    hint = research.normalize_hint(hint)
+    mode = research.research_mode(research_mode)
     dossier = collect_cve(cve)
     resolved = resolve_source(dossier, repo, fixed_ref)
     vulnerable_only_resolved = None
@@ -826,6 +997,27 @@ def generate_source_lab(
         _run_git(["fetch", "--force", "--end-of-options", "origin", vulnerable], cwd=repository)
     _run_git(["rev-parse", "--verify", "--end-of-options", f"{vulnerable}^{{commit}}"], cwd=repository)
 
+    lab_dir = output_root.resolve() / cve
+    _snapshot_once(repository, vulnerable, lab_dir / "source" / "vulnerable", repo_url)
+    if fixed:
+        _snapshot_once(repository, fixed, lab_dir / "source" / "patched", repo_url)
+    listing = _fix_listing(repository, vulnerable, fixed or vulnerable)
+    brief = None
+    if _wants_research(mode, listing):
+        # A retry in the same run reuses the brief; a fresh run reads anew.
+        saved = research.load(lab_dir) if generation_feedback else None
+        if research.matches(saved, cve, vulnerable, fixed, hint):
+            brief = saved
+        else:
+            brief = _research(
+                cve=cve, dossier=dossier, hint=hint, repository=repository,
+                vulnerable=vulnerable, fixed=fixed, lab_dir=lab_dir, listing=listing,
+                api_key=api_key, model=model, provider=provider, base_url=base_url,
+                rounds=research.research_rounds(),
+            )
+    research_record = {"research": research.summary(brief)} if brief else {}
+    context_limit = research.prompt_budget(resolve_provider(provider) == "local")
+
     marker = "CVELAB-" + uuid.uuid4().hex
     feedback_suffix = ""
     if generation_feedback:
@@ -835,12 +1027,8 @@ def generate_source_lab(
             + "\nReturn a complete replacement adapter that specifically corrects every listed failure."
         )
     if vulnerable_only:
-        context = _source_context(
-            repository,
-            vulnerable,
-            vulnerable,
-            dossier,
-            max_chars=60000 if resolve_provider(provider) == "local" else None,
+        context = _prompt_context(
+            repository, vulnerable, vulnerable, dossier, hint, listing, brief, context_limit
         )
         context += (
             "\n\n--- FIX STATUS ---\nNo public fixed revision was identified at generation time. "
@@ -910,8 +1098,7 @@ def generate_source_lab(
         _validate_generated(generated_files, vulnerable_only=True)
         _validate_fidelity(generation["fidelity"])
         _validate_support_services(generation["support_services"], generation["docker_compose"])
-        lab_dir = output_root.resolve() / cve
-        _snapshot(repository, vulnerable, lab_dir / "source" / "vulnerable")
+        _remove_stale_adapter_files(lab_dir, {item["path"] for item in generated_files})
         for item in generated_files:
             content = item["content"]
             if item["path"] == "docker-compose.yml":
@@ -942,6 +1129,8 @@ def generate_source_lab(
                 "confidence": generation["confidence"],
                 "rationale": generation["rationale"],
                 "discovery_evidence_urls": discovery.get("evidence_urls", []) if discovery else [],
+                **({"hint": hint} if hint else {}),
+                **research_record,
             },
         }
         write_text(lab_dir / "dossier.json", json.dumps(dossier, indent=2, ensure_ascii=True) + "\n")
@@ -954,13 +1143,7 @@ def generate_source_lab(
             "lab_dir": str(lab_dir),
             "plan": plan,
         }
-    context = _source_context(
-        repository,
-        vulnerable,
-        fixed,
-        dossier,
-        max_chars=60000 if resolve_provider(provider) == "local" else None,
-    )
+    context = _prompt_context(repository, vulnerable, fixed, dossier, hint, listing, brief, context_limit)
     generation = structured_response(
         api_key=api_key,
         model=model,
@@ -993,6 +1176,7 @@ def generate_source_lab(
             "selection, external connectivity, host integration, elevated container permissions, sensitive-data "
             "access, or lasting system changes. Dockerfiles may install ordinary build dependencies. Normalize copied "
             "scripts to LF. Before using a Gradle wrapper, verify that its JAR exists; otherwise install the exact "
+            "declared Gradle version. "
             "Measure confirmed the same way on both sides: one function that decides whether "
             "the exploit succeeded, called once for vulnerable and once for patched, so the two "
             "verdicts are comparable. confirmed means the security effect was observed, not that "
@@ -1000,7 +1184,7 @@ def generate_source_lab(
             "response without the effect is confirmed=false and blocked=true. A patched build "
             "that refuses the input is the expected outcome; recording that as a confirmation "
             "inverts the proof. "
-            "declared Gradle version. Source archives have no .git directory, so initialize a local repository without "
+            "Source archives have no .git directory, so initialize a local repository without "
             "a remote only if build logic requires it. Healthchecks and the validator must use the final application "
             "scheme, port, and route, and redirects must not count as healthy."
         ),
@@ -1027,9 +1211,7 @@ def generate_source_lab(
     _validate_fidelity(generation["fidelity"])
     _validate_support_services(generation["support_services"], generation["docker_compose"])
 
-    lab_dir = output_root.resolve() / cve
-    _snapshot(repository, vulnerable, lab_dir / "source" / "vulnerable")
-    _snapshot(repository, fixed, lab_dir / "source" / "patched")
+    _remove_stale_adapter_files(lab_dir, {item["path"] for item in generated_files})
     for item in generated_files:
         write_text(lab_dir / item["path"], item["content"])
     _enforce_compose_policy(lab_dir)
@@ -1058,6 +1240,9 @@ def generate_source_lab(
             "provider": resolve_provider(provider),
             "confidence": generation["confidence"],
             "rationale": generation["rationale"],
+            # A steered run says so, for whoever reviews what it reproduced.
+            **({"hint": hint} if hint else {}),
+            **research_record,
         },
     }
     write_text(lab_dir / "dossier.json", json.dumps(dossier, indent=2, ensure_ascii=True) + "\n")
@@ -1066,8 +1251,43 @@ def generate_source_lab(
     return {"ok": True, "status": "GENERATED_UNVALIDATED", "lab_dir": str(lab_dir), "plan": plan}
 
 
-def _repair_material(lab_dir: Path) -> dict[str, str]:
-    """Return only generated adapter inputs, never the vendor source snapshots."""
+def _adapter_tree(lab_dir: Path) -> list[Path]:
+    """Every regular file under adapter/, at any depth, without following links."""
+    adapter_dir = lab_dir / "adapter"
+    found = []
+    for directory, folders, names in os.walk(adapter_dir):
+        folders[:] = sorted(name for name in folders if not os.path.islink(os.path.join(directory, name)))
+        found.extend(Path(directory) / name for name in names)
+    return sorted(
+        (path for path in found if path.is_file() and not path.is_symlink()),
+        key=lambda path: path.relative_to(adapter_dir).as_posix(),
+    )
+
+
+def _remove_stale_adapter_files(lab_dir: Path, keep: set[str]) -> None:
+    """Delete adapter files a new answer no longer contains, at any depth.
+
+    Only the top level was cleaned, so a nested file from an earlier attempt
+    -- adapter/app/package.json -- stayed in the build context after the
+    answer that wrote it had been replaced.
+    """
+    for path in _adapter_tree(lab_dir):
+        relative = path.relative_to(lab_dir).as_posix()
+        if ALLOWED_GENERATED.fullmatch(relative) and relative not in keep:
+            path.unlink()
+    adapter_dir = lab_dir / "adapter"
+    for directory, _folders, _names in sorted(os.walk(adapter_dir), reverse=True):
+        if Path(directory) != adapter_dir and not os.listdir(directory):
+            os.rmdir(directory)
+
+
+def _repair_material(lab_dir: Path, limit: int = 120000) -> dict[str, str]:
+    """Return only generated adapter inputs, never the vendor source snapshots.
+
+    The whole adapter tree, not only its top level: a repair that could not
+    see adapter/app/server.js answered without it. Files past the limit are
+    named, so the model knows they exist.
+    """
     candidates = [
         lab_dir / "docker-compose.yml",
         lab_dir / ".dockerignore",
@@ -1075,17 +1295,23 @@ def _repair_material(lab_dir: Path) -> dict[str, str]:
         lab_dir / "patched" / "Dockerfile",
         lab_dir / "validator" / "Dockerfile",
         lab_dir / "validator" / "validator.py",
+        *_adapter_tree(lab_dir),
     ]
-    adapter_dir = lab_dir / "adapter"
-    if adapter_dir.is_dir():
-        candidates.extend(sorted(path for path in adapter_dir.iterdir() if path.is_file()))
     material = {}
+    used = 0
     for path in candidates:
         if not path.is_file():
             continue
         relative = path.relative_to(lab_dir).as_posix()
-        if ALLOWED_GENERATED.fullmatch(relative):
-            material[relative] = path.read_text(encoding="utf-8", errors="replace")[:30000]
+        if not ALLOWED_GENERATED.fullmatch(relative):
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")[:30000]
+        size = len(json.dumps(text, ensure_ascii=True))
+        if used + size > limit:
+            material[relative] = "[CVELab: omitted, the failed adapter is larger than this prompt allows]"
+            continue
+        material[relative] = text
+        used += size
     return material
 
 
@@ -1098,6 +1324,7 @@ def repair_source_lab(
     model: str | None,
     provider: str | None = None,
     base_url: str | None = None,
+    research_mode: str | None = None,
 ) -> dict:
     """Regenerate a failed source adapter using its observed runtime diagnostics."""
     cve = normalize_cve(cve_value)
@@ -1127,22 +1354,34 @@ def repair_source_lab(
 
     vulnerable_only = fixed is None
     local_provider = resolve_provider(provider) == "local"
-    context = _source_context(
-        repository,
-        vulnerable,
-        fixed or vulnerable,
-        dossier,
-        max_chars=30000 if local_provider else None,
-    )
+    mode = research.research_mode(research_mode)
+    hint = plan.get("generation", {}).get("hint")
     # Docker and validator output can quote whatever reached a container, and
     # this goes to the provider: redacted before it is cut, so a cut cannot
     # leave half a secret behind.
     diagnostic = redact(json.dumps(failure, ensure_ascii=True, indent=2))[
         :12000 if local_provider else 40000
     ]
-    current = json.dumps(_repair_material(lab_dir), ensure_ascii=True, indent=2)[
-        :24000 if local_provider else 100000
-    ]
+    listing = _fix_listing(repository, vulnerable, fixed or vulnerable)
+    brief = None
+    if mode != "off":
+        saved = research.load(lab_dir)
+        # A failure is the best evidence of what the brief got wrong, so
+        # every repair may read more source before it rewrites the lab.
+        brief = _research(
+            cve=cve, dossier=dossier, hint=hint, repository=repository,
+            vulnerable=vulnerable, fixed=fixed, lab_dir=lab_dir, listing=listing,
+            api_key=api_key, model=model, provider=provider, base_url=base_url,
+            rounds=min(2, research.research_rounds()), situation=diagnostic,
+            prior=saved if research.matches(saved, cve, vulnerable, fixed, hint) else None,
+        )
+    context = _prompt_context(
+        repository, vulnerable, fixed or vulnerable, dossier, hint, listing, brief,
+        30000 if local_provider else research.prompt_budget(False) * 5 // 8,
+    )
+    current = json.dumps(
+        _repair_material(lab_dir, 24000 if local_provider else 120000), ensure_ascii=True, indent=2
+    )
     variant_contract = (
         "This is vulnerable-only: do not create a patched image or service. Emit patched_tested=false, "
         "differential_confirmed=false, and fix_status=PUBLIC_FIX_NOT_IDENTIFIED."
@@ -1213,13 +1452,7 @@ def repair_source_lab(
     _validate_fidelity(generation["fidelity"])
     _validate_support_services(generation["support_services"], compose)
 
-    new_paths = {item["path"].replace("\\", "/") for item in generated_files}
-    adapter_dir = lab_dir / "adapter"
-    if adapter_dir.is_dir():
-        for old_file in adapter_dir.iterdir():
-            relative = old_file.relative_to(lab_dir).as_posix()
-            if old_file.is_file() and ALLOWED_GENERATED.fullmatch(relative) and relative not in new_paths:
-                old_file.unlink()
+    _remove_stale_adapter_files(lab_dir, {item["path"].replace("\\", "/") for item in generated_files})
     for item in generated_files:
         write_text(lab_dir / item["path"], item["content"])
     _enforce_compose_policy(lab_dir)
@@ -1253,6 +1486,7 @@ def repair_source_lab(
         "confidence": generation["confidence"],
         "rationale": generation["rationale"],
         "repair_history": history,
+        **({"research": research.summary(brief)} if brief else {}),
     }
     write_text(plan_path, json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
     write_text(lab_dir / "validator" / "plan.json", json.dumps(plan, indent=2, ensure_ascii=True) + "\n")

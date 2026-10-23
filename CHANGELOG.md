@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A research phase before a lab is written, for a fix that does not fit in
+  one prompt (more than 90,000 characters of diff or more than 24 changed
+  files) and on every repair. The model reads an index of every changed file,
+  with the functions each change is in, and asks for the source it needs: one
+  file's diff with whole functions around each change, a range of lines from
+  either revision, a literal search, or a directory listing. Any file in the
+  repository can be asked for, so a CVE is no longer limited to what fits in
+  one prompt. A repair asks with the failure in front of it. Requests only
+  read, from the lab's source snapshots and its git cache, and no path can
+  leave them. The analysis, the build notes and everything read are saved in
+  `research.json`; `plan.json` records the rounds and requests. `--research
+  auto|on|off` and `CVELAB_RESEARCH` choose when it runs, and
+  `CVELAB_RESEARCH_ROUNDS` (default 3) bounds it.
+- `--hint` on `source`, `source-all` and `auto` tells the model which part of
+  a fix, or which behaviour, to reproduce. It ranks the fix's files too, and
+  is recorded in `plan.json`.
+
+### Changed
+
+- A fix too large for the prompt is ranked rather than cut in path order:
+  files matching the hint, then code before tests and documentation, then by
+  match to the CVE text. A 2.35 MB PHP fix covering two CVEs used to show 74
+  of its 423 files, all under `Zend/`, and the model reproduced the CVE it
+  could see instead of the one it was asked for.
+- A hosted model's prompt carries at most 320,000 characters of source
+  context instead of an unbounded amount; `CVELAB_CONTEXT_CHARS` raises it.
+  A context under its limit is no longer cut anyway: every excerpt used to
+  lose half its length whenever a limit applied.
+- The tree sample shows build files (`config.m4`, `CMakeLists.txt`,
+  `configure.ac` and the like) and the fix's own directories first, and says
+  how many files the repository has.
+- An answer cut off at its output budget is asked for again with twice the
+  budget, at most twice, up to the provider's ceiling
+  (`CVELAB_<PROVIDER>_MAX_OUTPUT`), and with twice the time. It used to end
+  the run as an infrastructure failure. OpenAI requests now wait for the
+  provider's timeout instead of 180 seconds.
+- A lab may carry up to 80 adapter files and eight support services, up from
+  10 and 5.
+
+### Fixed
+
+- A repair saw only the top level of `adapter/`, so a nested file such as
+  `adapter/app/server.js` never reached the model, and a nested file the
+  repaired answer dropped stayed in the build context. Both now work at any
+  depth, and generation cleans up after an earlier attempt too.
+- A source snapshot extracted over one from another revision kept that
+  revision's deleted files. A snapshot is now made once per revision, and
+  from empty when the revision changes.
+- The generation prompt split "install the exact declared Gradle version"
+  around an unrelated paragraph.
+- A generation answer that named no exercised vendor component was refused
+  after it arrived, spending an attempt. The schema now says so, and a
+  provider with constrained decoding cannot produce one.
+
 ## [0.6.4] - 2026-10-23
 
 ### Security

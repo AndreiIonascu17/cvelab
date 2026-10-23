@@ -149,6 +149,7 @@ class SecretRedactionTests(unittest.TestCase):
 
             failure = {"kind": "runtime_error", "error": f"validator printed {SENTINEL}"}
             with mock.patch.object(sourcegen, "_source_context", return_value="context"), \
+                    mock.patch.object(sourcegen, "_fix_listing", return_value=("", [], [])), \
                     mock.patch.object(sourcegen, "structured_response", side_effect=capture):
                 with self.assertRaisesRegex(RuntimeError, "stop after"):
                     sourcegen.repair_source_lab(

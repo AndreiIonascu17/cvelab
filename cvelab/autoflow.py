@@ -91,6 +91,8 @@ def run_auto_workflow(
     progress: Progress | None = None,
     provider: str | None = None,
     base_url: str | None = None,
+    hint: str | None = None,
+    research_mode: str | None = None,
 ) -> dict:
     """Generate, execute, diagnose, repair, and re-run a CVE lab autonomously."""
     if max_attempts < 1:
@@ -118,6 +120,8 @@ def run_auto_workflow(
                 provider,
                 base_url,
                 generation_feedback,
+                hint=hint,
+                research_mode=research_mode,
             )
         except Exception as exc:
             generation_feedback.append(str(exc)[:6000])
@@ -194,6 +198,7 @@ def run_auto_workflow(
                     model,
                     provider,
                     base_url,
+                    research_mode=research_mode,
                 )
             except Exception as exc:
                 attempts.append({
