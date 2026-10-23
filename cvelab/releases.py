@@ -61,6 +61,16 @@ def version_key(version: str) -> tuple[int, ...] | None:
     return tuple(parts)
 
 
+def _bound_key(bound: str) -> tuple[int, ...] | None:
+    """A range bound such as 10.0.0-alpha.0, compared by its release number.
+
+    Only final releases are ever picked, so `>= 10.0.0-alpha.0` admits the
+    same ones as `>= 10.0.0`, and `< 11.0.0-rc.1` the same as `< 11.0.0`.
+    """
+    match = re.match(r"^v?(\d+(?:\.\d+)*)", bound.strip())
+    return version_key(match.group(1)) if match else None
+
+
 def in_range(version: str, vulnerable_range: str) -> bool:
     """Whether a release satisfies a GitHub advisory range such as '>= 1.2, < 1.4.1'."""
     key = version_key(version)
@@ -70,7 +80,7 @@ def in_range(version: str, vulnerable_range: str) -> bool:
     if not constraints:
         return False
     for operator, bound_text in constraints:
-        bound = version_key(bound_text)
+        bound = _bound_key(bound_text)
         if bound is None:
             return False
         if operator == ">=" and not key >= bound:
