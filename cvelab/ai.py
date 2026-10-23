@@ -21,7 +21,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
-from . import usage
+from . import progress, usage
 from .providers import (
     CHAT_COMPLETIONS,
     MESSAGES,
@@ -31,6 +31,7 @@ from .providers import (
     auth_headers_for,
     endpoint_for,
     output_budget_for,
+    output_ceiling_for,
     require_private_transport,
     timeout_for,
 )
@@ -53,6 +54,17 @@ PLAN_SCHEMA = {
 # Derived, never maintained by hand: see cvelab/providers.py.
 SUPPORTED_PROVIDERS = set(SELECTABLE)
 PROVIDER_KEY_VARIABLE = {p.name: p.key_variable for p in PROVIDERS.values()}
+
+
+class OutputBudgetExhausted(RuntimeError):
+    """The model stopped at its output budget before the answer was complete."""
+
+
+#: Times an answer cut off at its budget is asked for again, each time with
+#: twice the budget. A lab for a large product -- many adapter files, a long
+#: build -- needs more than the budget sized for a library harness, and that
+#: used to end the whole run as an infrastructure failure.
+OUTPUT_ESCALATIONS = 2
 
 
 class AIHTTPError(RuntimeError):
@@ -276,6 +288,7 @@ def _openai_response(
     max_output_tokens: int,
     tools: list[dict] | None,
     include: list[str] | None,
+    timeout_seconds: int | None = None,
 ) -> dict:
     body = {
         "model": model,
@@ -303,8 +316,17 @@ def _openai_response(
         endpoint_for("openai"),
         body,
         auth_headers_for("openai", api_key),
+        timeout_seconds=timeout_seconds or timeout_for("openai"),
     )
     usage.record("openai", model, payload)
+    if (
+        payload.get("status") == "incomplete"
+        and (payload.get("incomplete_details") or {}).get("reason") == "max_output_tokens"
+    ):
+        raise OutputBudgetExhausted(
+            "OpenAI reached max_output_tokens before producing structured output "
+            f"(max_output_tokens={max_output_tokens})"
+        )
     for item in payload.get("output", []):
         if item.get("type") != "message":
             continue
@@ -322,6 +344,7 @@ def _anthropic_response(
     schema: dict,
     max_output_tokens: int,
     tools: list[dict] | None,
+    timeout_seconds: int | None = None,
 ) -> dict:
     compatible_schema = _anthropic_compatible_schema(schema)
     effort = os.getenv("CVELAB_ANTHROPIC_EFFORT", "low").lower()
@@ -354,7 +377,7 @@ def _anthropic_response(
         # A non-streaming request sends nothing until the answer is done, so
         # this is the whole generation time. Left at _request_json's 180s,
         # the provider's 600s (and CVELAB_ANTHROPIC_TIMEOUT) never applied.
-        timeout_seconds=timeout_for("anthropic"),
+        timeout_seconds=timeout_seconds or timeout_for("anthropic"),
     )
     usage.record("anthropic", model, payload)
     stop_reason = payload.get("stop_reason")
@@ -362,7 +385,7 @@ def _anthropic_response(
     content = payload.get("content", [])
     content_types = [block.get("type", "unknown") for block in content]
     if stop_reason == "max_tokens":
-        raise RuntimeError(
+        raise OutputBudgetExhausted(
             "Anthropic reached max_tokens before producing structured output "
             f"(output_tokens={token_usage.get('output_tokens', 'unknown')}, "
             f"content_types={content_types})"
@@ -391,6 +414,7 @@ def _chat_completions_response(
     schema: dict,
     schema_name: str,
     max_output_tokens: int,
+    timeout_seconds: int | None = None,
 ) -> dict:
     """The OpenAI chat/completions dialect, for every provider that speaks it.
 
@@ -410,7 +434,9 @@ def _chat_completions_response(
         url = endpoint_for(provider_name, base_url)
     require_private_transport(url, api_key)
     headers = auth_headers_for(provider_name, api_key)
-    timeout = _local_timeout() if provider_name == "local" else timeout_for(provider_name)
+    timeout = timeout_seconds or (
+        _local_timeout() if provider_name == "local" else timeout_for(provider_name)
+    )
 
     schema_json = json.dumps(schema, ensure_ascii=True)
     system = instructions
@@ -453,9 +479,15 @@ def _chat_completions_response(
     content = (choices[0].get("message", {}) or {}).get("content", "")
     if isinstance(content, list):
         content = "".join(item.get("text", "") for item in content if isinstance(item, dict))
+    finish = choices[0].get("finish_reason")
+    if finish == "length" and str(content).strip():
+        raise OutputBudgetExhausted(
+            f"{provider.label} stopped at max_tokens (finish_reason='length') "
+            "before its JSON was complete"
+        )
     if not str(content).strip():
-        finish = choices[0].get("finish_reason")
-        raise RuntimeError(
+        error = OutputBudgetExhausted if finish == "length" else RuntimeError
+        raise error(
             f"{provider.label} returned no content (finish_reason={finish!r}); "
             "a truncated response usually means max_tokens was reached"
         )
@@ -492,30 +524,50 @@ def structured_response(
     # Asked for once here rather than at each of the six call sites that
     # name a budget: what a model needs is a property of the model.
     max_output_tokens = output_budget_for(selected, max_output_tokens)
-    # Dispatch on the dialect, not the name: a provider that speaks one we
-    # already handle needs no new request code.
+    ceiling = output_ceiling_for(selected)
+    timeout = _local_timeout() if selected == "local" else timeout_for(selected)
     if tools and not provider.web_search:
         instructions += (
             " No web-search tool is available from this endpoint. Use only the supplied input and "
             "return insufficient-data status rather than inventing provenance."
         )
-    if provider.dialect == RESPONSES:
-        result = _openai_response(
-            api_key or "", model, instructions, input_text, schema, schema_name,
-            max_output_tokens, tools, include,
-        )
-    elif provider.dialect == MESSAGES:
-        result = _anthropic_response(
-            api_key or "", model, instructions, input_text, schema,
-            max_output_tokens, tools,
-        )
-    elif provider.dialect == CHAT_COMPLETIONS:
-        result = _chat_completions_response(
-            selected, api_key, base_url, model, instructions, input_text,
-            schema, schema_name, max_output_tokens,
-        )
-    else:
+
+    # Dispatch on the dialect, not the name: a provider that speaks one we
+    # already handle needs no new request code.
+    def ask(budget: int, seconds: int) -> dict:
+        if provider.dialect == RESPONSES:
+            return _openai_response(
+                api_key or "", model, instructions, input_text, schema, schema_name,
+                budget, tools, include, seconds,
+            )
+        if provider.dialect == MESSAGES:
+            return _anthropic_response(
+                api_key or "", model, instructions, input_text, schema,
+                budget, tools, seconds,
+            )
+        if provider.dialect == CHAT_COMPLETIONS:
+            return _chat_completions_response(
+                selected, api_key, base_url, model, instructions, input_text,
+                schema, schema_name, budget, seconds,
+            )
         raise RuntimeError(f"No handler for dialect {provider.dialect!r}")
+
+    for escalation in range(OUTPUT_ESCALATIONS + 1):
+        try:
+            result = ask(max_output_tokens, timeout)
+            break
+        except OutputBudgetExhausted:
+            if escalation == OUTPUT_ESCALATIONS or ceiling is None or max_output_tokens >= ceiling:
+                raise
+            larger = min(max_output_tokens * 2, ceiling)
+            # A non-streaming answer arrives whole, so twice the tokens can
+            # take twice the time.
+            timeout = timeout * larger // max_output_tokens
+            progress.step(
+                f"{get_provider(selected).label} ran out of output at {max_output_tokens} tokens; "
+                f"asking again with {larger}"
+            )
+            max_output_tokens = larger
     _validate_schema(result, schema)
     return result
 

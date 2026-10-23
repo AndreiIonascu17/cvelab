@@ -180,6 +180,12 @@ export CVELAB_LOCAL_TIMEOUT=1800      # optional local request timeout
 export CVELAB_RUNTIME_MEMORY=2g
 export CVELAB_RUNTIME_CPUS=2
 export CVELAB_RUNTIME_PIDS=1024
+
+# How much of a large fix the model may read before writing a lab (GUIDE, section 5):
+export CVELAB_RESEARCH=auto          # auto, on, or off; --research overrides it
+export CVELAB_RESEARCH_ROUNDS=3      # research calls before a lab is written
+export CVELAB_CONTEXT_CHARS=320000   # source context per prompt, hosted models
+export CVELAB_ANTHROPIC_MAX_OUTPUT=128000  # ceiling when a cut answer is retried larger
 ```
 
 A key is never sent over plain `http://` to another machine: use `https://`, or

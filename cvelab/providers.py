@@ -77,6 +77,11 @@ class Provider:
     # request needs a larger ceiling for the same answer. Overridden by
     # CVELAB_<NAME>_OUTPUT_SCALE.
     output_budget_scale: float = 1.0
+    # The most output tokens a request may ask for. An answer cut off at its
+    # budget is asked for again with twice the budget, up to this; None means
+    # unknown, and a cut answer is then final. Overridden by
+    # CVELAB_<NAME>_MAX_OUTPUT.
+    max_output_tokens: int | None = None
     # Header used to carry the key. Anthropic takes its own; everyone else
     # uses Bearer.
     auth_header: str = "Authorization"
@@ -102,6 +107,7 @@ PROVIDERS: dict[str, Provider] = {
         base_url="https://api.openai.com/v1",
         key_variable="OPENAI_API_KEY",
         web_search=True,
+        max_output_tokens=128000,
         models=("gpt-5.6-sol",),
         prices={"gpt-5.6-sol": (4.00, 20.00)},
     ),
@@ -122,6 +128,7 @@ PROVIDERS: dict[str, Provider] = {
         # DeepSeek scale below was added for. Four times keeps the largest
         # request at 64,000 tokens, under every current model's 128K cap.
         output_budget_scale=4.0,
+        max_output_tokens=128000,
         models=(
             "claude-opus-5-5",
             "claude-sonnet-5-5",
@@ -155,6 +162,7 @@ PROVIDERS: dict[str, Provider] = {
         # finish_reason="length" with no content at budgets that suffice
         # elsewhere, because the thinking is spent before anything is written.
         output_budget_scale=4.0,
+        max_output_tokens=64000,
         models=("deepseek-flash", "deepseek-v4-pro"),
         prices={
             "deepseek-flash": (0.15, 0.60),
@@ -275,6 +283,22 @@ def output_budget_for(name: str, requested: int) -> int:
                 f"CVELAB_{name.upper()}_OUTPUT_SCALE must be a number, got {override!r}"
             ) from error
     return max(1, int(requested * scale))
+
+
+def output_ceiling_for(name: str) -> int | None:
+    """The largest output budget a request to this provider may ask for."""
+    override = os.getenv(f"CVELAB_{name.upper()}_MAX_OUTPUT")
+    if override:
+        try:
+            value = int(override)
+        except ValueError as error:
+            raise ValueError(
+                f"CVELAB_{name.upper()}_MAX_OUTPUT must be a whole number, got {override!r}"
+            ) from error
+        if value < 1:
+            raise ValueError(f"CVELAB_{name.upper()}_MAX_OUTPUT must be at least 1")
+        return value
+    return get(name).max_output_tokens
 
 
 def price_for(model: str) -> tuple[float, float] | None:

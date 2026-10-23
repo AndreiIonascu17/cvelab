@@ -272,6 +272,50 @@ cvelab --output-root "$HOME/cvelab-labs" \
   --model gpt-5.6-sol
 ```
 
+### Large fixes and complex CVEs
+
+A fix that fits in one prompt is shown to the model whole. When it does not
+(more than 90,000 characters of diff, or more than 24 changed files), CVELab
+ranks the files by how well they match the CVE text, code before tests and
+documentation, and adds a research phase before the lab is written. The model
+reads an index of every changed file and asks for the source it needs: one
+file's diff with whole functions around each change, a range of lines from
+either revision, a literal search, or a directory listing. Any file in the
+repository can be asked for, so the number of files a CVE needs is not limited
+by what fits in one prompt. Every repair does the same with the failure in
+front of it, which is how a missing build option or extension gets found.
+
+Requests only read. They are answered from the source snapshots under
+`source/` and from git in the lab's cache, and no path can leave them. The
+model's analysis, its build notes and everything it read are saved in
+`research.json` beside `plan.json`, and `plan.json` records how many rounds
+and requests it took.
+
+`--research on` researches every CVE, `--research off` never does, and `auto`
+is the default described above; `CVELAB_RESEARCH` sets the default.
+`CVELAB_RESEARCH_ROUNDS` (default 3) bounds the calls before a lab is written.
+Research adds a few model calls per CVE, and they show in the cost.
+
+When one commit fixes several CVEs, say which one you mean:
+
+```bash
+cvelab --output-root "$HOME/cvelab-labs" \
+  auto CVE-YYYY-NNNNN \
+  --hint "the session upload-progress half of the fix, not the OOM tests under Zend/" \
+  --key \
+  --model gpt-5.6-sol
+```
+
+The hint goes to the model, ranks the fix's files, and is recorded in
+`plan.json`, so a reviewer can see the run was steered.
+
+A hosted model's prompt carries up to 320,000 characters of source context;
+`CVELAB_CONTEXT_CHARS` raises it for a model with a larger window. An answer
+cut off at its output budget is asked for again with twice the budget, up to
+the provider's ceiling (`CVELAB_<PROVIDER>_MAX_OUTPUT` overrides it). A lab may
+carry up to 80 files under `adapter/`, at any depth, and up to eight support
+services.
+
 ## 6. Running an existing lab
 
 ```bash
@@ -451,6 +495,13 @@ and each line of the message names the service and the key. During `auto` the
 refusal is fed back to the next generation attempt. For a lab you wrote or
 received, remove the key; if the word `include` or `extends` appears only in a
 comment, reword the comment.
+
+### The lab reproduced the wrong CVE
+
+One commit sometimes fixes several CVEs, and a lab can demonstrate the half
+the model found first. Read `research.json`: its analysis says which part of
+the fix the model took to be this CVE. If that is wrong, run again with
+`--hint` naming the right part, as in section 5.
 
 ### Missing public fix
 

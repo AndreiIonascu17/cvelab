@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import __version__, progress, upload, usage
+from . import __version__, progress, research, upload, usage
 from .ai import resolve_provider
 from .autoflow import run_auto_workflow
 from .closed import run_closed_lab
@@ -75,6 +75,21 @@ def add_upload_flags(command: argparse.ArgumentParser) -> None:
     )
 
 
+def add_source_steering(command: argparse.ArgumentParser) -> None:
+    """What the model is told, and what it may read, about the fix."""
+    command.add_argument(
+        "--hint",
+        help="Tell the model which part of the fix or which behaviour to reproduce; it also decides "
+        "which files of a large fix are shown first. Recorded in plan.json",
+    )
+    command.add_argument(
+        "--research",
+        choices=research.MODES,
+        help="Let the model read the repository before writing the lab: auto when the fix does not "
+        "fit in one prompt and on every repair (default, or CVELAB_RESEARCH), on, or off",
+    )
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         prog="cvelab",
@@ -110,6 +125,7 @@ def parser() -> argparse.ArgumentParser:
     source.add_argument("--repo", help="Public GitHub or GitLab HTTPS repository")
     source.add_argument("--fixed-ref", help="Commit containing the security fix")
     source.add_argument("--vulnerable-ref", help="Vulnerable commit (default: parent of fixed commit)")
+    add_source_steering(source)
     add_ai_credentials(source)
 
     source_all = sub.add_parser(
@@ -120,6 +136,7 @@ def parser() -> argparse.ArgumentParser:
     source_all.add_argument("--repo", help="Public GitHub or GitLab HTTPS repository")
     source_all.add_argument("--fixed-ref", help="Commit containing the security fix")
     source_all.add_argument("--vulnerable-ref", help="Vulnerable commit (default: parent of fixed commit)")
+    add_source_steering(source_all)
     source_all.add_argument("--keep", action="store_true", help="Keep containers running")
     add_ai_credentials(source_all)
     add_upload_flags(source_all)
@@ -132,6 +149,7 @@ def parser() -> argparse.ArgumentParser:
     auto.add_argument("--repo", help="Optional public GitHub or GitLab HTTPS repository override")
     auto.add_argument("--fixed-ref", help="Optional commit containing the security fix")
     auto.add_argument("--vulnerable-ref", help="Optional vulnerable commit")
+    add_source_steering(auto)
     auto.add_argument(
         "--ai",
         choices=("on",),
@@ -380,6 +398,8 @@ def _run_command(args: argparse.Namespace) -> int:
                 args.max_attempts,
                 provider=provider,
                 base_url=base_url,
+                hint=args.hint,
+                research_mode=args.research,
             )
         elif args.command in {"source", "source-all"}:
             generated = generate_source_lab(
@@ -392,6 +412,8 @@ def _run_command(args: argparse.Namespace) -> int:
                 model,
                 provider,
                 base_url,
+                hint=args.hint,
+                research_mode=args.research,
             )
             if args.command == "source-all" and generated.get("ok"):
                 result = run_lab(args.cve, args.output_root, args.keep)
