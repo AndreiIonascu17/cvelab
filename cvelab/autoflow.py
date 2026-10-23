@@ -20,7 +20,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from . import progress, usage
-from .core import normalize_cve, run_lab, write_text
+from .core import CVERecordNotFound, normalize_cve, run_lab, write_text
 from .deliverables import create_deliverables
 from .sourcegen import generate_source_lab, repair_source_lab
 
@@ -133,7 +133,11 @@ def run_auto_workflow(
             })
             if lab_dir.exists():
                 _record(lab_dir, attempts)
-            if _infrastructure_failure(str(exc)) or generation_attempt == max_attempts:
+            if (
+                isinstance(exc, CVERecordNotFound)
+                or _infrastructure_failure(str(exc))
+                or generation_attempt == max_attempts
+            ):
                 _record(
                     lab_dir,
                     attempts,

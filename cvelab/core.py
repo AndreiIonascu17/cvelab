@@ -50,14 +50,118 @@ def normalize_cwe(value: str | None) -> str | None:
     return f"CWE-{match.group(1)}" if match else value.upper()
 
 
-def collect_cve(cve: str) -> dict:
-    url = f"https://cveawg.mitre.org/api/cve/{cve}"
-    request = urllib.request.Request(url, headers={"User-Agent": "cvelab/0.1"})
+CVE_RECORD_URL = "https://cveawg.mitre.org/api/cve/{cve}"
+GITHUB_ADVISORY_URL = "https://api.github.com/advisories?type=reviewed&cve_id={cve}"
+
+
+class CVERecordNotFound(RuntimeError):
+    """Neither CVE.org nor GitHub's advisory database has a record.
+
+    Permanent for the run: asking again returns the same answer, so the
+    automatic retry loop stops on it instead of spending every attempt on a
+    404.
+    """
+
+
+def _get_json(url: str, headers: dict[str, str]) -> object:
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.load(response)
+
+
+def collect_github_advisory(cve: str) -> dict | None:
+    """Build a dossier from GitHub's reviewed advisory for a CVE.
+
+    A CNA can publish its advisory, CVE number included, before CVE.org
+    publishes the record: until then CVE.org holds the identifier as RESERVED
+    and answers 404. GitHub's reviewed advisory already carries the
+    description, the CWEs, the affected versions and the fix commits, in the
+    references the source resolver reads. Returns None when GitHub has no
+    advisory for the identifier.
+    """
+    url = GITHUB_ADVISORY_URL.format(cve=cve)
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            raw = json.load(response)
+        advisories = _get_json(
+            url, {"Accept": "application/vnd.github+json", "User-Agent": "cvelab"}
+        )
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"CVE API returned HTTP {exc.code} for {cve}") from exc
+        # A 403 or 429 here is GitHub's rate limit, not an answer: retryable.
+        raise RuntimeError(f"GitHub advisory API returned HTTP {exc.code} for {cve}") from exc
+    if not isinstance(advisories, list):
+        return None
+    matching = [
+        item for item in advisories
+        if isinstance(item, dict)
+        and str(item.get("cve_id") or "").upper() == cve
+        and not item.get("withdrawn_at")
+    ]
+    if not matching:
+        return None
+    advisory = matching[0]
+
+    summary = str(advisory.get("summary") or "").strip()
+    details = str(advisory.get("description") or "").strip()
+    description = "\n\n".join(part for part in (summary, details) if part)
+    cwes = []
+    for item in advisory.get("cwes") or []:
+        candidate = normalize_cwe(item.get("cwe_id") if isinstance(item, dict) else None)
+        if candidate and candidate.startswith("CWE-"):
+            cwes.append(candidate)
+    repository = advisory.get("source_code_location") or None
+    affected = []
+    for vulnerability in advisory.get("vulnerabilities") or []:
+        if not isinstance(vulnerability, dict):
+            continue
+        package = vulnerability.get("package") or {}
+        versions = []
+        if vulnerability.get("vulnerable_version_range"):
+            versions.append({"version": vulnerability["vulnerable_version_range"], "status": "affected"})
+        if vulnerability.get("first_patched_version"):
+            versions.append({"version": vulnerability["first_patched_version"], "status": "unaffected"})
+        affected.append({
+            "vendor": package.get("ecosystem"),
+            "product": package.get("name"),
+            "packageName": package.get("name"),
+            "repo": repository,
+            "versions": versions,
+        })
+    references = [str(item) for item in advisory.get("references") or [] if item]
+    if repository and repository not in references:
+        references.append(repository)
+    return {
+        "cve": cve,
+        "state": None,
+        "published": advisory.get("published_at"),
+        "descriptions": [description] if description else [],
+        "cwes": sorted(set(cwes)),
+        "affected": affected,
+        "references": references,
+        "source": advisory.get("html_url") or url,
+        "record": {
+            "kind": "github_advisory",
+            "id": advisory.get("ghsa_id"),
+            "reason": "CVE.org has no published record for this identifier (HTTP 404)",
+        },
+    }
+
+
+def collect_cve(cve: str) -> dict:
+    url = CVE_RECORD_URL.format(cve=cve)
+    try:
+        raw = _get_json(url, {"User-Agent": "cvelab/0.1"})
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise RuntimeError(f"CVE API returned HTTP {exc.code} for {cve}") from exc
+        advisory = collect_github_advisory(cve)
+        if advisory is None:
+            raise CVERecordNotFound(
+                f"CVE API returned HTTP 404 for {cve}, and GitHub has no reviewed "
+                "advisory for it either. The identifier may be reserved and not "
+                "yet published, or mistyped."
+            ) from exc
+        return advisory
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"CVE API returned an unexpected document for {cve}")
 
     cna = raw.get("containers", {}).get("cna", {})
     descriptions = [item.get("value", "") for item in cna.get("descriptions", [])]

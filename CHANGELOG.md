@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A CVE that CVE.org still holds as reserved is read from GitHub's reviewed
+  advisory instead. A CNA can publish the advisory, CVE number included,
+  days before CVE.org publishes the record, and until then every run on it
+  ended on `CVE API returned HTTP 404`. The advisory's description, CWEs,
+  affected versions and fix commits fill the same dossier, and the report
+  names the advisory as its source. CVE.org is still asked first.
+
+### Fixed
+
+- An identifier with no record at CVE.org or at GitHub stops after one
+  attempt with a message saying it may be reserved or mistyped. The answer
+  cannot change between attempts, and the run used to spend all four on it.
+  A server error or a rate limit is still retried.
+
 ## [0.6.5] - 2026-10-23
 
 ### Added

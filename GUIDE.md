@@ -503,6 +503,18 @@ the model found first. Read `research.json`: its analysis says which part of
 the fix the model took to be this CVE. If that is wrong, run again with
 `--hint` naming the right part, as in section 5.
 
+### CVE API returned HTTP 404
+
+CVE.org has no published record for the identifier. CVELab then reads
+GitHub's reviewed advisory for it, which often exists days before the
+record does. If GitHub has none either, the run stops after one attempt.
+Check the identifier for a typo, or wait for the record: until it is
+published, CVE.org reports the identifier as `RESERVED`.
+
+```bash
+curl -s https://cveawg.mitre.org/api/cve-id/CVE-YYYY-NNNNN
+```
+
 ### Missing public fix
 
 The absence of a fix is not an error if the vulnerable revision is verified.
