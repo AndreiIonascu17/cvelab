@@ -18,6 +18,7 @@ import hashlib
 import io
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -684,6 +685,101 @@ def _validate_generated(files: list[dict], vulnerable_only: bool = False) -> Non
                     allowed_hosts.add("patched")
                 if url not in allowed_hosts:
                     raise RuntimeError(f"Validator external target rejected: {url}")
+    reads = _source_text_reads(files)
+    if reads:
+        raise RuntimeError(
+            "The lab reads the vendor source as text instead of running it: "
+            + "; ".join(reads[:3])
+            + ". A verdict must come from executing the affected code with the regression input: "
+            "build, install or import the source and send the input to it."
+        )
+
+
+# A harness that reads the vendor source as text and looks for the fix in
+# it passes the differential without running anything: an Electron lab
+# returned readFileSync(guest-window-manager.ts).includes('if (navigate) {')
+# as its verdict and simulated the browser, the cookie jar and the request.
+# What follows finds a text read, in an adapter file or the validator, of a
+# path the Dockerfiles copied the source to. Calibrated on the twenty labs
+# validated by 2026-10-23: it flags that one and none of the others.
+_COPY_SOURCE = re.compile(
+    r"^\s*(?:COPY|ADD)\s+(?:--\S+\s+)*(?:\./)?source/(?:vulnerable|patched)/?\s+(\S+)\s*$", re.I
+)
+_COPY_ANY = re.compile(r"^\s*(?:COPY|ADD)\s+(?:--\S+\s+)*(.+?)\s+(\S+)\s*$", re.I)
+_WORKDIR = re.compile(r"^\s*WORKDIR\s+(\S+)", re.I)
+_ENV_PAIR = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(\"?)([^\s\"]+)\2")
+_ENV_LEGACY = re.compile(r"^\s*ENV\s+([A-Za-z_][A-Za-z0-9_]*)\s+(\S+)\s*$", re.I)
+_TEXT_READ = re.compile(
+    r"readFileSync\s*\(|\breadFile\s*\(|\.read_text\s*\(|(?<![\w.])open\s*\(|file_get_contents\s*\(|"
+    r"File\.read\s*\(|IO\.read\s*\(|os\.ReadFile\s*\(|ioutil\.ReadFile\s*\(|read_to_string\s*\(|"
+    r"Files\.readString\s*\(|(?<![\w-])grep\s"
+)
+# Reading an upstream fixture as bytes and sending it is a real input.
+_BINARY_MODE = re.compile(r"""['"](?:rb|br|r\+b)['"]""")
+_JS_READ = re.compile(r"readFileSync\s*\(|\breadFile\s*\(")
+_JS_TEXT = re.compile(r"""['"](?:utf-?8|latin1|ascii|utf16le)['"]|encoding\s*:|\.toString\s*\(""", re.I)
+
+
+def _source_locations(files: list[dict]) -> tuple[set[str], set[str], set[str]]:
+    """Where the Dockerfiles put the source, the ENV names pointing there, and adapter destinations."""
+    contents = {item["path"].replace("\\", "/"): item["content"] for item in files}
+    roots: set[str] = set()
+    names: set[str] = set()
+    adapter_destinations: set[str] = set()
+    for path in ("vulnerable/Dockerfile", "patched/Dockerfile"):
+        lines = contents.get(path, "").splitlines()
+        workdir = "/"
+        for line in lines:
+            if match := _WORKDIR.match(line):
+                workdir = posixpath.normpath(posixpath.join(workdir, match.group(1)))
+            if match := _COPY_SOURCE.match(line):
+                roots.add(posixpath.normpath(posixpath.join(workdir, match.group(1))))
+            elif (match := _COPY_ANY.match(line)) and "adapter/" in match.group(1):
+                adapter_destinations.add(posixpath.normpath(posixpath.join(workdir, match.group(2))))
+        for line in lines:
+            if not re.match(r"^\s*ENV\s", line, re.I):
+                continue
+            legacy = _ENV_LEGACY.match(line)
+            pairs = _ENV_PAIR.findall(line) or ([(legacy.group(1), "", legacy.group(2))] if legacy else [])
+            for name, _quote, value in pairs:
+                value = posixpath.normpath(value) if value.startswith("/") else value
+                if any(value == root or value.startswith(root + "/") for root in roots):
+                    names.add(name)
+    roots.discard("/")
+    return roots, names, adapter_destinations
+
+
+def _source_text_reads(files: list[dict]) -> list[str]:
+    """Lines in adapter files or the validator that read the vendor source as text."""
+    roots, names, adapter_destinations = _source_locations(files)
+    if not roots:
+        return []
+
+    def mentions(window: str, path: str) -> bool:
+        return re.search(re.escape(path) + r"(?:/|['\"`\s)]|$)", window) is not None
+
+    found = []
+    for item in files:
+        path = item["path"].replace("\\", "/")
+        if not (path.startswith("adapter/") or path == "validator/validator.py"):
+            continue
+        lines = item["content"].splitlines()
+        for index, line in enumerate(lines):
+            if not _TEXT_READ.search(line) or _BINARY_MODE.search(line):
+                continue
+            if _JS_READ.search(line) and not _JS_TEXT.search("\n".join(lines[index:index + 3])):
+                continue
+            # The path is often built a line or two above the read.
+            window = "\n".join(lines[max(0, index - 3):index + 2])
+            literal = any(
+                mentions(window, root)
+                and not any(dest.startswith(root) and mentions(window, dest) for dest in adapter_destinations)
+                for root in roots
+            )
+            named = any(re.search(rf"\b{re.escape(name)}\b", window) for name in names)
+            if literal or named:
+                found.append(f"{path}:{index + 1}: {line.strip()[:160]}")
+    return found
 
 
 def _without_compose_version(content: str) -> str:
@@ -739,6 +835,21 @@ def _validate_fidelity(fidelity: dict) -> None:
         raise RuntimeError("Fidelity must name at least one exercised vendor component")
     if not isinstance(simulated, list):
         raise RuntimeError("Fidelity simulated_components must be a list")
+    # A model that reads the source instead of running it tends to say so
+    # here, as the Electron lab did: "read as raw source text".
+    read_not_run = [str(item) for item in exercised if _READ_NOT_RUN.search(str(item))]
+    if read_not_run:
+        raise RuntimeError(
+            "Fidelity says the vendor code is read, not run: " + "; ".join(read_not_run[:3])
+            + ". An exercised component is code the regression input executes."
+        )
+
+
+_READ_NOT_RUN = re.compile(
+    r"source text|raw source|read as (?:raw )?text|as raw text|\bgrep|string match|text search"
+    r"|reads? the (?:vendor )?source",
+    re.I,
+)
 
 
 def _validate_support_services(services: list[str], compose: str) -> None:
@@ -1049,7 +1160,7 @@ def generate_source_lab(
                 "non-root user, and expose only the application route required for the regression check. The validator "
                 "must exercise the patch-relevant input against the real affected code path and derive a concrete, "
                 "non-destructive security-boundary observation from the response or container state. A reflected value "
-                "alone is insufficient. Preserve the required JSON field names: attack_executed means the regression "
+                "alone is insufficient. Reading, searching or comparing the vendor source text is not evidence either: the verdict must come from executing the affected code. Preserve the required JSON field names: attack_executed means the regression "
                 "input was actually delivered; vulnerable.confirmed must be computed from raw observations; set "
                 "proof_quality to security_effect_observed, patched_tested and differential_confirmed to false, and "
                 "fix_status to PUBLIC_FIX_NOT_IDENTIFIED. Exit zero only when the stated observation is reproduced. "
@@ -1159,7 +1270,7 @@ def generate_source_lab(
             "Compose services must be named vulnerable, patched, and validator. The validator must send the same "
             "minimal patch-derived regression input to both real code paths and derive a concrete, non-destructive "
             "security-boundary observation from raw responses or container state. A reflected marker alone is not "
-            "evidence. Preserve the required JSON field names: attack_executed means the regression input was sent; "
+            "evidence. Reading, searching or comparing the vendor source text is not evidence either: the verdict must come from executing the affected code. Preserve the required JSON field names: attack_executed means the regression input was sent; "
             "vulnerable.confirmed, patched.confirmed, patched.blocked, and differential_confirmed must be computed from "
             "raw observations, never hard-coded. Exit zero only when the observation occurs on the affected revision "
             "and the fixed revision demonstrably prevents it. Implement the required local manual interface using "
@@ -1411,7 +1522,7 @@ def repair_source_lab(
             "the required comparison fields, and exit zero only on genuine proof. It must also support independently "
             "runnable CVELAB_MANUAL_ACTION=exploit|verify and CVELAB_TARGET=vulnerable|patched modes; the legacy exploit action prints raw "
             "evidence and verify prints REPRODUCED or BLOCKED only after evaluating a fresh request. Never hard-code a "
-            "successful result or treat canary reflection alone as proof. Preserve the regression contract unless runtime "
+            "successful result or treat canary reflection alone as proof. Reading, searching or comparing the vendor source text is not evidence either: the verdict must come from executing the affected code. Preserve the regression contract unless runtime "
             "evidence shows it is technically wrong. Keep all interaction inside the internal Docker network, accept "
             "only fixed service names, use harmless canary data, and add no host integration, elevated permissions, "
             "sensitive-data access, external connectivity, or lasting system changes. "

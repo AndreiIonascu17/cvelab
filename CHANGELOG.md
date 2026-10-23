@@ -50,6 +50,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A lab could pass by reading the fix out of the source instead of running
+  it. An Electron lab returned
+  `readFileSync(guest-window-manager.ts).includes('if (navigate) {')` as its
+  verdict, simulated the browser and the cookie jar, and validated. A text
+  read of the path the Dockerfiles copy the source to, from an adapter file
+  or the validator, is now refused before the build with the file and line;
+  so is a fidelity report whose exercised component is read rather than run.
+  Reading an upstream fixture as bytes, importing the source and the
+  adapter's own files are unaffected, and of the twenty labs validated so
+  far only that one is refused. Every prompt says that source text is not
+  evidence.
 - A repair saw only the top level of `adapter/`, so a nested file such as
   `adapter/app/server.js` never reached the model, and a nested file the
   repaired answer dropped stayed in the build context. Both now work at any
