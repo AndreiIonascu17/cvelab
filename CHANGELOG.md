@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- An answer refused before the build is asked for again with the reason,
+  up to twice (`CVELAB_CONTRACT_RETRIES`, 0 to 5), instead of costing a
+  generation attempt or one of the three repairs. Rerunning the failed
+  entries of three benchmark batches, half of the repair budget went to
+  layout refusals the model repeated. The refusals are kept in plan.json.
+
 - A lab whose two variants could differ for any reason but the fix is
   refused before it is built. vulnerable/Dockerfile and patched/Dockerfile,
   and their Compose services, may differ only in the snapshot they copy, in
