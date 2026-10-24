@@ -403,11 +403,16 @@ class GitRevisionTests(unittest.TestCase):
                      '"diff", "--name-only", "--end-of-options"',
                      '"ls-tree", "-r", "--name-only", "--end-of-options"',
                      '"show", "--end-of-options"',
-                     '"--no-checkout", "--end-of-options"'):
+                     '"--no-checkout", "--end-of-options"',
+                     '"fetch", "--depth=2", "--no-tags", "--end-of-options"'):
             with self.subTest(call=call):
                 self.assertIn(call, source)
+        # An inventory of the call sites that pass a revision from outside, so
+        # a new one has to be reviewed rather than inherited: two forced
+        # fetches in the generator, and three verifications once the
+        # closed-source resolver checks a fix it only reads.
         self.assertEqual(source.count('"fetch", "--force", "--end-of-options", "origin"'), 2)
-        self.assertEqual(source.count('"rev-parse", "--verify", "--end-of-options"'), 2)
+        self.assertEqual(source.count('"rev-parse", "--verify", "--end-of-options"'), 3)
 
     def test_a_discovered_revision_is_validated(self) -> None:
         from unittest import mock

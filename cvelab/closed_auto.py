@@ -20,9 +20,11 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from . import progress, research
 from .ai import structured_response
 from .closed import run_closed_lab
 from .core import collect_cve, normalize_cve
+from .sourcegen import fix_patch, resolve_source
 
 _REQUEST_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -106,6 +108,7 @@ def _ai_plan(
     model: str | None,
     provider: str | None = None,
     base_url: str | None = None,
+    fix: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return structured_response(
         api_key=api_key,
@@ -120,10 +123,19 @@ def _ai_plan(
             "targets beyond that contained check. "
             "Use relative HTTP paths only and express headers as name/value list items. "
             "Use null for optional match predicates that do not apply. "
+            "When security_patch is supplied it is the authoritative account of the vulnerability, and it "
+            "outranks the advisory's prose: read it for the endpoint, the parameter and the authorization the "
+            "fix restored, and derive the reproduction from that. A vendor advisory is often written to "
+            "withhold exactly those details, so their absence from it is not a reason to decline. The patch "
+            "does not relieve the image requirement -- the vulnerable tag must still be a published image "
+            "inside the affected range -- and it is not a licence to exceed the contained HTTP check. "
             "If proprietary artifacts, authentication, a license, non-HTTP interaction, or missing technical "
             "details prevent a faithful reproduction, return ARTIFACT_REQUIRED or UNSUPPORTED."
         ),
-        input_text=json.dumps({"cve": cve, "cve_record": dossier}, ensure_ascii=True),
+        input_text=json.dumps(
+            {"cve": cve, "cve_record": dossier, "security_patch": fix},
+            ensure_ascii=True,
+        ),
         schema=_PLAN_SCHEMA,
         schema_name="closed_software_resolution",
         max_output_tokens=5000,
@@ -187,6 +199,34 @@ def _ensure_image(image: str) -> None:
     subprocess.run(["docker", "pull", image], check=True)
 
 
+def _security_patch(
+    dossier: dict[str, Any],
+    output_root: Path,
+    repo: str | None,
+    fixed_ref: str | None,
+) -> dict[str, Any] | None:
+    """The fix behind this CVE, when a public one can be pointed at.
+
+    A product advisory names a patched release and nothing else, so a
+    resolver working from prose cannot say which request to send. The fix
+    commit can: for closed source it is not something to build, only the
+    evidence that says what to exercise. Failing to read one is not fatal --
+    the resolver then answers from the record alone, as it did before.
+    """
+    resolved = resolve_source(dossier, repo, fixed_ref)
+    if not resolved:
+        return None
+    repo_url, reference = resolved
+    described = research.words(
+        " ".join(str(text) for text in dossier.get("descriptions") or [])
+    )
+    try:
+        return fix_patch(repo_url, reference, output_root, described=described)
+    except (RuntimeError, ValueError, OSError) as exc:
+        progress.step(f"the fix at {repo_url} could not be read: {exc}")
+        return None
+
+
 def run_closed_auto(
     cve_value: str,
     output_root: Path,
@@ -194,14 +234,18 @@ def run_closed_auto(
     model: str | None,
     provider: str | None = None,
     base_url: str | None = None,
+    repo: str | None = None,
+    fixed_ref: str | None = None,
 ) -> dict[str, Any]:
     cve = normalize_cve(cve_value)
     entry, catalog_source = _catalog_entry(cve)
     dossier: dict[str, Any] | None = None
+    fix: dict[str, Any] | None = None
     if entry is None:
         dossier = collect_cve(cve)
+        fix = _security_patch(dossier, output_root, repo, fixed_ref)
         plan = _normalize_plan(
-            _ai_plan(cve, dossier, api_key, model, provider, base_url)
+            _ai_plan(cve, dossier, api_key, model, provider, base_url, fix)
         )
         resolution_source = "public_research"
     else:
@@ -216,6 +260,16 @@ def run_closed_auto(
         "catalog": catalog_source,
         "plan": plan,
     }
+    if fix:
+        # The patch itself is not kept: it is public, and a copy here would
+        # go out with every uploaded report. Where it came from is the part
+        # a reader needs to check the plan against.
+        resolution["security_patch"] = {
+            "repository": fix["repository"],
+            "vulnerable_ref": fix["vulnerable_ref"],
+            "fixed_ref": fix["fixed_ref"],
+            "changed_files": fix["changed_files"],
+        }
     (resolution_dir / "resolution.json").write_text(
         json.dumps(resolution, indent=2), encoding="utf-8"
     )
@@ -252,5 +306,6 @@ def run_closed_auto(
         "catalog": catalog_source,
         "sources": plan.get("sources", []),
         "resolution": str(resolution_dir / "resolution.json"),
+        "security_patch": resolution.get("security_patch"),
     }
     return result
