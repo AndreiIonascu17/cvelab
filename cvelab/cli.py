@@ -219,6 +219,12 @@ def parser() -> argparse.ArgumentParser:
         help="Resolve and validate a closed software HTTP PoC from only a CVE identifier",
     )
     closed_auto.add_argument("cve")
+    closed_auto.add_argument(
+        "--repo",
+        help="Public GitHub or GitLab HTTPS repository holding the fix. With --fixed-ref it gives "
+             "the resolver the patch, which is what a product advisory withholds",
+    )
+    closed_auto.add_argument("--fixed-ref", help="Commit containing the security fix")
     add_ai_credentials(closed_auto)
 
     all_cmd = sub.add_parser("all", help="Generate and validate a lab")
@@ -421,7 +427,8 @@ def _run_command(args: argparse.Namespace) -> int:
                 result = generated
         elif args.command == "closed-auto":
             result = run_closed_auto(
-                args.cve, args.output_root, api_key, model, provider, base_url
+                args.cve, args.output_root, api_key, model, provider, base_url,
+                args.repo, args.fixed_ref,
             )
         elif args.command == "closed":
             result = run_closed_lab(

@@ -277,6 +277,9 @@ OSV_VULN_URL = "https://api.osv.dev/v1/vulns/{cve}"
 OSV_TIMEOUT_SECONDS = 20
 # A hexadecimal commit id, not a tag or a branch: the lab must be reproducible.
 COMMIT_ID = re.compile(r"[0-9a-f]{7,40}")
+# The whole id. Fetching one commit by id needs it exact, so an abbreviation
+# is not something to ask a server for.
+FULL_COMMIT_ID = re.compile(r"[0-9a-f]{40}")
 # A revision that arrives from outside -- the command line, plan.json, or a
 # model's answer from web search -- before it reaches git: a commit id or a
 # plain tag or branch name, optionally followed by ^ or ~N. It cannot start
@@ -394,6 +397,28 @@ def discover_source_with_ai(
         provider=provider,
         base_url=base_url,
     )
+
+
+def prepare_repository(repo_url: str, output_root: Path) -> Path:
+    """A blobless clone of repo_url under the output root, fetched if already there.
+
+    Keyed by URL rather than by CVE, so two CVEs in the same project clone
+    once. The closed-source path reads a fix from here too, which is why this
+    is not inlined in the generator.
+    """
+    cache_key = hashlib.sha256(repo_url.encode()).hexdigest()[:16]
+    repository = output_root.resolve() / ".source-cache" / cache_key
+    repository.parent.mkdir(parents=True, exist_ok=True)
+    if not repository.exists():
+        with progress.stage(f"cloning {repo_url}"):
+            _run_git([
+                "clone", "--filter=blob:none", "--no-checkout", "--end-of-options",
+                repo_url, str(repository),
+            ])
+    else:
+        with progress.stage("fetching updates"):
+            _run_git(["fetch", "--force", "origin"], cwd=repository)
+    return repository
 
 
 def _snapshot(repository: Path, revision: str, destination: Path) -> None:
@@ -516,6 +541,87 @@ def _regression_tests(diff: str, files: list[str], limit: int = REGRESSION_TEST_
         "say in a validator comment which test the input comes from.\n"
         + body
     )
+
+
+def _fetch_one_commit(repo_url: str, fixed: str, output_root: Path) -> Path | None:
+    """Two commits -- the fix and its parent -- where the host serves one by id.
+
+    Measured: GitHub and gitlab.com both answer a full commit id in about a
+    second for a megabyte or two, while a blobless clone of a monorepo is
+    minutes and gigabytes. The closed-source path needs nothing but the one
+    diff, so it asks for that first.
+
+    Only a full 40-character object id is worth asking for. The protocol
+    wants an exact id, so an abbreviated one fails with "couldn't find
+    remote ref" on any host -- a tag or a branch name likewise -- and a
+    server with the capability turned off answers "not our ref". Both of
+    those are this returning None and the caller taking every ref instead.
+    """
+    if not FULL_COMMIT_ID.fullmatch(fixed):
+        return None
+    key = hashlib.sha256(f"{repo_url}@{fixed}".encode()).hexdigest()[:16]
+    repository = output_root.resolve() / ".fix-cache" / key
+    if (repository / ".git").is_dir():
+        return repository
+    repository.mkdir(parents=True, exist_ok=True)
+    _run_git(["init", "-q"], cwd=repository)
+    _run_git(["remote", "add", "origin", repo_url], cwd=repository)
+    try:
+        with progress.stage(f"fetching {fixed[:12]} from {repo_url}"):
+            _run_git(
+                ["fetch", "--depth=2", "--no-tags", "--end-of-options", "origin", fixed],
+                cwd=repository,
+            )
+    except RuntimeError:
+        shutil.rmtree(repository, ignore_errors=True)
+        return None
+    return repository
+
+
+def fix_patch(
+    repo: str,
+    fixed_ref: str,
+    output_root: Path,
+    described: set[str] | None = None,
+    budget: int = research.PATCH_BUDGET,
+) -> dict:
+    """The security patch behind a fix commit, trimmed to a prompt budget.
+
+    The closed-source path builds nothing from source, but the patch is still
+    the only public statement of what the vulnerability was. A GitLab
+    advisory says an unauthenticated user "could have read internal" data and
+    names no endpoint; the diff names the field, the authorization the fix
+    restored, and often ships the test that exercises it. Without this, a
+    resolver reading advisory prose answers UNSUPPORTED and is right to.
+    """
+    repo_url = _safe_repo_url(repo)
+    fixed = _safe_revision(fixed_ref, "fixed revision")
+    repository = _fetch_one_commit(repo_url, fixed, output_root)
+    if repository is None:
+        # No single commit to be had: take every ref and look for the fix
+        # locally, which also covers a tag or a branch. The clone is shared
+        # with the source generator, so a project used by both pays once.
+        repository = prepare_repository(repo_url, output_root)
+    _run_git(["rev-parse", "--verify", "--end-of-options", f"{fixed}^{{commit}}"], cwd=repository)
+    # The parent, never a named vulnerable revision: a closed-source lab runs
+    # published images, so these revisions are evidence about the bug rather
+    # than something to check out and build.
+    vulnerable = f"{fixed}^"
+    diff = _run_git(
+        ["diff", "--no-ext-diff", "--unified=80", "--end-of-options", vulnerable, fixed],
+        cwd=repository,
+    )
+    files = _run_git(
+        ["diff", "--name-only", "--end-of-options", vulnerable, fixed], cwd=repository
+    ).splitlines()
+    patch, _ = research.select_patch(diff, described or set(), set(), budget=budget)
+    return {
+        "repository": repo_url,
+        "vulnerable_ref": vulnerable,
+        "fixed_ref": fixed,
+        "changed_files": files,
+        "patch": patch,
+    }
 
 
 def _source_context(
@@ -1473,18 +1579,7 @@ def generate_source_lab(
     else:
         repo_url, fixed = resolved
         fixed = _safe_revision(fixed, "fixed revision")
-    cache_key = hashlib.sha256(repo_url.encode()).hexdigest()[:16]
-    repository = output_root.resolve() / ".source-cache" / cache_key
-    repository.parent.mkdir(parents=True, exist_ok=True)
-    if not repository.exists():
-        with progress.stage(f"cloning {repo_url}"):
-            _run_git([
-                "clone", "--filter=blob:none", "--no-checkout", "--end-of-options",
-                repo_url, str(repository),
-            ])
-    else:
-        with progress.stage("fetching updates"):
-            _run_git(["fetch", "--force", "origin"], cwd=repository)
+    repository = prepare_repository(repo_url, output_root)
     if fixed:
         _run_git(["fetch", "--force", "--end-of-options", "origin", fixed], cwd=repository)
         _run_git(["rev-parse", "--verify", "--end-of-options", f"{fixed}^{{commit}}"], cwd=repository)
