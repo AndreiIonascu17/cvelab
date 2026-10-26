@@ -36,6 +36,7 @@ from .core import (
 )
 from .deliverables import create_deliverables
 from .doctor import doctor_command
+from .field import run_field_lab
 from .providers import SELECTABLE
 from .providers import get as get_provider
 from .sourcegen import generate_source_lab
@@ -213,6 +214,18 @@ def parser() -> argparse.ArgumentParser:
     closed.add_argument("--container-port", required=True, type=int, help="HTTP port inside the image")
     closed.add_argument("--health-path", default="/", help="Relative readiness path")
     closed.add_argument("--contract", required=True, type=Path, help="Inspectable HTTP attack contract JSON")
+
+    field_cmd = sub.add_parser(
+        "field",
+        help="Emit a single-target PoC the operator runs against their own server, "
+             "proven against a vulnerable and a fixed image",
+    )
+    field_cmd.add_argument("cve")
+    field_cmd.add_argument("--vulnerable-image", required=True, help="Image the PoC must fire against")
+    field_cmd.add_argument("--fixed-image", required=True, help="Image the PoC must stay silent against")
+    field_cmd.add_argument("--container-port", required=True, type=int, help="HTTP port inside the image")
+    field_cmd.add_argument("--health-path", default="/", help="Relative readiness path")
+    field_cmd.add_argument("--spec", required=True, type=Path, help="Field PoC spec: strategy, effect, requests")
 
     closed_auto = sub.add_parser(
         "closed-auto",
@@ -442,6 +455,16 @@ def _run_command(args: argparse.Namespace) -> int:
             result = run_closed_auto(
                 args.cve, args.output_root, api_key, model, provider, base_url,
                 args.repo, args.fixed_ref,
+            )
+        elif args.command == "field":
+            result = run_field_lab(
+                args.cve,
+                args.output_root,
+                args.vulnerable_image,
+                args.fixed_image,
+                args.container_port,
+                args.health_path,
+                args.spec,
             )
         elif args.command == "closed":
             result = run_closed_lab(

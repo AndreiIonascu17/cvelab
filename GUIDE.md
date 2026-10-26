@@ -543,6 +543,60 @@ Three things to know:
   It may also need more than the default 2 GB ceiling, which is
   `CVELAB_RUNTIME_MEMORY`, not a contract key.
 
+## 10a. Field PoC: one target you own
+
+The source and closed modes prove a vulnerability inside Docker, by a
+differential between two revisions or two images. Their PoC never leaves that
+harness: it is the validator, bound to the service names `vulnerable` and
+`patched`, and refuses a remote target by construction. That answers "does this
+bug reproduce"; it does not hand you something to run against a server to show a
+client the bug happening.
+
+The field mode emits that artifact. The deliverable is a standalone
+`field-poc.py` that takes `--target`, runs against one server you are permitted
+to test, in one run, and shows the effect rather than printing a version
+verdict:
+
+```bash
+cvelab --output-root out field CVE-YYYY-NNNNN \
+  --vulnerable-image vendor/app:vulnerable \
+  --fixed-image vendor/app:fixed \
+  --container-port 8080 --health-path /health \
+  --spec field-spec.json
+# then, from out/CVE-YYYY-NNNNN/artifacts:
+python3 field-poc.py --target https://your-server --authorized --show-bodies
+```
+
+Its proof does not need a second server. It is an effect a fixed build cannot
+produce, observed on the one target, and CVELab confirms that before handing
+the script over: the script must observe the effect on the vulnerable image and
+must stay silent on the fixed one. A script that fires on both is observing
+normal behavior, not the bug, and is refused.
+
+Two strategies carry the effect without a listener you have to stand up:
+
+- `inband_differential` reads the same resource two ways in one request round,
+  the vulnerable path and the path that authorizes correctly, and reports what
+  only the vulnerable path returned. The proof is per-target and needs no
+  marker: a value the vulnerable path returned and the authorized one withheld
+  was disclosed to someone who should not have it.
+- `marker_roundtrip` sends a unique marker through the vulnerable vector and
+  observes it surface where it should not. The marker is fresh each run, so a
+  reflection left by an earlier run is never counted.
+
+A spec names the strategy, the effect in words, and the requests; it never names
+a host. See `examples/field-spec.example.json`.
+
+### What the field mode will not do
+
+A class whose effect is not observable on a live target over the wire has no
+field PoC: a memory over-read that only crashes a worker, a race, a timing
+signal. The mode declines such a spec rather than emit a script that prints a
+verdict it never observed. And `NOT_OBSERVED` on a real target is not proof of a
+patch -- a differential strategy also returns it when the instance simply had
+nothing to disclose. To decide affected vs fixed regardless of data, check the
+build.
+
 ## 11. Troubleshooting
 
 ### Docker does not respond

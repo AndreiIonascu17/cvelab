@@ -53,6 +53,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The sidecar joins the lab container's network namespace instead of the lab
   publishing a port, so `127.0.0.1` reaches the product and nothing is
   exposed to the host.
+- A `field` lab mode that emits a single-target PoC the operator runs against
+  their own server, in one run, showing the effect rather than a version
+  verdict. CVELab proves the script against a vulnerable and a fixed image --
+  it must observe the effect on the first and stay silent on the second -- then
+  hands it over; a script that fires on both is refused. Two listener-free
+  strategies: `inband_differential` (read a resource the vulnerable and the
+  authorized way, report the gap) and `marker_roundtrip` (a fresh marker sent
+  through the vector and observed where it should not surface). Classes whose
+  effect is not observable over the wire are declined rather than faked.
 
 ### Changed
 
