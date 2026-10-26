@@ -426,6 +426,13 @@ def _run_command(args: argparse.Namespace) -> int:
             else:
                 result = generated
         elif args.command == "closed-auto":
+            # One without the other gave the resolver nothing and was dropped
+            # in silence: the record's own commit was used instead, which may
+            # belong to a different repository.
+            if bool(args.repo) != bool(args.fixed_ref):
+                raise ValueError(
+                    "--repo and --fixed-ref name one patch together; pass both or neither"
+                )
             result = run_closed_auto(
                 args.cve, args.output_root, api_key, model, provider, base_url,
                 args.repo, args.fixed_ref,

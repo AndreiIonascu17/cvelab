@@ -357,10 +357,25 @@ def resolve_source(dossier: dict, repo: str | None, fixed_ref: str | None) -> tu
     for reference in dossier.get("references", []):
         github = GITHUB_COMMIT.match(reference)
         if github:
-            return f"https://github.com/{github.group(1)}/{github.group(2)}.git", github.group(3)
+            # Lowercased: the id is matched case-insensitively, but fetching a
+            # single commit needs the exact 40-character form, so an uppercase
+            # id used to fall through to a full clone of the repository.
+            return (
+                f"https://github.com/{github.group(1)}/{github.group(2)}.git",
+                github.group(3).lower(),
+            )
         gitlab = GITLAB_COMMIT.match(reference)
         if gitlab:
-            return _safe_repo_url(gitlab.group(1) + ".git"), gitlab.group(2)
+            # The pattern matches a commit on any host, but only gitlab.com is
+            # supported. A reference to a self-hosted instance -- gitlab.gnome.org,
+            # salsa.debian.org -- used to raise from here and abandon the whole
+            # list, so a usable github.com reference further down was never
+            # reached. An unusable reference is skipped instead.
+            try:
+                url = _safe_repo_url(gitlab.group(1) + ".git")
+            except ValueError:
+                continue
+            return url, gitlab.group(2).lower()
     # Free and deterministic, so it is tried before the paid AI discovery.
     return resolve_source_via_osv(dossier.get("cve", ""))
 
@@ -560,21 +575,36 @@ def _fetch_one_commit(repo_url: str, fixed: str, output_root: Path) -> Path | No
     if not FULL_COMMIT_ID.fullmatch(fixed):
         return None
     key = hashlib.sha256(f"{repo_url}@{fixed}".encode()).hexdigest()[:16]
-    repository = output_root.resolve() / ".fix-cache" / key
+    cache = output_root.resolve() / ".fix-cache"
+    repository = cache / key
     if (repository / ".git").is_dir():
         return repository
-    repository.mkdir(parents=True, exist_ok=True)
-    _run_git(["init", "-q"], cwd=repository)
-    _run_git(["remote", "add", "origin", repo_url], cwd=repository)
+    # Built aside and moved into place, so a cache entry that exists is always
+    # one that holds the commit. Cleaning up only on RuntimeError left an
+    # init-only repository behind whenever the fetch was interrupted -- Ctrl-C,
+    # SIGTERM -- and every later run took it as cached, so that fix could never
+    # be read again.
+    staging = cache / f"{key}.partial"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
     try:
+        _run_git(["init", "-q"], cwd=staging)
+        _run_git(["remote", "add", "origin", repo_url], cwd=staging)
         with progress.stage(f"fetching {fixed[:12]} from {repo_url}"):
             _run_git(
                 ["fetch", "--depth=2", "--no-tags", "--end-of-options", "origin", fixed],
-                cwd=repository,
+                cwd=staging,
             )
     except RuntimeError:
-        shutil.rmtree(repository, ignore_errors=True)
+        shutil.rmtree(staging, ignore_errors=True)
         return None
+    except BaseException:
+        # Including KeyboardInterrupt and the Terminated the CLI raises on a
+        # signal: leaving the staging directory behind would only grow.
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    shutil.rmtree(repository, ignore_errors=True)
+    staging.replace(repository)
     return repository
 
 

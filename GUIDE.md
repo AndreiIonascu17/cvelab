@@ -484,6 +484,30 @@ artifact is available locally and registered in `closed-catalog.json`. VirtualBo
 can host the product, but the installation package, license, and vendor
 configuration cannot be fabricated or downloaded by bypassing access controls.
 
+### Pointing the resolver at the fix
+
+A product advisory names a patched release and withholds the endpoint, so a
+resolver reading only that prose answers `UNSUPPORTED` and is right to. The fix
+commit is usually public even where the report behind it is not, and it names
+the field, the authorization it restored, and often the test that exercises it:
+
+```bash
+cvelab closed-auto CVE-YYYY-NNNNN \
+  --repo https://gitlab.com/owner/project.git \
+  --fixed-ref FIX_COMMIT \
+  --key --model gpt-5.6-sol
+```
+
+The two options name one patch together, so pass both or neither. Without them,
+a commit the CVE record itself names is used. The patch is sent beside the
+record with the advisory's prose outranked, and it is read as reference material
+only -- it is a third-party diff, so nothing written inside it directs the run.
+
+The patch does not relieve the image requirement: the vulnerable tag must still
+be a published image inside the affected range. `resolution.json` records where
+the patch came from, not the patch, since the diff is public anyway and a copy
+would travel with every uploaded report.
+
 ## 11. Troubleshooting
 
 ### Docker does not respond

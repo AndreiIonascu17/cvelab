@@ -16,6 +16,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider's explanation, and is uploaded as declined. Refusals are now
   recognised from OpenAI and Chat Completions providers too, not only from
   Anthropic.
+- `closed-auto` reads the fix behind the CVE, not only the advisory. A
+  product advisory names a patched release and withholds the endpoint, so
+  the resolver answered `UNSUPPORTED` with nothing to work from; the fix
+  commit is public even where the report behind it is not, and it names the
+  field, the authorization it restored and often the test that exercises
+  it. `--repo` with `--fixed-ref` points at that commit, and a commit the
+  CVE record itself names is used otherwise. The patch is sent beside the
+  record with the advisory's prose explicitly outranked, and read as
+  reference material only -- a third-party diff from a public host, never a
+  source of instructions. The image requirement is unchanged: a vulnerable
+  tag must still be published and in the affected range. On CVE-2026-85529
+  this moved the answer from `UNSUPPORTED` to `ARTIFACT_REQUIRED`, naming
+  the GraphQL field and published tags either side of the fix.
+  `resolution.json` records where the patch came from, not the patch.
 
 ### Changed
 
@@ -46,6 +60,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still do not start is repaired from the container logs on its own, up to
   twice (`CVELAB_STARTUP_REPAIRS`), without spending either. In the latest
   nginx batch, three of four labs lost their first validation this way.
+- A commit fetched by id is asked for with `--depth=2` from a repository
+  built aside and moved into place, so a cache entry that exists always
+  holds the commit. Cleaning up only on a git error left an init-only
+  repository behind whenever the fetch was interrupted, and every later run
+  took it as cached, so that fix could never be read again.
+- A CVE record naming a commit on a self-hosted GitLab -- gitlab.gnome.org,
+  salsa.debian.org -- aborted the scan of the reference list, so
+  `closed-auto` stopped before planning and a usable github.com reference
+  further down was never reached. An unsupported host is skipped instead.
+- A commit id written in uppercase failed the exact-id check and fell
+  through to a blobless clone of the whole repository, which the
+  single-commit fetch exists to avoid.
+- `--repo` or `--fixed-ref` passed alone gave the resolver nothing and was
+  dropped in silence, with the record's own commit used instead; the two
+  name one patch together now. A fix the operator supplied that git rejects
+  is an error rather than a step message, which `--quiet` hid.
 
 ## [0.6.8] - 2026-10-24
 
