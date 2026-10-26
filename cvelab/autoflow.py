@@ -94,6 +94,60 @@ STARTUP_HINT = (
 )
 
 
+def effect_repair_limit() -> int:
+    """Repairs added when the lab runs but the effect does not show (CVELAB_EFFECT_REPAIRS, 0 to 5)."""
+    raw = os.getenv("CVELAB_EFFECT_REPAIRS", "").strip()
+    try:
+        value = int(raw) if raw else 2
+    except ValueError:
+        value = 2
+    return max(0, min(value, 5))
+
+
+EFFECT_HINT = (
+    "The lab started and the validator reached both services, but the security effect did "
+    "not show the way the contract requires; failed_proof_checks names what is missing. "
+    "Read what each revision answered and the service logs, and settle two things in order: "
+    "first whether the regression input reached the code the fix changes at all (route, "
+    "configuration, parameters, the condition the fix tests), then whether the observation "
+    "is the one this fix actually changes. Change the input or the observation, and keep the "
+    "build and the services if they worked."
+)
+
+
+def _compact(value: object, limit: int = 600) -> object:
+    """A validator result with every long string cut, so the digest stays small."""
+    if isinstance(value, dict):
+        return {key: _compact(item, limit) for key, item in list(value.items())[:20]}
+    if isinstance(value, list):
+        return [_compact(item, limit) for item in value[:10]]
+    if isinstance(value, str) and len(value) > limit:
+        return value[:limit] + f"... [{len(value) - limit} more characters]"
+    return value
+
+
+def _reached_targets(report: dict) -> bool:
+    """Whether the validator sent its input to the services, as opposed to failing before."""
+    validation = report.get("validation") or {}
+    return isinstance(validation, dict) and validation.get("attack_executed") is True
+
+
+def _validation_digest(report: dict) -> dict:
+    """What a repair needs first from a validation that did not prove the effect."""
+    validation = report.get("validation") or {}
+    if not isinstance(validation, dict):
+        validation = {}
+    checks = report.get("proof_checks") or {}
+    return {
+        "failed_proof_checks": sorted(name for name, passed in checks.items() if passed is False),
+        "attack_executed": validation.get("attack_executed"),
+        "observable_effect": validation.get("observable_effect"),
+        "vulnerable": _compact(validation.get("vulnerable")),
+        "patched": _compact(validation.get("patched")),
+        "service_logs": report.get("service_logs"),
+    }
+
+
 def _record(
     lab_dir: Path,
     attempts: list[dict],
@@ -219,13 +273,14 @@ def run_auto_workflow(
     pending_failure: dict | None = None
     repair_calls = 0
     startup_repairs = 0
+    effect_repairs = 0
     validation_attempt = 0
 
-    while validation_attempt < max_attempts:
+    while validation_attempt < max_attempts + effect_repairs:
         if pending_failure and not scripted_runner and not _infrastructure_failure(
             json.dumps(pending_failure, ensure_ascii=True)
         ):
-            if repair_calls >= max_attempts - 1:
+            if repair_calls >= max_attempts - 1 + effect_repairs:
                 break
             repair_calls += 1
             announce(
@@ -354,6 +409,8 @@ def run_auto_workflow(
                     "validation_attempts": validation_attempt,
                     "repair_calls": repair_calls,
                     "max_attempts": max_attempts,
+                    "effect_repairs": effect_repairs,
+                    "startup_repairs": startup_repairs,
                     "attempts": attempts,
                 }
                 validated.setdefault("report", {})["automation"] = automation
@@ -368,10 +425,29 @@ def run_auto_workflow(
                 )
                 delivered["automation"] = automation
                 return delivered
+            report = validated.get("report", validated)
+            reached = _reached_targets(report)
+            # The digest comes first so a long report cannot push it past
+            # what the repair prompt keeps.
             pending_failure = {
+                **({"hint": EFFECT_HINT} if reached else {}),
                 "kind": "proof_not_verified",
-                "report": validated.get("report", validated),
+                "digest": _validation_digest(report),
+                "report": report,
             }
+            if (
+                reached
+                and not scripted_runner
+                and validation_attempt >= max_attempts + effect_repairs
+                and effect_repairs < effect_repair_limit()
+            ):
+                # The closest case to a reproduction: the lab builds, starts
+                # and is probed, and only the effect is missing.
+                effect_repairs += 1
+                announce(
+                    f"{cve}: the lab runs but the effect did not show; one more repair "
+                    f"({effect_repairs}/{effect_repair_limit()})"
+                )
             attempts.append({
                 "phase": "validation",
                 "attempt": validation_attempt,
@@ -398,6 +474,8 @@ def run_auto_workflow(
         "validation_attempts": validation_attempt,
         "repair_calls": repair_calls,
         "max_attempts": max_attempts,
+        "effect_repairs": effect_repairs,
+        "startup_repairs": startup_repairs,
         "failure": reason,
         "attempts": attempts,
     }

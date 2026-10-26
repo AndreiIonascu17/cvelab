@@ -184,6 +184,7 @@ export CVELAB_RUNTIME_PIDS=1024
 # Starting the lab and asking again before any build:
 export CVELAB_STARTUP_GRACE=120      # seconds a health-checked service may take to start
 export CVELAB_STARTUP_REPAIRS=2      # startup-only repairs, not counted against the exploit's
+export CVELAB_EFFECT_REPAIRS=2       # extra repairs when the lab runs but the effect does not show
 export CVELAB_CONTRACT_RETRIES=2     # answers refused before the build, asked for again
 export CVELAB_PUBLISHED_RELEASES=on  # off: never offer an npm or PyPI release pair
 

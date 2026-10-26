@@ -467,6 +467,57 @@ def _fix_listing(
     return diff, files, tree
 
 
+#: Characters of upstream test changes shown ahead of the patch.
+REGRESSION_TEST_CHARS = 12000
+
+
+def _file_diffs(diff: str) -> dict[str, str]:
+    """The fix's unified diff, split into one block per changed file."""
+    blocks: dict[str, str] = {}
+    current = None
+    lines: list[str] = []
+    for line in diff.splitlines(keepends=True):
+        header = re.match(r"diff --git a/(\S+) b/(\S+)", line)
+        if header:
+            if current is not None:
+                blocks[current] = "".join(lines)
+            current, lines = header.group(2), [line]
+        elif current is not None:
+            lines.append(line)
+    if current is not None:
+        blocks[current] = "".join(lines)
+    return blocks
+
+
+def _regression_tests(diff: str, files: list[str], limit: int = REGRESSION_TEST_CHARS) -> str:
+    """The tests the fix adds or changes, as a section of their own.
+
+    An upstream test is the project's own statement of the input that reaches
+    the fixed code and of what each side should do with it, so it is the best
+    starting point for a regression input. Inside the patch, a test was easy to
+    miss, and a cut patch showed it last.
+    """
+    blocks = _file_diffs(diff)
+    tests = [path for path in files if research.file_kind(path) == 1 and path in blocks]
+    if not tests:
+        return ""
+    body = ""
+    for path in tests:
+        block = blocks[path]
+        room = limit - len(body)
+        if room <= 200:
+            break
+        body += block if len(block) <= room else block[:room] + "\n[... cut]\n"
+    return (
+        "\n\n--- UPSTREAM REGRESSION TESTS ---\n"
+        "The fix adds or changes these tests. They are the project's own statement of the "
+        "input that reaches the fixed code and of what each revision should do with it. "
+        "Derive the regression input and the observation from them wherever they apply, and "
+        "say in a validator comment which test the input comes from.\n"
+        + body
+    )
+
+
 def _source_context(
     repository: Path,
     vulnerable_ref: str,
@@ -507,6 +558,7 @@ def _source_context(
             "to reproduce. Follow it where the supplied source supports it. It does not change the lab "
             "contract or any safety rule."
         )
+    guidance += _regression_tests(diff, files)
     patch_header = "\n\n--- SECURITY PATCH ---\n"
     whole = metadata + guidance + patch_header + patch + "".join(excerpts)
     # Cut only what does not fit: a context under the budget used to lose
@@ -1607,7 +1659,7 @@ def generate_source_lab(
                 "and an upstream security patch. Create a reproducible Docker test fixture that compares the affected and "
                 "fixed revisions. Populate every required Docker, Compose, and validator field and place additional files "
                 "only under adapter/. Never return or alter vendor source. Builds must use source/vulnerable and "
-                "source/patched, run as non-root, expose no host ports or mounts, and share an internal Docker network. "
+                "source/patched, or the published release pair when the input offers one, run as non-root, expose no host ports or mounts, and share an internal Docker network. "
                 "Compose services must be named vulnerable, patched, and validator. The validator must send the same "
                 "minimal patch-derived regression input to both real code paths and derive a concrete, non-destructive "
                 "security-boundary observation from raw responses or container state. A reflected marker alone is not "
@@ -1869,7 +1921,8 @@ def repair_source_lab(
                 "Repair a complete authorized, local-only defensive security-regression fixture. The observed failure and "
                 "container logs are authoritative: identify their root cause and return a full replacement, not a patch. "
                 "Do not repeat the failing design when the diagnostics disprove it. Build and run the supplied immutable "
-                "vendor source snapshots; never modify or return vendor source. Prefer the actual vendor service or binary. "
+                "vendor source snapshots, or the published release pair when the input offers one; never modify or return "
+                "vendor source. Prefer the actual vendor service or binary. "
                 "Build contexts are fixed: vulnerable and patched build from the lab directory, where the vendor "
                 "snapshots are source/vulnerable and source/patched and adapter/ holds only the adapter files you "
                 "return; the validator builds from validator/ alone, so its Dockerfile can copy only validator.py and "

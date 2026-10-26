@@ -362,6 +362,12 @@ startup on its own, from the container logs, up to twice
 (`CVELAB_STARTUP_REPAIRS`, 0 to 5), without spending a validation attempt or a
 repair meant for the exploit.
 
+When the lab builds, starts and the validator reaches both services but the
+effect does not show, the repair is given the validator's observations and the
+end of each service's log first, and up to two repairs are added beyond the
+budget (`CVELAB_EFFECT_REPAIRS`, 0 to 5). Tests the fix adds or changes are
+shown ahead of the patch as the upstream statement of the input to start from.
+
 Stopping a run with Ctrl+C, SIGTERM or SIGHUP, including closing the terminal,
 stops the lab's containers before the process exits.
 
