@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `PROVIDER_DECLINED`, an outcome of its own for a run the model provider
+  declined under its usage policy. It used to end as `AUTO_GENERATION_FAILED`
+  and count as a failure of the tool. The run stops at once, without retrying
+  or rewording the request, names the provider and the model, keeps the
+  provider's explanation, and is uploaded as declined. Refusals are now
+  recognised from OpenAI and Chat Completions providers too, not only from
+  Anthropic.
+
 ### Changed
 
 - A lab that builds and starts but does not show the effect is the most

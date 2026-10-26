@@ -63,6 +63,15 @@ The vulnerable product is not publicly available or requires authentication,
 entitlement, a license, firmware, or a specific hardware environment. CVELab does
 not bypass these requirements or replace the product with a simulation.
 
+### PROVIDER_DECLINED
+
+The model provider declined the request under its own usage policy. This is
+the provider's decision, not a fault in the lab or in CVELab, and the run stops
+at once: the same request asked again gets the same answer, so it is neither
+retried nor reworded. The result names the provider and the model and carries
+the provider's explanation. You may rerun with another provider you have
+configured. A declined run is uploaded as declined, not as failed.
+
 ### POC_NOT_GENERATED
 
 Public data does not support a faithful reproduction. This outcome is preferable

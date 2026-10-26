@@ -128,6 +128,7 @@ STATUS = {
     "VALIDATED": "succeeded",
     "ARTIFACT_REQUIRED": "declined",
     "GENERATION_NOT_AVAILABLE": "declined",
+    "PROVIDER_DECLINED": "declined",
     "AUTO_GENERATION_FAILED": "failed",
     "AUTO_REPAIR_EXHAUSTED": "failed",
 }

@@ -56,6 +56,27 @@ SUPPORTED_PROVIDERS = set(SELECTABLE)
 PROVIDER_KEY_VARIABLE = {p.name: p.key_variable for p in PROVIDERS.values()}
 
 
+class ProviderDeclined(RuntimeError):
+    """The model provider declined the request under its own usage policy.
+
+    This is the provider's decision, not a fault in the lab or in CVELab, and
+    the same request asked again gets the same answer. The run stops, says
+    which provider and model declined, and records the outcome apart from
+    failures, so a benchmark does not count it as the tool getting it wrong.
+    """
+
+    def __init__(self, provider: str, model: str | None, detail: object) -> None:
+        self.provider = provider
+        self.model = model
+        self.detail = detail
+        # "refused structured generation" is kept in the text: older code and
+        # logs search for it.
+        super().__init__(
+            f"{provider} refused structured generation: the provider declined the request "
+            f"under its usage policy (model {model}): {detail}"
+        )
+
+
 class OutputBudgetExhausted(RuntimeError):
     """The model stopped at its output budget before the answer was complete."""
 
@@ -331,6 +352,8 @@ def _openai_response(
         if item.get("type") != "message":
             continue
         for content in item.get("content", []):
+            if content.get("type") == "refusal":
+                raise ProviderDeclined("OpenAI", model, content.get("refusal"))
             if content.get("type") == "output_text":
                 return _decode_json_text(content["text"], "OpenAI")
     raise RuntimeError("OpenAI response did not contain structured output")
@@ -393,7 +416,7 @@ def _anthropic_response(
     if stop_reason == "refusal" or any(block.get("type") == "refusal" for block in content):
         refusal = next((block for block in content if block.get("type") == "refusal"), {})
         details = payload.get("stop_details") or refusal
-        raise RuntimeError(f"Anthropic refused structured generation: {details}")
+        raise ProviderDeclined("Anthropic", model, details)
     for block in content:
         if block.get("type") == "text":
             return _decode_json_text(block.get("text", ""), "Anthropic")
@@ -476,7 +499,12 @@ def _chat_completions_response(
     choices = payload.get("choices", [])
     if not choices:
         raise RuntimeError(f"{provider.label} response did not contain a completion choice")
-    content = (choices[0].get("message", {}) or {}).get("content", "")
+    message = choices[0].get("message", {}) or {}
+    if message.get("refusal") or choices[0].get("finish_reason") == "content_filter":
+        raise ProviderDeclined(
+            provider.label, model, message.get("refusal") or "finish_reason=content_filter"
+        )
+    content = message.get("content", "")
     if isinstance(content, list):
         content = "".join(item.get("text", "") for item in content if isinstance(item, dict))
     finish = choices[0].get("finish_reason")
