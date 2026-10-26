@@ -21,6 +21,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from . import progress, usage
+from .ai import ProviderDeclined
 from .core import CVERecordNotFound, normalize_cve, run_lab, write_text
 from .deliverables import create_deliverables
 from .sourcegen import generate_source_lab, repair_source_lab
@@ -148,6 +149,42 @@ def _validation_digest(report: dict) -> dict:
     }
 
 
+def _declined(
+    cve: str,
+    lab_dir: Path,
+    attempts: list[dict],
+    error: ProviderDeclined,
+    announce: Callable[[str], None],
+) -> dict:
+    """End a run the model provider declined, as its own outcome rather than a failure."""
+    detail = error.detail
+    explanation = detail.get("explanation") if isinstance(detail, dict) else None
+    declined = {
+        "provider": error.provider,
+        "model": error.model,
+        "category": detail.get("category") if isinstance(detail, dict) else None,
+        "explanation": explanation or (str(detail) if detail else None),
+    }
+    message = (
+        f"{error.provider} declined this request under its usage policy (model {error.model}). "
+        "That is the provider's decision, not a fault in the lab, and CVELab does not retry "
+        "or reword the request. The provider's own explanation is included; you may rerun "
+        "with another provider you have configured."
+    )
+    announce(f"{cve}: {message}")
+    _record(lab_dir, attempts, "PROVIDER_DECLINED", {"kind": "provider_declined", **declined})
+    return {
+        "ok": False,
+        "status": "PROVIDER_DECLINED",
+        "cve": cve,
+        "lab_dir": str(lab_dir),
+        "declined": declined,
+        "message": message,
+        "attempts": attempts,
+        "error": str(error),
+    }
+
+
 def _record(
     lab_dir: Path,
     attempts: list[dict],
@@ -226,6 +263,8 @@ def run_auto_workflow(
             })
             if lab_dir.exists():
                 _record(lab_dir, attempts)
+            if isinstance(exc, ProviderDeclined):
+                return _declined(cve, lab_dir, attempts, exc, announce)
             if (
                 isinstance(exc, CVERecordNotFound)
                 or _infrastructure_failure(str(exc))
@@ -306,6 +345,8 @@ def run_auto_workflow(
                     "ok": False,
                     "error": str(exc)[:16000],
                 })
+                if isinstance(exc, ProviderDeclined):
+                    return _declined(cve, lab_dir, attempts, exc, announce)
                 pending_failure = {
                     "kind": "repair_generation_error",
                     "previous_failure": pending_failure,
@@ -372,6 +413,8 @@ def run_auto_workflow(
                         "error": str(repair_error)[:16000],
                     })
                     _record(lab_dir, attempts)
+                    if isinstance(repair_error, ProviderDeclined):
+                        return _declined(cve, lab_dir, attempts, repair_error, announce)
                     if _infrastructure_failure(str(repair_error)):
                         break
                     # Fall back to the ordinary path: the next loop repairs
