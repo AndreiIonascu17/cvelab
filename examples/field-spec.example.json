@@ -1,0 +1,30 @@
+{
+  "strategy": "inband_differential",
+  "observable_effect": "a private record returned by the vulnerable endpoint that the authorized endpoint withholds from an unauthenticated requester",
+  "health_timeout": 120,
+  "fixture": {
+    "command": ["app-console", "seed", "/cvelab/fixture/seed.script"],
+    "files": {
+      "seed.script": "create project demo --public\ncreate note demo --private \"internal detail\"\n"
+    },
+    "env": {},
+    "timeout": 300
+  },
+  "probe": [
+    {
+      "method": "POST",
+      "path": "/api/graphql",
+      "headers": { "Content-Type": "application/json" },
+      "body": "{\"query\":\"{ vulnerableField { nodes { body } } }\"}"
+    }
+  ],
+  "control": [
+    {
+      "method": "POST",
+      "path": "/api/graphql",
+      "headers": { "Content-Type": "application/json" },
+      "body": "{\"query\":\"{ authorizedField { nodes { body } } }\"}"
+    }
+  ],
+  "extract": { "json_values": "body" }
+}
