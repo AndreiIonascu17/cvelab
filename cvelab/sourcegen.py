@@ -1017,7 +1017,10 @@ def _validate_generated(files: list[dict], vulnerable_only: bool = False) -> Non
                 # Where the variable may point is bounded at run time instead,
                 # by the Compose network this file is checked to declare
                 # internal.
-                if "{" in url:
+                # The same holds for printf-style interpolation,
+                # "http://%s:%d" % (target, port): "%s" was read as a host
+                # and refused a validator that only formatted its target.
+                if "{" in url or "%" in url:
                     continue
                 allowed_hosts = {"vulnerable", "127.0.0.1", "localhost"}
                 if not vulnerable_only:
