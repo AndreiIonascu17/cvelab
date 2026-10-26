@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- A lab that builds and starts but does not show the effect is the most
+  common failure now, and its repair was working blind: a successful run kept
+  no service logs, and the validator's observations sat deep in a long report.
+  The repair now gets a digest first, with the failed proof checks, what each
+  revision answered and the end of each service's log, plus a hint to settle
+  whether the input reached the fixed code before changing the observation.
+  Such a run gets up to two repairs beyond the budget (`CVELAB_EFFECT_REPAIRS`).
+- Tests the fix adds or changes are shown in a section of their own, ahead of
+  the patch, as the project's statement of the input to start from. They used
+  to sit inside the patch, or after the code when the patch was cut.
+- The rule that builds use the source snapshots now names the published
+  release pair as its exception, in generation and repair alike; the
+  exception used to appear only further down in the input.
+
 ### Fixed
 
 - A lab whose services were slow to start was declared unhealthy before it

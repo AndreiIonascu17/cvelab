@@ -833,6 +833,30 @@ def compose_command(docker: str, lab_dir: Path) -> list[str]:
     return [docker, "compose", "-p", project, "-f", str(lab_dir / "docker-compose.yml")]
 
 
+#: Characters of service log kept with a failed validation, newest last.
+SERVICE_LOG_CHARS = 8000
+
+
+def _service_logs(
+    compose: list[str], services: list[str], lab_dir: Path, environment: dict[str, str]
+) -> str:
+    """The end of each target service's log, for a validation that did not prove the effect.
+
+    The validator says what it saw from outside; the services' own logs say
+    whether the request reached the code the fix changed at all. A repair
+    without them could only guess which of the two went wrong.
+    """
+    inspected = subprocess.run(
+        compose + ["logs", "--no-color", "--tail", "60", *services],
+        cwd=lab_dir,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    output = "\n".join(part.strip() for part in (inspected.stdout, inspected.stderr) if part and part.strip())
+    return redact(output)[-SERVICE_LOG_CHARS:]
+
+
 def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
     cve = normalize_cve(cve_value)
     lab_dir = output_root.resolve() / cve
@@ -1059,6 +1083,8 @@ def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
             "differential_confirmed": validation.get("differential_confirmed") is True,
             "ok": validated,
         }
+        if not validated:
+            report["service_logs"] = _service_logs(compose, list(startup_services), lab_dir, environment)
         write_text(lab_dir / "report.json", json.dumps(report, indent=2, ensure_ascii=True) + "\n")
         validated_run = report["ok"]
         return {"ok": report["ok"], "lab_dir": str(lab_dir), "report": report}
