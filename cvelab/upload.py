@@ -84,11 +84,19 @@ ALWAYS = (
     "plan.json",
     "report.json",
     "analysis.json",
+    # A closed-software lab's PoC.py reads the attack from contract.json
+    # beside it, so without this the shared lab downloaded as a validated
+    # run failed with FileNotFoundError on the first line that matters. A
+    # source lab has no such file and the allowlist skips what is absent.
+    "contract.json",
 )
 
 #: Withheld by --no-poc: what makes the lab reproducible rather than merely
-#: described.
-EXPLOIT = ("PoC.py", "manual.sh", "PoC.ps1", "MANUAL-POC.md", "plan.json")
+#: described. contract.json is the attack itself, so it travels with the
+#: exploit rather than with the description.
+EXPLOIT = (
+    "PoC.py", "manual.sh", "PoC.ps1", "MANUAL-POC.md", "plan.json", "contract.json",
+)
 
 #: What the control plane requires before a validated run joins the shared
 #: corpus (site/worker/gate.js in cvelab-prod). Kept first when a payload has

@@ -277,6 +277,32 @@ runpy.run_path(str(home / "PoC.py"), run_name="__main__")
 '''
 
 
+#: Linux caps one argument at 128 KiB (MAX_ARG_STRLEN), and the contract is
+#: passed to the sidecar as a single -e value. A fixture file may be 256 KiB
+#: on its own, so a contract carrying one used to reach docker as an argument
+#: too long -- raised by subprocess after the fixture and the attack had both
+#: run, with no report written.
+_MAX_CONTRACT_ARG = 96 * 1024
+
+
+def _attack_only(contract: dict[str, Any]) -> str:
+    """The contract as the PoC script needs it: the attack, not the seeding.
+
+    The fixture ran inside the container before the first request, so the
+    script has no use for it, and leaving it in both risked the argument
+    limit and shipped the fixture's own markers into the sidecar's
+    environment.
+    """
+    attack = {key: value for key, value in contract.items() if key != "fixture"}
+    text = json.dumps(attack, separators=(",", ":"))
+    if len(text) > _MAX_CONTRACT_ARG:
+        raise RuntimeError(
+            f"the attack contract is {len(text)} bytes, over the "
+            f"{_MAX_CONTRACT_ARG} an argument can carry; shorten the requests"
+        )
+    return text
+
+
 def _run_poc_script(
     container: str, port: int, contract: dict[str, Any], expected: str
 ) -> dict[str, Any]:
@@ -298,7 +324,7 @@ def _run_poc_script(
             *runtime_flags(),
             "-e", f"CVELAB_BASE=http://127.0.0.1:{port}",
             "-e", f"CVELAB_POC={_POC_SCRIPT}",
-            "-e", f"CVELAB_CONTRACT={json.dumps(contract, separators=(',', ':'))}",
+            "-e", f"CVELAB_CONTRACT={_attack_only(contract)}",
             "python:3.13-alpine", "python", "-c", _POC_BOOTSTRAP,
         ],
         capture_output=True, text=True, timeout=300, check=False,
@@ -324,7 +350,13 @@ def _apply_fixture(container: str, fixture: dict[str, Any]) -> dict[str, Any]:
     with tempfile.TemporaryDirectory() as staging:
         for name, text in fixture["files"].items():
             (Path(staging) / name).write_text(text, encoding="utf-8")
-        _docker("exec", container, "mkdir", "-p", _FIXTURE_ROOT)
+        # As uid 0 inside the container, and only for the directory: a product
+        # image that declares a non-root USER cannot create /cvelab, so every
+        # fixture on such an image failed here with a bare docker error. The
+        # copy and the fixture command itself still run as the image's own
+        # user, and this is the container's own root, not the host's.
+        _docker("exec", "-u", "0", container, "mkdir", "-p", _FIXTURE_ROOT)
+        _docker("exec", "-u", "0", container, "chmod", "777", _FIXTURE_ROOT)
         for name in fixture["files"]:
             _docker("cp", str(Path(staging) / name), f"{container}:{_FIXTURE_ROOT}/{name}")
     environment: list[str] = []
@@ -491,6 +523,29 @@ print("REPRODUCED" if confirmed else "BLOCKED")
 '''
 
 
+#: What a finished run writes, and therefore what a run that did not finish
+#: must not leave behind from the one before it.
+_VERDICT_FILES = (
+    Path("artifacts") / "report.json",
+    Path("artifacts") / "EVIDENCE.json",
+    Path("closed") / "evidence" / "result.json",
+)
+
+
+def _clear_previous_verdict(lab_dir: Path) -> None:
+    """Drop the last run's verdict before this one starts.
+
+    The contract, the PoC and the fixture are rewritten at the top of a run
+    but the verdict only at the end, so a run that raised partway -- a
+    fixture that exits non-zero, an image that never becomes healthy -- left
+    the previous run's `ok: true` and REAL_CLOSED_SOFTWARE_POC_VALIDATED on
+    disk beside the new inputs. `cvelab upload` then offered them as this
+    run's result.
+    """
+    for relative in _VERDICT_FILES:
+        (lab_dir / relative).unlink(missing_ok=True)
+
+
 def run_closed_lab(
     cve: str,
     output_root: Path,
@@ -513,6 +568,7 @@ def run_closed_lab(
     evidence_dir = lab_dir / "closed" / "evidence"
     artifacts.mkdir(parents=True, exist_ok=True)
     evidence_dir.mkdir(parents=True, exist_ok=True)
+    _clear_previous_verdict(lab_dir)
     (artifacts / "contract.json").write_text(json.dumps(contract, indent=2), encoding="utf-8")
     (artifacts / "PoC.py").write_text(_POC_SCRIPT, encoding="ascii")
     fixture = contract.get("fixture")
@@ -548,9 +604,16 @@ def run_closed_lab(
         "security_effect_observed": bool(vulnerable["confirmed"]),
         "vulnerable_confirmed": bool(vulnerable["confirmed"]),
         "patched_not_confirmed": patched is None or not patched["confirmed"],
-        "patched_blocked": differential,
         "manual_poc_verified": manual_poc_verified,
     }
+    # Without a fixed image there is no differential to confirm, so claiming
+    # the check and failing it made the status contradict its own rule that
+    # every check must pass. The source path does the same: it swaps in the
+    # checks the run could actually make.
+    if patched is None:
+        proof_checks["differential_not_available"] = True
+    else:
+        proof_checks["patched_blocked"] = differential
     fixture_text = (
         "No fixture was declared; the attack ran against the image as published."
         if not fixture
@@ -733,7 +796,14 @@ infer source-level root cause, patch provenance, or behavior outside the tested 
             f"-e {shlex.quote(f'{key}={value}')}" for key, value in fixture["env"].items()
         )
         fixture_steps = (
-            f'  docker exec "$container" mkdir -p {_FIXTURE_ROOT}\n'
+            # The fixture files are not shared with an uploaded lab -- they
+            # seed the filer's own instance -- so say so instead of failing
+            # inside docker cp with a path that is not there.
+            f'  [[ -d "$LAB_ROOT/fixture" ]] || {{ echo "This lab needs its '
+            f'fixture files in $LAB_ROOT/fixture; they are not part of a shared '
+            f'lab. See WALKTHROUGH.md." >&2; exit 2; }}\n'
+            f'  docker exec -u 0 "$container" mkdir -p {_FIXTURE_ROOT}\n'
+            f'  docker exec -u 0 "$container" chmod 777 {_FIXTURE_ROOT}\n'
             f'  docker cp "$LAB_ROOT/fixture/." "$container":{_FIXTURE_ROOT}/\n'
             f'  docker exec {exports} "$container" '
             + " ".join(shlex.quote(argument) for argument in fixture["command"])
