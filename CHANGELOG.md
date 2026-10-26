@@ -66,6 +66,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   targets from the instance -- enumerate public objects, bind an id per
   step, fill it into the probe -- so one emitted script sweeps every target
   it finds instead of the objects a fixture created.
+  `--target` takes one host and port in whatever form an engagement names it:
+  `10.0.0.5:8080`, `[2001:db8::1]:8443`, a bare hostname, or a full URL. A
+  scheme is optional, `http` is assumed without one and `https` on port 443,
+  and a target carrying a path is refused rather than quietly ignored, since
+  every request path comes from the spec. `--authorized` is still required on
+  every run.
+
+### Fixed
+
+- A bodyless request made the emitted `field-poc.py` die on import with
+  `NameError: null`, against every target, before sending anything: the spec
+  was pasted in as a Python literal and `null` is not a Python name. It now
+  travels as JSON text. Only a spec whose every request carried a body ever
+  ran.
+- A field PoC that crashed against the fixed image counted as silence, so the
+  lab was stored as `REAL_FIELD_POC_VALIDATED` on the strength of a run that
+  never looked. A verdict now counts only from a run that finished and said
+  `OBSERVED` or `NOT_OBSERVED`, and `script_ran_on_both` is a proof check of
+  its own.
+- A discovered value containing a quote or a backslash was substituted into
+  the serialized request raw, so it broke the request or moved a neighbouring
+  field. Values are escaped as JSON before they are filled in.
+- One busy object crowded every other discovered target out of the run: the
+  cap was applied to a flat list of children, so a project with more items
+  than the cap left the rest untested and the sweep reported a clean target.
+  The cap now takes a share from each parent, and says when it truncates.
+- A discovery that found nothing sent the probe anyway, carrying the
+  unreplaced `{{name}}` in the request, and read the empty result as a clean
+  target. It is now reported as nothing to test.
+- A `match` predicate other than `body_contains` validated and was then
+  ignored, so a spec asking for a regex got a bare marker check. It is now a
+  spec error.
 
 ### Changed
 

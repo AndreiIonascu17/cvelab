@@ -564,8 +564,15 @@ cvelab --output-root out field CVE-YYYY-NNNNN \
   --container-port 8080 --health-path /health \
   --spec field-spec.json
 # then, from out/CVE-YYYY-NNNNN/artifacts:
-python3 field-poc.py --target https://your-server --authorized --show-bodies
+python3 field-poc.py --target 10.0.0.5:8080 --authorized --show-bodies
 ```
+
+`--target` is one host and port, however you write it: `10.0.0.5:8080`,
+`[2001:db8::1]:8443`, `app.example.com` or `https://app.example.com`. Without a
+scheme the script assumes `http`, except on port 443. Every request path comes
+from the spec, so the target carries none, and a target with a path is refused
+rather than silently ignored. `--authorized` is required on every run: point the
+script only at a host the engagement covers.
 
 Its proof does not need a second server. It is an effect a fixed build cannot
 produce, observed on the one target, and CVELab confirms that before handing

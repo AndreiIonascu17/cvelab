@@ -90,6 +90,18 @@ class SpecTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             field.validate_spec(_marker(probe=[{"method": "GET", "path": "/search?q=static"}]))
 
+    def test_a_match_predicate_the_script_cannot_evaluate_is_refused(self) -> None:
+        """The script reads body_contains and nothing else.
+
+        Any other key validated and was then ignored, so a spec asking for a
+        regex got a bare marker check and reported on something it never
+        asked for.
+        """
+        with self.assertRaises(ValueError):
+            field.validate_spec(_marker(match={"body_regex": "<b>{{marker}}"}))
+        spec = field.validate_spec(_marker(match={"body_contains": "x{{marker}}"}))
+        self.assertEqual(spec["checks"][0]["match"], {"body_contains": "x{{marker}}"})
+
     def test_a_request_path_must_be_relative(self) -> None:
         with self.assertRaises(ValueError):
             field.validate_spec(_inband(probe=[{"path": "http://evil/x"}]))
@@ -176,6 +188,80 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual([f["value"] for f in findings], ["secret-a", "secret-b"])
         self.assertEqual([f["where"]["project"] for f in findings], ["a", "b"])
 
+    def _two_step_engine(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """A spec that enumerates projects, then the items inside each."""
+        spec = field.validate_spec({
+            "strategy": "inband_differential", "observable_effect": "disclosed bodies",
+            "checks": [{
+                "label": "notes",
+                "discover": [
+                    {"bind": "project",
+                     "query": [{"method": "GET", "path": "/projects"}],
+                     "extract": {"json_values": "fullPath"}},
+                    {"bind": "item",
+                     "query": [{"method": "GET", "path": "/items/{{project}}"}],
+                     "extract": {"json_values": "iid"}},
+                ],
+                "probe": [{"method": "GET", "path": "/n/{{project}}/{{item}}"}],
+                "control": [{"method": "GET", "path": "/c/{{project}}/{{item}}"}],
+                "extract": {"json_values": "body"},
+            }],
+        })
+        namespace: dict[str, Any] = {"__name__": "not_main"}
+        exec(compile(field.emit_field_poc("CVE-2026-0001", spec), "<f>", "exec"), namespace)  # noqa: S102
+        return spec, namespace
+
+    def test_the_cap_takes_a_share_from_every_parent(self) -> None:
+        """A busy first project must not crowd the others out of the run.
+
+        Truncating a flat list of children let one project's items fill the
+        cap, so every later project went untested and the sweep reported a
+        clean target.
+        """
+        spec, namespace = self._two_step_engine()
+        cap = namespace["MAX_CONTEXTS"]
+
+        class Crowded:
+            base = "http://x"
+
+            def send(self, step: dict[str, Any]) -> tuple[int, str]:
+                path = step["path"]
+                if path == "/projects":
+                    return 200, json.dumps([{"fullPath": "busy"}, {"fullPath": "quiet"}])
+                if path.endswith("/busy"):
+                    return 200, json.dumps([{"iid": str(i)} for i in range(cap * 2)])
+                return 200, json.dumps([{"iid": "only"}])
+
+        contexts = namespace["discover"](Crowded(), spec["checks"][0]["discover"])
+        self.assertEqual(len(contexts), cap)
+        projects = {ctx["project"] for ctx in contexts}
+        self.assertEqual(projects, {"busy", "quiet"})
+
+    def test_an_empty_discovery_tests_nothing_rather_than_a_literal(self) -> None:
+        """Finding nothing to test is its own outcome.
+
+        With no project discovered, the probe was sent anyway, carrying the
+        unreplaced {{project}} in its path, and the empty result read as a
+        clean target.
+        """
+        spec, namespace = self._two_step_engine()
+
+        class Empty:
+            base = "http://x"
+
+            def __init__(self) -> None:
+                self.paths: list[str] = []
+
+            def send(self, step: dict[str, Any]) -> tuple[int, str]:
+                self.paths.append(step["path"])
+                return 200, json.dumps([])
+
+        target = Empty()
+        contexts = namespace["discover"](target, spec["checks"][0]["discover"])
+        self.assertEqual(contexts, [])
+        self.assertEqual(target.paths, ["/projects"])
+        self.assertFalse(any("{{" in path for path in target.paths))
+
 
 class EmittedScriptTests(unittest.TestCase):
     def test_both_strategies_emit_valid_python(self) -> None:
@@ -190,13 +276,32 @@ class EmittedScriptTests(unittest.TestCase):
         spec = field.validate_spec(_inband())
         script = field.emit_field_poc("CVE-2026-0001", spec)
         # The embedded SPEC parses back to the same object the lab validated.
+        # It is JSON text rather than a Python literal, because a bodyless
+        # request carries null, which is not a Python name.
         tree = ast.parse(script)
         assign = next(
             node for node in tree.body
             if isinstance(node, ast.Assign)
             and any(getattr(t, "id", None) == "SPEC" for t in node.targets)
         )
-        self.assertEqual(ast.literal_eval(assign.value), spec)
+        self.assertEqual(json.loads(assign.value.args[0].value), spec)
+
+    def test_a_bodyless_request_still_emits_a_script_that_runs(self) -> None:
+        """Every request carries "body": null, which Python cannot name.
+
+        Embedded as a literal, a plain GET probe emitted a script that died
+        with NameError on import, against every target, before sending a
+        single request. Only the GitLab spec escaped it, by sending a body
+        on every request.
+        """
+        spec = field.validate_spec(_inband(
+            probe=[{"method": "GET", "path": "/a"}],
+            control=[{"method": "GET", "path": "/b"}],
+        ))
+        script = field.emit_field_poc("CVE-2026-0001", spec)
+        namespace: dict[str, Any] = {"__name__": "not_main"}
+        exec(compile(script, "field-poc.py", "exec"), namespace)  # noqa: S102
+        self.assertIsNone(namespace["SPEC"]["checks"][0]["probe"][0]["body"])
 
     def test_the_fixture_is_not_baked_into_the_deliverable(self) -> None:
         """The fixture seeds CVELab's own instance; it must not ship in the PoC."""
@@ -237,16 +342,92 @@ class EmittedScriptTests(unittest.TestCase):
         self.assertEqual(disclosed, ["SECRET"])
 
 
+class TargetTests(unittest.TestCase):
+    """One target, however the operator wrote it.
+
+    An engagement names a host and a port, so the script takes that shape
+    directly rather than requiring a URL to be assembled around it.
+    """
+
+    def setUp(self) -> None:
+        script = field.emit_field_poc("CVE-2026-0001", field.validate_spec(_inband()))
+        namespace: dict[str, Any] = {"__name__": "not_main"}
+        exec(compile(script, "<field-poc.py>", "exec"), namespace)  # noqa: S102
+        self.normalize = namespace["normalize_target"]
+
+    def test_a_host_and_port_needs_no_scheme(self) -> None:
+        for written, expected in [
+            ("10.0.0.5:8080", "http://10.0.0.5:8080"),
+            ("app.example.com", "http://app.example.com"),
+            # A bare 443 means TLS; that is what host:443 means in practice.
+            ("app.example.com:443", "https://app.example.com:443"),
+            ("[2001:db8::1]:8443", "http://[2001:db8::1]:8443"),
+            ("https://app.example.com/", "https://app.example.com"),
+            ("  10.0.0.5:8080  ", "http://10.0.0.5:8080"),
+        ]:
+            with self.subTest(written=written):
+                self.assertEqual(self.normalize(written), expected)
+
+    def test_a_target_that_is_not_one_host_is_refused(self) -> None:
+        for written in [
+            "",
+            "   ",
+            "ftp://host",
+            "http://",
+            # The spec supplies every request path, appended to this base, so
+            # a path here would prefix none of them.
+            "https://host/admin",
+            "https://host/?q=1",
+            "host:99999",
+            "host:not-a-port",
+        ]:
+            with self.subTest(written=written):
+                with self.assertRaises(SystemExit):
+                    self.normalize(written)
+
+
+class SubstitutionTests(unittest.TestCase):
+    """A value read off the target is data, never part of the request's syntax."""
+
+    def setUp(self) -> None:
+        script = field.emit_field_poc("CVE-2026-0001", field.validate_spec(_inband()))
+        namespace: dict[str, Any] = {"__name__": "not_main"}
+        exec(compile(script, "<field-poc.py>", "exec"), namespace)  # noqa: S102
+        self.subst = namespace["_subst"]
+
+    def test_a_discovered_value_with_a_quote_stays_one_value(self) -> None:
+        """Substituted into the JSON text raw, it broke the request.
+
+        The names are filled into the serialized request, so a project named
+        `a"b` ended the string early: the script either died in json.loads or
+        sent a request whose other fields had moved.
+        """
+        for value in ['a"b', "a\\b", 'a","method":"DELETE','a\nb', "ünicode"]:
+            with self.subTest(value=value):
+                out = self.subst({"path": "/p/{{name}}", "method": "GET"}, {"name": value})
+                self.assertEqual(out["path"], "/p/" + value)
+                self.assertEqual(out["method"], "GET")
+
+
 class ProofTests(unittest.TestCase):
     """The lab hands the script over only if it tells the instances apart."""
 
-    def _lab(self, vulnerable_observed: bool, patched_observed: bool) -> dict[str, Any]:
+    def _lab(
+        self,
+        vulnerable_observed: bool,
+        patched_observed: bool,
+        patched_ran: bool = True,
+    ) -> dict[str, Any]:
         outcomes = {
             "vulnerable": {"variant": "vulnerable", "image": "img:v", "fixture": None,
-                           "observed": vulnerable_observed, "exit_code": 0,
-                           "observation": {}, "output": "", "stderr": ""},
+                           "observed": vulnerable_observed, "ran": True,
+                           "verdict": "OBSERVED" if vulnerable_observed else "NOT_OBSERVED",
+                           "exit_code": 0, "observation": {}, "output": "", "stderr": ""},
             "patched": {"variant": "patched", "image": "img:p", "fixture": None,
-                        "observed": patched_observed, "exit_code": 0,
+                        "observed": patched_observed, "ran": patched_ran,
+                        "verdict": ("OBSERVED" if patched_observed else "NOT_OBSERVED")
+                        if patched_ran else None,
+                        "exit_code": 0 if patched_ran else 1,
                         "observation": {}, "output": "", "stderr": ""},
         }
         with tempfile.TemporaryDirectory() as root:
@@ -285,6 +466,21 @@ class ProofTests(unittest.TestCase):
         lab = self._lab(vulnerable_observed=False, patched_observed=False)
         self.assertIs(lab["result"]["ok"], False)
         self.assertIs(lab["evidence"]["proof_checks"]["effect_observed_on_vulnerable"], False)
+
+    def test_a_script_that_crashed_on_the_fixed_image_is_not_silence(self) -> None:
+        """A run that never finished observed nothing because it never looked.
+
+        Reading only the last line, an unreachable target, a traceback or a
+        killed sidecar on the fixed image read as silence and the lab was
+        stored as a validated field PoC.
+        """
+        lab = self._lab(
+            vulnerable_observed=True, patched_observed=False, patched_ran=False
+        )
+        self.assertIs(lab["result"]["ok"], False)
+        self.assertNotEqual(lab["evidence"]["status"], "REAL_FIELD_POC_VALIDATED")
+        self.assertIs(lab["evidence"]["proof_checks"]["silent_on_fixed"], False)
+        self.assertIs(lab["evidence"]["proof_checks"]["script_ran_on_both"], False)
 
     def test_a_fixed_image_is_required(self) -> None:
         with tempfile.TemporaryDirectory() as root:

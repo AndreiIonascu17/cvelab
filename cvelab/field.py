@@ -217,6 +217,15 @@ def _validate_check(check: Any, strategy: str, where: str) -> dict[str, Any]:
         match = check.get("match", {"body_contains": _MARKER_TOKEN})
         if not isinstance(match, dict):
             raise ValueError(f"{where}.match must be an object")
+        # The script reads body_contains and nothing else, so any other key
+        # was accepted and then ignored: a spec written with body_regex got a
+        # bare marker check instead and reported on something it never asked
+        # for. A predicate the script cannot evaluate is a spec error.
+        unknown = set(match) - {"body_contains"}
+        if unknown:
+            raise ValueError(
+                f"{where}.match supports only body_contains, not {sorted(unknown)}"
+            )
         out["match"] = match
         _allowed(probe, "probe")
         _allowed([out["observe"]], "observe")
@@ -284,7 +293,11 @@ observes. It writes nothing back beyond those requests.
 from __future__ import annotations
 import argparse, json, re, ssl, sys, urllib.error, urllib.parse, urllib.request, uuid
 
-SPEC = @@SPEC@@
+# The spec travels as JSON text rather than as a Python literal. A bodyless
+# request carries "body": null, and null, true and false are not Python names:
+# pasted in as a literal they made the script die with NameError on import,
+# against every target, before it sent a single request.
+SPEC = json.loads(r"""@@SPEC@@""")
 
 
 def _collect(value, key, out):
@@ -311,11 +324,50 @@ def tokens(body, extractor):
     return [m if isinstance(m, str) else m[0] for m in found]
 
 
+def normalize_target(value):
+    """One target, however the operator wrote it.
+
+    An engagement names a host and a port -- 10.0.0.5:8080, [2001:db8::1]:443,
+    app.example.com -- so a scheme is optional and http is assumed when none
+    is given. A port alone picks no default: 443 is https, anything else http,
+    which is what a plain host:port means in practice.
+    """
+    text = str(value).strip()
+    if not text:
+        raise SystemExit("--target is empty")
+    try:
+        if "://" not in text:
+            # urlsplit reads "10.0.0.5:8080" as scheme "10.0.0.5", and a bare
+            # host as a path, so the scheme is decided here and the rest
+            # parsed as an authority afterwards.
+            port = urllib.parse.urlsplit("//" + text).port
+            text = ("https://" if port == 443 else "http://") + text
+        parsed = urllib.parse.urlsplit(text)
+        parsed.port
+    except ValueError as error:
+        # A port out of range reaches urlsplit as ValueError. The operator
+        # mistyped a target; a traceback is the wrong way to say so.
+        raise SystemExit("--target is not a usable host and port: %s" % error) from None
+    if parsed.scheme not in ("http", "https"):
+        raise SystemExit(
+            "--target must be http or https, or a bare host:port, not %r" % parsed.scheme
+        )
+    if not parsed.hostname:
+        raise SystemExit("--target names no host, e.g. 10.0.0.5:8080 or https://host")
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        # Every request path comes from the spec and is appended to the base,
+        # so a path here would silently prefix none of them.
+        raise SystemExit("--target must be a host and port only, with no path")
+    # Rebuilt rather than trimmed: the base is exactly the scheme and the
+    # authority the operator named, with nothing for a request path to
+    # collide with.
+    return "%s://%s" % (parsed.scheme, parsed.netloc)
+
+
 class Target:
     def __init__(self, base, insecure, timeout):
+        base = normalize_target(base)
         parsed = urllib.parse.urlsplit(base)
-        if parsed.scheme not in ("http", "https") or not parsed.netloc:
-            raise SystemExit("--target must be an http(s) URL, e.g. https://host")
         self.base = base.rstrip("/")
         self.timeout = timeout
         self.ctx = None
@@ -350,9 +402,12 @@ MAX_CONTEXTS = 200
 
 
 def _subst(obj, ctx):
+    # Substituted into the JSON text, a discovered value carrying a quote or a
+    # backslash broke json.loads or changed a neighbouring field. The value is
+    # escaped as JSON first, so what lands in the text is always one string.
     s = json.dumps(obj)
     for key, value in ctx.items():
-        s = s.replace("{{" + key + "}}", str(value))
+        s = s.replace("{{" + key + "}}", json.dumps(str(value))[1:-1])
     return json.loads(s)
 
 
@@ -366,24 +421,38 @@ def discover(target, steps):
     """
     contexts = [{}]
     for step in steps:
-        grown = []
+        # Children are kept per parent and interleaved, so the cap takes a
+        # share from each. Truncating a flat list let the first project's 250
+        # issues fill it and every later project went untested, reported as a
+        # clean run.
+        families = []
         for ctx in contexts:
+            children = []
             if "derive" in step:
                 value = step["derive"]
                 for key, bound in ctx.items():
                     value = value.replace("{{" + key + "}}", str(bound))
-                nc = dict(ctx); nc[step["bind"]] = value; grown.append(nc)
+                nc = dict(ctx); nc[step["bind"]] = value; children.append(nc)
             else:
                 last = None
                 for req in _subst(step["query"], ctx):
                     last = target.send(req)
                 for token in tokens(last[1] if last else "", step["extract"]):
-                    nc = dict(ctx); nc[step["bind"]] = token; grown.append(nc)
+                    nc = dict(ctx); nc[step["bind"]] = token; children.append(nc)
+            families.append(children)
+        grown = []
+        for index in range(max([len(f) for f in families] or [0])):
+            for family in families:
+                if index < len(family):
+                    grown.append(family[index])
         seen = set(); unique = []
         for ctx in grown:
             key = json.dumps(ctx, sort_keys=True)
             if key not in seen:
                 seen.add(key); unique.append(ctx)
+        if len(unique) > MAX_CONTEXTS:
+            print("  [NOTE] %d targets found, testing the first %d"
+                  % (len(unique), MAX_CONTEXTS), file=sys.stderr)
         contexts = unique[:MAX_CONTEXTS]
     return contexts
 
@@ -426,7 +495,9 @@ def _run_marker(target, check, ctx, show_bodies, findings):
 
 def main():
     p = argparse.ArgumentParser(description="CVELab field PoC for @@CVE@@")
-    p.add_argument("--target", required=True, help="https://host you are permitted to test")
+    p.add_argument("--target", required=True,
+                   help="One host you are permitted to test: 10.0.0.5:8080, "
+                        "[2001:db8::1]:443 or https://app.example.com")
     p.add_argument("--authorized", action="store_true",
                    help="Required: confirm you may test --target")
     p.add_argument("--show-bodies", action="store_true")
@@ -446,8 +517,16 @@ def main():
     findings = []
     run = _run_inband if SPEC["strategy"] == "inband_differential" else _run_marker
     for check in SPEC["checks"]:
-        contexts = discover(target, check.get("discover", [])) or [{}]
-        print("check    %s: %d target(s) discovered" % (check["label"], len(contexts)), file=sys.stderr)
+        steps = check.get("discover", [])
+        contexts = discover(target, steps)
+        if steps and not contexts:
+            # Sending the probe anyway left {{project}} in the request and
+            # reported the empty result as a clean one. Finding nothing to
+            # test is its own outcome.
+            print("check    %s: nothing to test on this target" % check["label"],
+                  file=sys.stderr)
+            continue
+        print("check    %s: %d target(s)" % (check["label"], len(contexts)), file=sys.stderr)
         for ctx in contexts:
             run(target, check, ctx, args.show_bodies, findings)
     observed = bool(findings)
@@ -473,10 +552,20 @@ def emit_field_poc(cve: str, spec: dict[str, Any]) -> str:
     deliverable.
     """
     embedded = {key: value for key, value in spec.items() if key != "fixture"}
+    text = json.dumps(embedded, indent=4)
+    # The spec sits inside a triple-quoted raw string so a reviewer reads it
+    # indented. JSON escapes every quote inside a string, so three in a row
+    # cannot occur and the text always ends in a brace -- but the script is a
+    # deliverable, so the invariant is checked rather than assumed.
+    if '"""' in text or text.endswith("\\"):
+        raise ValueError("the spec cannot be embedded verbatim in the deliverable")
+    effect = spec["observable_effect"]
+    if '"""' in effect:
+        raise ValueError("observable_effect must not contain a triple quote")
     return (
         _FIELD_POC
-        .replace("@@SPEC@@", json.dumps(embedded, indent=4))
-        .replace("@@EFFECT@@", spec["observable_effect"])
+        .replace("@@SPEC@@", text)
+        .replace("@@EFFECT@@", effect)
         .replace("@@CVE@@", cve)
     )
 
@@ -515,8 +604,15 @@ def _run_field_script(container: str, port: int, script: str, strategy: str) -> 
         if line.startswith("{") and line.endswith("}"):
             with contextlib.suppress(json.JSONDecodeError):
                 observation = json.loads(line)
+    # The script reports one of two verdicts and exits 0 or 1 to match. Any
+    # other ending -- a traceback, an unreachable target, a killed sidecar --
+    # is neither, and reading only "is the last line OBSERVED" called it
+    # silence: a crash against the fixed image proved the fix.
+    ran = verdict[0] in ("OBSERVED", "NOT_OBSERVED") and completed.returncode in (0, 1)
     return {
-        "observed": verdict[0] == "OBSERVED",
+        "observed": ran and verdict[0] == "OBSERVED",
+        "ran": ran,
+        "verdict": verdict[0] if ran else None,
         "exit_code": completed.returncode,
         "observation": observation,
         "output": completed.stdout[-_MAX_FIELD_OUTPUT:],
@@ -614,11 +710,15 @@ def run_field_lab(
 
     # The script is a field PoC only if it tells the two apart on its own: the
     # effect on the vulnerable instance, silence on the fixed one. Firing on
-    # both means it observes normal behavior, not the bug.
-    proven = bool(vulnerable["observed"] and not patched["observed"])
+    # both means it observes normal behavior, not the bug. Silence counts only
+    # from a run that finished and said so -- a script that crashed against
+    # the fixed image observed nothing because it never looked.
+    both_ran = bool(vulnerable["ran"] and patched["ran"])
+    proven = bool(both_ran and vulnerable["observed"] and not patched["observed"])
     proof_checks = {
+        "script_ran_on_both": both_ran,
         "effect_observed_on_vulnerable": bool(vulnerable["observed"]),
-        "silent_on_fixed": not patched["observed"],
+        "silent_on_fixed": bool(patched["ran"] and not patched["observed"]),
         "field_poc_proven": proven,
     }
 
@@ -654,7 +754,7 @@ def run_field_lab(
     (artifacts / "EVIDENCE.json").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
     (evidence_dir / "result.json").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
 
-    usage = "python3 field-poc.py --target https://your-server --authorized --show-bodies"
+    usage = "python3 field-poc.py --target 10.0.0.5:8080 --authorized --show-bodies"
     walkthrough = f"""# {cve} Field PoC
 
 ## What this is
@@ -673,11 +773,19 @@ cd {cve}/artifacts
 {usage}
 ```
 
+`--target` is one host and port: `10.0.0.5:8080`, `[2001:db8::1]:8443` or
+`https://app.example.com`. A scheme is optional and `http` is assumed without
+one, except for port 443. The paths come from the spec, so the target carries
+none.
+
 It prints `OBSERVED` and exits 0 when the effect is present, `NOT_OBSERVED` and
-exits 1 when it is not. `--show-bodies` prints the disclosed values in full.
+exits 1 when it is not. Any other ending is a run that did not finish, not a
+result. `--show-bodies` prints the disclosed values in full.
 
 The `--authorized` flag is required: the script sends live requests to the
-target and reads what it returns.
+target and reads what it returns. Point it only at a host the engagement
+covers, and keep the authorization in writing -- the effect it demonstrates is
+real data leaving a real server.
 
 ## Strategy: {spec['strategy']}
 
