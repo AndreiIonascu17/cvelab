@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A validator that built its target URL printf-style, `"http://%s:%d" %
+  (target, port)`, was refused as reaching an external host named `%s`. An
+  f-string placeholder was already treated as a variable; a printf one now
+  is too, and a literal external host is still refused.
 - A lab whose services were slow to start was declared unhealthy before it
   listened, and the run spent a validation attempt and a repair on what was
   never an exploit failure. A health-checked service now gets a start period

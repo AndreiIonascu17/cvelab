@@ -182,11 +182,15 @@ class ExternalTargetGuardTests(unittest.TestCase):
         return [
             host
             for host in self.HOSTS.findall(source.lower())
-            if "{" not in host and host not in self.ALLOWED
+            if "{" not in host and "%" not in host and host not in self.ALLOWED
         ]
 
     def test_an_interpolated_target_is_allowed(self) -> None:
         self.assertEqual(self.rejected('url = f"http://{target}/read"'), [])
+
+    def test_a_printf_interpolated_target_is_allowed(self) -> None:
+        self.assertEqual(self.rejected('url = "http://%s:%d/read" % (target, PORT)'), [])
+        self.assertEqual(self.rejected('url = "http://%(host)s/read" % values'), [])
 
     def test_a_real_external_host_is_still_rejected(self) -> None:
         self.assertEqual(
@@ -200,7 +204,7 @@ class ExternalTargetGuardTests(unittest.TestCase):
         source = (
             Path(__file__).resolve().parent.parent / "cvelab" / "sourcegen.py"
         ).read_text(encoding="utf-8")
-        self.assertIn('if "{" in url:', source)
+        self.assertIn('if "{" in url or "%" in url:', source)
 
 
 class AdapterTreeTests(unittest.TestCase):
