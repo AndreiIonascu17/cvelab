@@ -30,6 +30,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this moved the answer from `UNSUPPORTED` to `ARTIFACT_REQUIRED`, naming
   the GraphQL field and published tags either side of the fix.
   `resolution.json` records where the patch came from, not the patch.
+- A closed-software contract can declare the state its vulnerability needs
+  as a `fixture`: an argv list, named files copied into `/cvelab/fixture`,
+  and an environment the contract carries. It runs once the image answers
+  its health path and before the first attack request. A product rarely
+  ships the state its own vulnerability needs -- the GraphQL field behind
+  CVE-2026-85529 discloses a private comment only once a project, a work
+  item and that comment exist -- and creating it is authenticated work the
+  unauthenticated attack is not allowed to do, so the contract used to
+  answer with nothing to disclose and the run looked like a fixed build. A
+  fixture that exits non-zero aborts the run, because an unseeded instance
+  discloses nothing and that is indistinguishable from a patched one. The
+  readiness deadline is a contract key for the same reason: two minutes
+  covers an application server binding a port, not a product migrating a
+  database on first boot. Measured on the GitLab images: ready after 31
+  seconds warm and 101 cold, with the fixture itself taking 18.
+- `PoC.py` evaluates the contract's own predicate and prints one verdict,
+  `REPRODUCED` or `BLOCKED`, and the runner executes it against each variant
+  expecting the verdict that variant should produce. The reproduction the
+  runner performed and the script a reviewer was handed used to be two
+  different programs, and only the first ever ran; `ok` now requires both.
+  The sidecar joins the lab container's network namespace instead of the lab
+  publishing a port, so `127.0.0.1` reaches the product and nothing is
+  exposed to the host.
 
 ### Changed
 
@@ -76,6 +99,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped in silence, with the record's own commit used instead; the two
   name one patch together now. A fix the operator supplied that git rejects
   is an error rather than a step message, which `--quiet` hid.
+- A contract carrying a fixture reached docker as a single argument over the
+  128 KiB Linux allows, so the run raised `argument list too long` after the
+  fixture and the attack had both finished, with no report written. The
+  script is sent the attack alone -- the fixture has already run inside the
+  container -- and a contract still too large is refused before the build.
+- A run that raised partway left the previous run's `ok: true` and validated
+  status on disk beside the new inputs, and `cvelab upload` offered them as
+  this run's result. The verdict files are dropped when a run starts.
+- A closed lab uploaded as a validated run could not be run by whoever
+  downloaded it: `PoC.py` reads the attack from `contract.json` beside it,
+  which was not among the shared documents. It travels with the exploit now.
+- A fixture failed on any image declaring a non-root `USER`, because the
+  directory it copies into could not be created. The directory is made as
+  the container's own uid 0; the copy and the fixture command still run as
+  the image's user.
+- Without a fixed image the run reported `patched_blocked: false` beside a
+  validated status, contradicting its own rule that every proof check must
+  pass. There is no differential to confirm, so the check is not claimed.
 
 ## [0.6.8] - 2026-10-24
 

@@ -117,7 +117,11 @@ class ApplyTests(unittest.TestCase):
         ) as run:
             record = closed._apply_fixture("lab", self.fixture)
 
-        self.assertEqual(calls[0], ("exec", "lab", "mkdir", "-p", "/cvelab/fixture"))
+        # As uid 0, and only for the directory: a product image declaring a
+        # non-root USER cannot create /cvelab, so every fixture on such an
+        # image failed here.
+        self.assertEqual(calls[0], ("exec", "-u", "0", "lab", "mkdir", "-p", "/cvelab/fixture"))
+        self.assertEqual(calls[1], ("exec", "-u", "0", "lab", "chmod", "777", "/cvelab/fixture"))
         self.assertEqual(copied, {"lab:/cvelab/fixture/seed.rb": "puts 1\n"})
         self.assertEqual(
             run.call_args.args[0],
@@ -367,10 +371,115 @@ class EvidenceTests(unittest.TestCase):
         self.assertNotRegex(lab["evidence"]["status"], r"^REAL_[A-Z_]+_POC_VALIDATED$")
 
     def test_without_a_fixed_image_nothing_is_claimed_about_the_patch(self) -> None:
+        """No differential to confirm, so the check is not claimed at all.
+
+        Reporting `patched_blocked: false` beside a validated status made the
+        status contradict its own rule that every check must pass.
+        """
         lab = self._lab(shipped_passed=True, patched=False)
-        self.assertIs(lab["evidence"]["proof_checks"]["patched_blocked"], False)
+        checks = lab["evidence"]["proof_checks"]
+        self.assertNotIn("patched_blocked", checks)
+        self.assertIs(checks["differential_not_available"], True)
+        self.assertTrue(all(checks.values()))
         self.assertIsNone(lab["evidence"]["validation"]["patched"])
         self.assertIs(lab["result"]["ok"], True)
+
+
+class ContractArgumentTests(unittest.TestCase):
+    """The contract reaches the sidecar as one -e value, which Linux caps."""
+
+    def test_the_fixture_does_not_travel_to_the_poc_script(self) -> None:
+        """It already ran inside the container before the first request.
+
+        Carried along it risked the argument limit for nothing and shipped
+        the fixture's own markers into the sidecar's environment.
+        """
+        contract = _contract()
+        contract["fixture"] = closed._validate_fixture({
+            "command": ["seed"],
+            "files": {"seed.rb": "canary marker"},
+            "env": {"CVELAB_MARKER": "canary"},
+        })
+        sent = json.loads(closed._attack_only(contract))
+        self.assertNotIn("fixture", sent)
+        self.assertNotIn("canary", json.dumps(sent))
+        self.assertEqual(sent["attack"], contract["attack"])
+        self.assertEqual(sent["observe"], contract["observe"])
+
+    def test_a_contract_too_large_for_one_argument_is_refused_up_front(self) -> None:
+        """Raised after the fixture and the attack had both run, with no report.
+
+        A fixture file may be 256 KiB on its own, and one argument carries
+        128 KiB, so docker answered "argument list too long" at the very end
+        of the run.
+        """
+        contract = _contract()
+        contract["attack"] = [
+            {"method": "POST", "path": "/a", "headers": [], "body": "x" * 200_000}
+        ]
+        with self.assertRaises(RuntimeError) as caught:
+            closed._attack_only(contract)
+        self.assertIn("argument", str(caught.exception))
+
+
+class RerunTests(unittest.TestCase):
+    """A run that does not finish must not leave the last one's verdict."""
+
+    def test_an_aborted_rerun_drops_the_previous_validated_evidence(self) -> None:
+        """`cvelab upload` reads report.json and EVIDENCE.json off the disk.
+
+        The contract, the PoC and the fixture are rewritten at the top of a
+        run but the verdict only at the end, so a run that raised partway
+        left `ok: true` and a validated status beside the new inputs.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            output = Path(root)
+            lab_dir = output / "CVE-2026-0001"
+            artifacts = lab_dir / "artifacts"
+            evidence_dir = lab_dir / "closed" / "evidence"
+            for directory in (artifacts, evidence_dir):
+                directory.mkdir(parents=True, exist_ok=True)
+            stale = {"ok": True, "status": "REAL_CLOSED_SOFTWARE_POC_VALIDATED"}
+            for path in (
+                artifacts / "report.json",
+                artifacts / "EVIDENCE.json",
+                evidence_dir / "result.json",
+            ):
+                path.write_text(json.dumps(stale), encoding="utf-8")
+
+            contract_path = output / "contract.json"
+            contract_path.write_text(json.dumps(_contract()), encoding="utf-8")
+            with mock.patch.object(
+                closed, "_run_variant", side_effect=RuntimeError("never became healthy")
+            ):
+                with self.assertRaises(RuntimeError):
+                    closed.run_closed_lab(
+                        "CVE-2026-0001", output, "image:vulnerable", None, 80, "/",
+                        contract_path,
+                    )
+            for path in (
+                artifacts / "report.json",
+                artifacts / "EVIDENCE.json",
+                evidence_dir / "result.json",
+            ):
+                self.assertFalse(path.exists(), f"{path.name} survived the failed run")
+
+
+class SharedLabTests(unittest.TestCase):
+    """A closed lab uploaded as a success must be one someone can run."""
+
+    def test_the_attack_contract_travels_with_the_exploit(self) -> None:
+        """PoC.py reads the attack from contract.json beside it.
+
+        Without it the shared lab, downloaded as a validated run, failed
+        with FileNotFoundError on the first line that matters.
+        """
+        from cvelab import upload
+
+        self.assertIn("contract.json", upload.ALWAYS)
+        self.assertIn("contract.json", upload.EXPLOIT)
+        withheld = tuple(n for n in upload.ALWAYS if n not in upload.EXPLOIT)
+        self.assertNotIn("contract.json", withheld)
 
 
 if __name__ == "__main__":
