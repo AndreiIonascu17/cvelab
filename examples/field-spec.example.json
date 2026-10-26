@@ -3,28 +3,77 @@
   "observable_effect": "a private record returned by the vulnerable endpoint that the authorized endpoint withholds from an unauthenticated requester",
   "health_timeout": 120,
   "fixture": {
-    "command": ["app-console", "seed", "/cvelab/fixture/seed.script"],
+    "command": [
+      "app-console",
+      "seed",
+      "/cvelab/fixture/seed.script"
+    ],
     "files": {
       "seed.script": "create project demo --public\ncreate note demo --private \"internal detail\"\n"
     },
     "env": {},
     "timeout": 300
   },
-  "probe": [
+  "checks": [
     {
-      "method": "POST",
-      "path": "/api/graphql",
-      "headers": { "Content-Type": "application/json" },
-      "body": "{\"query\":\"{ vulnerableField { nodes { body } } }\"}"
+      "label": "record notes",
+      "discover": [
+        {
+          "bind": "project",
+          "query": [
+            {
+              "method": "POST",
+              "path": "/api/graphql",
+              "headers": {
+                "Content-Type": "application/json"
+              },
+              "body": "{\"query\":\"{ projects(first:25){ nodes { fullPath } } }\"}"
+            }
+          ],
+          "extract": {
+            "json_values": "fullPath"
+          }
+        },
+        {
+          "bind": "record_iid",
+          "query": [
+            {
+              "method": "POST",
+              "path": "/api/graphql",
+              "headers": {
+                "Content-Type": "application/json"
+              },
+              "body": "{\"query\":\"{ project(fullPath:\\\"{{project}}\\\"){ records(first:25){ nodes { iid } } } }\"}"
+            }
+          ],
+          "extract": {
+            "json_values": "iid"
+          }
+        }
+      ],
+      "probe": [
+        {
+          "method": "POST",
+          "path": "/api/graphql",
+          "headers": {
+            "Content-Type": "application/json"
+          },
+          "body": "{\"query\":\"{ vulnerableField(project:\\\"{{project}}\\\", iid:\\\"{{record_iid}}\\\"){ nodes { body } } }\"}"
+        }
+      ],
+      "control": [
+        {
+          "method": "POST",
+          "path": "/api/graphql",
+          "headers": {
+            "Content-Type": "application/json"
+          },
+          "body": "{\"query\":\"{ authorizedField(project:\\\"{{project}}\\\", iid:\\\"{{record_iid}}\\\"){ nodes { body } } }\"}"
+        }
+      ],
+      "extract": {
+        "json_values": "body"
+      }
     }
-  ],
-  "control": [
-    {
-      "method": "POST",
-      "path": "/api/graphql",
-      "headers": { "Content-Type": "application/json" },
-      "body": "{\"query\":\"{ authorizedField { nodes { body } } }\"}"
-    }
-  ],
-  "extract": { "json_values": "body" }
+  ]
 }

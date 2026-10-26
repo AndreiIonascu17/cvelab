@@ -136,6 +136,93 @@ def _validate_extractor(value: Any) -> dict[str, str]:
     raise ValueError("extract must be one of json_values or regex")
 
 
+_BIND_NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
+_MAX_DISCOVER_STEPS = 6
+
+
+def _substitutions(text: str) -> set[str]:
+    return set(re.findall(r"\{\{([a-z][a-z0-9_]*)\}\}", text))
+
+
+def _validate_discover(value: Any) -> tuple[list[dict[str, Any]], set[str]]:
+    """The chain that enumerates targets before the probe tests each one.
+
+    Each step binds one name. A query step runs requests and binds every value
+    its extractor pulls, fanning the run out over them; a derive step binds a
+    value computed from names already bound. A step may use only names bound by
+    an earlier step, so a spec cannot reference a target it never discovered.
+    """
+    if value is None:
+        return [], set()
+    if not isinstance(value, list):
+        raise ValueError("discover must be a list of steps")
+    if len(value) > _MAX_DISCOVER_STEPS:
+        raise ValueError(f"discover may hold at most {_MAX_DISCOVER_STEPS} steps")
+    steps: list[dict[str, Any]] = []
+    bound: set[str] = set()
+    for index, step in enumerate(value):
+        where = f"discover[{index}]"
+        if not isinstance(step, dict):
+            raise ValueError(f"{where} must be an object")
+        name = str(step.get("bind", ""))
+        if not _BIND_NAME.fullmatch(name):
+            raise ValueError(f"{where}.bind must match {_BIND_NAME.pattern}")
+        if name in bound:
+            raise ValueError(f"{where}.bind {name!r} is already bound")
+        if "derive" in step:
+            template = str(step["derive"])
+            missing = _substitutions(template) - bound
+            if missing:
+                raise ValueError(f"{where}.derive uses unbound {sorted(missing)}")
+            steps.append({"bind": name, "derive": template})
+        elif "query" in step:
+            query = _validate_sequence(step.get("query"), f"{where}.query")
+            missing = _substitutions(json.dumps(query)) - bound
+            if missing:
+                raise ValueError(f"{where}.query uses unbound {sorted(missing)}")
+            steps.append({
+                "bind": name,
+                "query": query,
+                "extract": _validate_extractor(step.get("extract")),
+            })
+        else:
+            raise ValueError(f"{where} must have either query or derive")
+        bound.add(name)
+    return steps, bound
+
+
+def _validate_check(check: Any, strategy: str, where: str) -> dict[str, Any]:
+    if not isinstance(check, dict):
+        raise ValueError(f"{where} must be an object")
+    discover, bound = _validate_discover(check.get("discover"))
+    out: dict[str, Any] = {"label": str(check.get("label", where)), "discover": discover}
+
+    def _allowed(sequence: list[dict[str, Any]], what: str) -> None:
+        missing = _substitutions(json.dumps(sequence)) - bound - {"marker"}
+        if missing:
+            raise ValueError(f"{where}.{what} uses names nothing binds: {sorted(missing)}")
+
+    if strategy == "inband_differential":
+        out["probe"] = _validate_sequence(check.get("probe"), f"{where}.probe")
+        out["control"] = _validate_sequence(check.get("control"), f"{where}.control")
+        out["extract"] = _validate_extractor(check.get("extract"))
+        _allowed(out["probe"], "probe")
+        _allowed(out["control"], "control")
+    else:  # marker_roundtrip
+        probe = _validate_sequence(check.get("probe"), f"{where}.probe")
+        if _MARKER_TOKEN not in json.dumps(probe):
+            raise ValueError(f"{where}.probe must place {_MARKER_TOKEN} somewhere")
+        out["probe"] = probe
+        out["observe"] = _validate_request(check.get("observe"), f"{where}.observe")
+        match = check.get("match", {"body_contains": _MARKER_TOKEN})
+        if not isinstance(match, dict):
+            raise ValueError(f"{where}.match must be an object")
+        out["match"] = match
+        _allowed(probe, "probe")
+        _allowed([out["observe"]], "observe")
+    return out
+
+
 def validate_spec(spec: Any) -> dict[str, Any]:
     """A field spec, independent of any one target.
 
@@ -157,23 +244,20 @@ def validate_spec(spec: Any) -> dict[str, Any]:
 
     out: dict[str, Any] = {"strategy": strategy, "observable_effect": effect.strip()}
 
-    if strategy == "inband_differential":
-        out["probe"] = _validate_sequence(spec.get("probe"), "probe")
-        out["control"] = _validate_sequence(spec.get("control"), "control")
-        out["extract"] = _validate_extractor(spec.get("extract"))
-    else:  # marker_roundtrip
-        probe = _validate_sequence(spec.get("probe"), "probe")
-        serialized = json.dumps(probe)
-        if _MARKER_TOKEN not in serialized:
-            raise ValueError(
-                f"marker_roundtrip probe must place {_MARKER_TOKEN} somewhere"
-            )
-        out["probe"] = probe
-        out["observe"] = _validate_request(spec.get("observe"), "observe")
-        match = spec.get("match", {"body_contains": _MARKER_TOKEN})
-        if not isinstance(match, dict):
-            raise ValueError("match must be an object")
-        out["match"] = match
+    # A spec may list several checks -- work items and merge requests are two
+    # for the same disclosure -- or, in the short form, carry one check's keys
+    # at the top level. The top-level form is kept so a one-check spec stays
+    # small and the earlier form still validates.
+    if spec.get("checks") is not None:
+        checks = spec["checks"]
+        if not isinstance(checks, list) or not checks:
+            raise ValueError("checks must be a non-empty list")
+        out["checks"] = [
+            _validate_check(check, strategy, f"checks[{i}]")
+            for i, check in enumerate(checks)
+        ]
+    else:
+        out["checks"] = [_validate_check(spec, strategy, "spec")]
 
     if spec.get("fixture") is not None:
         out["fixture"] = _validate_fixture(spec["fixture"])
@@ -262,45 +346,82 @@ class Target:
             raise SystemExit("cannot reach %s: %s" % (self.base, e))
 
 
-def _subst(sequence, marker):
-    return json.loads(json.dumps(sequence).replace("{{marker}}", marker))
+MAX_CONTEXTS = 200
 
 
-def run_inband_differential(target, show_bodies):
+def _subst(obj, ctx):
+    s = json.dumps(obj)
+    for key, value in ctx.items():
+        s = s.replace("{{" + key + "}}", str(value))
+    return json.loads(s)
+
+
+def discover(target, steps):
+    """Build the list of targets a check will test.
+
+    Each step fans the run out: a query step binds every value its extractor
+    returns, a derive step binds one value computed from names already bound.
+    With no steps the check runs once against whatever the requests name on
+    their own.
+    """
+    contexts = [{}]
+    for step in steps:
+        grown = []
+        for ctx in contexts:
+            if "derive" in step:
+                value = step["derive"]
+                for key, bound in ctx.items():
+                    value = value.replace("{{" + key + "}}", str(bound))
+                nc = dict(ctx); nc[step["bind"]] = value; grown.append(nc)
+            else:
+                last = None
+                for req in _subst(step["query"], ctx):
+                    last = target.send(req)
+                for token in tokens(last[1] if last else "", step["extract"]):
+                    nc = dict(ctx); nc[step["bind"]] = token; grown.append(nc)
+        seen = set(); unique = []
+        for ctx in grown:
+            key = json.dumps(ctx, sort_keys=True)
+            if key not in seen:
+                seen.add(key); unique.append(ctx)
+        contexts = unique[:MAX_CONTEXTS]
+    return contexts
+
+
+def _run_inband(target, check, ctx, show_bodies, findings):
     last_probe = None
-    for step in SPEC["probe"]:
+    for step in _subst(check["probe"], ctx):
         last_probe = target.send(step)
     last_control = None
-    for step in SPEC["control"]:
+    for step in _subst(check["control"], ctx):
         last_control = target.send(step)
-    probe_tokens = tokens(last_probe[1], SPEC["extract"])
-    control_tokens = set(tokens(last_control[1], SPEC["extract"]))
-    disclosed = [t for t in probe_tokens if t not in control_tokens]
-    print("probe    status=%s  %d value(s) via the vulnerable path" % (last_probe[0], len(probe_tokens)))
-    print("control  status=%s  %d value(s) via the authorized path" % (last_control[0], len(set(probe_tokens) & control_tokens)))
+    probe_tokens = tokens(last_probe[1], check["extract"])
+    control_tokens = set(tokens(last_control[1], check["extract"]))
     seen = set()
-    unique = [t for t in disclosed if not (t in seen or seen.add(t))]
-    for value in unique:
+    disclosed = [t for t in probe_tokens
+                 if t not in control_tokens and not (t in seen or seen.add(t))]
+    where = " ".join("%s=%s" % (k, v) for k, v in ctx.items()) or "(no discovery)"
+    for value in disclosed:
         shown = value if show_bodies else (value[:120] + ("..." if len(value) > 120 else ""))
-        print("  [DISCLOSED] %r" % shown)
-    return {"observed": bool(unique), "disclosed": unique,
-            "probe_status": last_probe[0], "control_status": last_control[0]}
+        print("  [DISCLOSED] %s via %s" % (repr(shown), check["label"]))
+        if where != "(no discovery)":
+            print("              at %s" % where)
+        findings.append({"check": check["label"], "where": ctx, "value": value})
 
 
-def run_marker_roundtrip(target, show_bodies):
+def _run_marker(target, check, ctx, show_bodies, findings):
     marker = "cvelab-" + uuid.uuid4().hex[:16]
-    for step in _subst(SPEC["probe"], marker):
-        status, _ = target.send(step)
-    obs_status, obs_body = target.send(_subst([SPEC["observe"]], marker)[0])
-    match = SPEC["match"]
-    needle = str(match.get("body_contains", "{{marker}}")).replace("{{marker}}", marker)
-    observed = needle in obs_body
-    print("marker   %s" % marker)
-    print("observe  status=%s  marker_present=%s" % (obs_status, observed))
-    if observed and show_bodies:
-        idx = obs_body.find(needle)
-        print("  [REFLECTED] ...%s..." % obs_body[max(0, idx - 40):idx + len(needle) + 40])
-    return {"observed": observed, "marker": marker, "observe_status": obs_status}
+    local = dict(ctx); local["marker"] = marker
+    for step in _subst(check["probe"], local):
+        target.send(step)
+    obs_status, obs_body = target.send(_subst(check["observe"], local))
+    needle = str(check["match"].get("body_contains", "{{marker}}")).replace("{{marker}}", marker)
+    if needle in obs_body:
+        print("  [REFLECTED] marker %s surfaced via %s (status=%s)" % (marker, check["label"], obs_status))
+        if show_bodies:
+            idx = obs_body.find(needle)
+            print("              ...%s..." % obs_body[max(0, idx - 40):idx + len(needle) + 40])
+        findings.append({"check": check["label"], "where": ctx, "marker": marker})
 
 
 def main():
@@ -322,14 +443,20 @@ def main():
     target = Target(args.target, args.insecure, args.timeout)
     print("target   %s" % target.base, file=sys.stderr)
     print("effect   %s" % SPEC["observable_effect"], file=sys.stderr)
-    if SPEC["strategy"] == "inband_differential":
-        result = run_inband_differential(target, args.show_bodies)
-    else:
-        result = run_marker_roundtrip(target, args.show_bodies)
+    findings = []
+    run = _run_inband if SPEC["strategy"] == "inband_differential" else _run_marker
+    for check in SPEC["checks"]:
+        contexts = discover(target, check.get("discover", [])) or [{}]
+        print("check    %s: %d target(s) discovered" % (check["label"], len(contexts)), file=sys.stderr)
+        for ctx in contexts:
+            run(target, check, ctx, args.show_bodies, findings)
+    observed = bool(findings)
     if args.json:
-        print(json.dumps({"target": target.base, "strategy": SPEC["strategy"], **result}))
-    print("OBSERVED" if result["observed"] else "NOT_OBSERVED")
-    return 0 if result["observed"] else 1
+        print(json.dumps({"target": target.base, "strategy": SPEC["strategy"],
+                          "observed": observed, "findings": findings}))
+    print("%d finding(s)" % len(findings), file=sys.stderr)
+    print("OBSERVED" if observed else "NOT_OBSERVED")
+    return 0 if observed else 1
 
 
 if __name__ == "__main__":
@@ -338,10 +465,17 @@ if __name__ == "__main__":
 
 
 def emit_field_poc(cve: str, spec: dict[str, Any]) -> str:
-    """The standalone deliverable, with the spec frozen into it."""
+    """The standalone deliverable, with the spec frozen into it.
+
+    The fixture is dropped: it seeds CVELab's own validation instance and has
+    no place in a script pointed at a server that already holds real data, and
+    it would otherwise ship the fixture's markers and object ids inside the
+    deliverable.
+    """
+    embedded = {key: value for key, value in spec.items() if key != "fixture"}
     return (
         _FIELD_POC
-        .replace("@@SPEC@@", json.dumps(spec, indent=4))
+        .replace("@@SPEC@@", json.dumps(embedded, indent=4))
         .replace("@@EFFECT@@", spec["observable_effect"])
         .replace("@@CVE@@", cve)
     )
