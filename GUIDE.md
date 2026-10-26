@@ -354,6 +354,14 @@ memory, two CPUs and 1,024 processes. Change these with `CVELAB_RUNTIME_MEMORY`
 `CVELAB_RUNTIME_PIDS`; an empty value removes that limit. The build is bounded
 separately by `CVELAB_BUILD_MEMORY` (default `4g`).
 
+A service with a healthcheck gets at least two minutes to come up
+(`CVELAB_STARTUP_GRACE`, in seconds, 0 to 900; 0 leaves the lab's own
+setting). Probes that fail during that time do not count, and a healthy answer
+ends the wait at once. If the services still do not start, the run repairs the
+startup on its own, from the container logs, up to twice
+(`CVELAB_STARTUP_REPAIRS`, 0 to 5), without spending a validation attempt or a
+repair meant for the exploit.
+
 Stopping a run with Ctrl+C, SIGTERM or SIGHUP, including closing the terminal,
 stops the lab's containers before the process exits.
 

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -53,6 +54,44 @@ def _infrastructure_failure(message: str) -> bool:
         "cvelab_model is not set",
     )
     return any(indicator in lowered for indicator in indicators)
+
+
+_STARTUP_MARKERS = (
+    "dependency failed to start",
+    "is unhealthy",
+    "docker stage 'startup' failed",
+    "lab service did not become healthy",
+)
+
+
+def _startup_failure(message: str) -> bool:
+    """Whether a run ended because the lab's services never came up.
+
+    The validator only runs once its targets are healthy, so these runs say
+    nothing about the PoC. They are repaired on their own, without spending
+    a validation attempt or one of the repairs meant for the exploit.
+    """
+    lowered = message.lower()
+    return any(marker in lowered for marker in _STARTUP_MARKERS)
+
+
+def startup_repair_limit() -> int:
+    """Startup-only repairs allowed per run (CVELAB_STARTUP_REPAIRS, 0 to 5)."""
+    raw = os.getenv("CVELAB_STARTUP_REPAIRS", "").strip()
+    try:
+        value = int(raw) if raw else 2
+    except ValueError:
+        value = 2
+    return max(0, min(value, 5))
+
+
+STARTUP_HINT = (
+    "The lab's services did not become healthy, so the validator never ran and "
+    "nothing is known yet about the exploit. Fix only what keeps the services from "
+    "starting: the build output, the start command, the port, the healthcheck command "
+    "and route, and anything the logs below show failing. Keep the regression input "
+    "and the validator's evidence logic as they are unless they are the cause."
+)
 
 
 def _record(
@@ -179,6 +218,7 @@ def run_auto_workflow(
     scripted_runner = bool(plan.get("runner"))
     pending_failure: dict | None = None
     repair_calls = 0
+    startup_repairs = 0
     validation_attempt = 0
 
     while validation_attempt < max_attempts:
@@ -236,6 +276,64 @@ def run_auto_workflow(
         try:
             validated = run_lab(cve, output_root, keep)
         except Exception as exc:
+            if (
+                _startup_failure(str(exc))
+                and not _infrastructure_failure(str(exc))
+                and not scripted_runner
+                and startup_repairs < startup_repair_limit()
+            ):
+                # The validator never ran: this attempt is given back, and
+                # the repair below does not count against the exploit's.
+                validation_attempt -= 1
+                startup_repairs += 1
+                attempts.append({
+                    "phase": "startup",
+                    "attempt": startup_repairs,
+                    "ok": False,
+                    "error": str(exc)[:24000],
+                })
+                _record(lab_dir, attempts)
+                announce(
+                    f"{cve}: services did not start; repairing the startup "
+                    f"({startup_repairs}/{startup_repair_limit()}) without spending a repair"
+                )
+                try:
+                    repaired = repair_source_lab(
+                        cve,
+                        output_root,
+                        {"hint": STARTUP_HINT, "kind": "startup_failure", "error": str(exc)},
+                        repair_calls,
+                        api_key,
+                        model,
+                        provider,
+                        base_url,
+                        research_mode=research_mode,
+                    )
+                except Exception as repair_error:
+                    attempts.append({
+                        "phase": "startup_repair",
+                        "attempt": startup_repairs,
+                        "ok": False,
+                        "error": str(repair_error)[:16000],
+                    })
+                    _record(lab_dir, attempts)
+                    if _infrastructure_failure(str(repair_error)):
+                        break
+                    # Fall back to the ordinary path: the next loop repairs
+                    # from the startup failure and counts it.
+                    validation_attempt += 1
+                    pending_failure = {"kind": "runtime_error", "error": str(exc)}
+                    continue
+                attempts.append({
+                    "phase": "startup_repair",
+                    "attempt": startup_repairs,
+                    "ok": True,
+                    "status": repaired.get("status"),
+                })
+                plan = repaired.get("plan", plan)
+                pending_failure = None
+                _record(lab_dir, attempts)
+                continue
             pending_failure = {"kind": "runtime_error", "error": str(exc)}
             attempts.append({
                 "phase": "validation",

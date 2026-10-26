@@ -435,6 +435,48 @@ def enforce(compose: list[str], lab_dir: Path, environment: dict[str, str]) -> d
     return model
 
 
+_DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)")
+_DURATION_SECONDS = {"ns": 1e-9, "us": 1e-6, "µs": 1e-6, "ms": 1e-3, "s": 1, "m": 60, "h": 3600}
+
+
+def duration_seconds(value: object) -> float | None:
+    """Seconds in a Compose duration such as 2s, 1m30s or 500ms; None when unset or unreadable."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) / 1e9  # Compose resolves a bare number to nanoseconds
+    text = str(value).strip()
+    parts = _DURATION_PART.findall(text)
+    if not parts or "".join(number + unit for number, unit in parts) != text:
+        return None
+    return sum(float(number) * _DURATION_SECONDS[unit] for number, unit in parts)
+
+
+def startup_grace_override(model: dict, grace_seconds: int) -> dict:
+    """Give every health-checked service a start period of at least grace_seconds.
+
+    A generated healthcheck usually probes every two seconds and gives up
+    after thirty tries, so a product that compiles assets or migrates a
+    database on first boot is marked unhealthy before it ever listened, and
+    the validator never runs. Failures during the start period do not count
+    against the retries, while a healthy answer still ends it at once, so a
+    fast service is not slowed down. A service with no healthcheck, or with a
+    longer start period of its own, is left alone.
+    """
+    services: dict[str, object] = {}
+    if grace_seconds <= 0:
+        return {"services": services}
+    for name, service in (model.get("services") or {}).items():
+        check = service.get("healthcheck") or {}
+        test = check.get("test")
+        if not test or check.get("disable") or (isinstance(test, list) and test[:1] == ["NONE"]):
+            continue
+        current = duration_seconds(check.get("start_period"))
+        if current is None or current < grace_seconds:
+            services[name] = {"healthcheck": {"start_period": f"{grace_seconds}s"}}
+    return {"services": services}
+
+
 def limits_override(model: dict, limits: dict[str, object]) -> dict:
     """A Compose override that gives each service the default limits it lacks.
 

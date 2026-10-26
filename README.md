@@ -181,6 +181,12 @@ export CVELAB_RUNTIME_MEMORY=2g
 export CVELAB_RUNTIME_CPUS=2
 export CVELAB_RUNTIME_PIDS=1024
 
+# Starting the lab and asking again before any build:
+export CVELAB_STARTUP_GRACE=120      # seconds a health-checked service may take to start
+export CVELAB_STARTUP_REPAIRS=2      # startup-only repairs, not counted against the exploit's
+export CVELAB_CONTRACT_RETRIES=2     # answers refused before the build, asked for again
+export CVELAB_PUBLISHED_RELEASES=on  # off: never offer an npm or PyPI release pair
+
 # How much of a large fix the model may read before writing a lab (GUIDE, section 5):
 export CVELAB_RESEARCH=auto          # auto, on, or off; --research overrides it
 export CVELAB_RESEARCH_ROUNDS=3      # research calls before a lab is written
