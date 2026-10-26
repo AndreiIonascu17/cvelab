@@ -200,18 +200,42 @@ class ResolverInputTests(unittest.TestCase):
             self.assertEqual("abc123", resolution["security_patch"]["fixed_ref"])
             self.assertFalse(result["ok"])
 
-    def test_a_fix_that_cannot_be_read_does_not_stop_the_resolver(self) -> None:
+    def test_a_fix_the_record_merely_named_may_fail_to_be_read(self) -> None:
+        """The resolver then answers from the record alone, as it did before."""
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             _, calls = self.resolve(
                 root,
-                repo=URL, fixed_ref="abc123",
-                extra=[mock.patch.object(
-                    closed_auto, "fix_patch", side_effect=RuntimeError("git fetch failed"),
-                )],
+                extra=[
+                    mock.patch.object(
+                        closed_auto, "resolve_source", return_value=(URL, "abc123"),
+                    ),
+                    mock.patch.object(
+                        closed_auto, "fix_patch",
+                        side_effect=RuntimeError("git fetch failed"),
+                    ),
+                ],
             )
             sent = json.loads(calls[0]["input_text"])
             self.assertIsNone(sent["security_patch"])
+
+    def test_a_fix_the_operator_supplied_must_not_fail_in_silence(self) -> None:
+        """--repo with --fixed-ref is the operator saying where the patch is.
+
+        Swallowed, a typo or a revision git rejects left the resolver
+        answering from advisory prose while the patch the operator supplied
+        was dropped, and nothing in the result or resolution.json said so.
+        """
+        with tempfile.TemporaryDirectory() as name:
+            with self.assertRaises(RuntimeError):
+                self.resolve(
+                    Path(name),
+                    repo=URL, fixed_ref="abc123",
+                    extra=[mock.patch.object(
+                        closed_auto, "fix_patch",
+                        side_effect=RuntimeError("git fetch failed"),
+                    )],
+                )
 
     def test_without_a_fix_the_record_is_still_resolved_alone(self) -> None:
         with tempfile.TemporaryDirectory() as name:
@@ -222,6 +246,113 @@ class ResolverInputTests(unittest.TestCase):
             sent = json.loads(calls[0]["input_text"])
             self.assertIsNone(sent["security_patch"])
             self.assertEqual(CVE, sent["cve"])
+
+
+class ReferenceScanTests(unittest.TestCase):
+    """What the resolver takes from a CVE record's reference list."""
+
+    def test_a_self_hosted_commit_link_does_not_abandon_the_list(self) -> None:
+        """Only gitlab.com is supported, but the pattern matches any host.
+
+        A reference to a self-hosted instance used to raise from inside the
+        scan, so closed-auto died before planning and a usable github.com
+        reference further down was never reached.
+        """
+        dossier = {
+            "cve": CVE,
+            "references": [
+                "https://gitlab.gnome.org/GNOME/glib/-/commit/" + "a" * 40,
+                "https://github.com/example/product/commit/" + "b" * 40,
+            ],
+        }
+        self.assertEqual(
+            sourcegen.resolve_source(dossier, None, None),
+            ("https://github.com/example/product.git", "b" * 40),
+        )
+
+    def test_an_unsupported_host_alone_resolves_to_nothing(self) -> None:
+        dossier = {
+            "cve": CVE,
+            "references": ["https://salsa.debian.org/a/b/-/commit/" + "c" * 40],
+        }
+        with mock.patch.object(sourcegen, "resolve_source_via_osv", return_value=None):
+            self.assertIsNone(sourcegen.resolve_source(dossier, None, None))
+
+    def test_an_uppercase_commit_id_still_takes_the_single_commit_path(self) -> None:
+        """The id is matched case-insensitively but fetched exactly.
+
+        Left uppercase it failed the full-id check and fell through to a
+        blobless clone of the whole repository -- the minutes and gigabytes
+        the single-commit fetch exists to avoid.
+        """
+        dossier = {
+            "cve": CVE,
+            "references": ["https://github.com/example/product/commit/" + "AB" * 20],
+        }
+        _, reference = sourcegen.resolve_source(dossier, None, None)
+        self.assertEqual(reference, "ab" * 20)
+        self.assertTrue(sourcegen.FULL_COMMIT_ID.fullmatch(reference))
+
+
+class FixCacheTests(unittest.TestCase):
+    """A cache entry that exists is one that holds the commit."""
+
+    def test_an_interrupted_fetch_leaves_nothing_to_be_reused(self) -> None:
+        """Cleanup ran only on RuntimeError.
+
+        Ctrl-C or a signal left an init-only repository behind, and every
+        later run took it as cached, so that fix could never be read again.
+        """
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            fixed = "d" * 40
+            calls: list[list[str]] = []
+
+            def git(args, cwd=None, **kwargs):
+                calls.append(list(args))
+                if args[0] == "fetch":
+                    raise KeyboardInterrupt
+                return ""
+
+            with mock.patch.object(sourcegen, "_run_git", side_effect=git):
+                with self.assertRaises(KeyboardInterrupt):
+                    sourcegen._fetch_one_commit(URL, fixed, root)
+
+            cache = root / ".fix-cache"
+            left = list(cache.iterdir()) if cache.is_dir() else []
+            self.assertEqual(left, [], f"left behind: {left}")
+
+            # And the next run fetches again rather than reusing a shell.
+            calls.clear()
+            with mock.patch.object(sourcegen, "_run_git", side_effect=git):
+                with self.assertRaises(KeyboardInterrupt):
+                    sourcegen._fetch_one_commit(URL, fixed, root)
+            self.assertIn("fetch", [args[0] for args in calls])
+
+    def test_a_completed_fetch_is_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            fixed = "e" * 40
+
+            def git(args, cwd=None, **kwargs):
+                if args[0] == "init":
+                    (Path(cwd) / ".git").mkdir(exist_ok=True)
+                return ""
+
+            with mock.patch.object(sourcegen, "_run_git", side_effect=git):
+                first = sourcegen._fetch_one_commit(URL, fixed, root)
+                self.assertIsNotNone(first)
+                self.assertTrue((first / ".git").is_dir())
+                calls: list[str] = []
+
+                def record(args, cwd=None, **kwargs):
+                    calls.append(args[0])
+                    return ""
+
+                with mock.patch.object(sourcegen, "_run_git", side_effect=record):
+                    second = sourcegen._fetch_one_commit(URL, fixed, root)
+                self.assertEqual(second, first)
+                self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":
