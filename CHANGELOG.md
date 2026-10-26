@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A lab whose services were slow to start was declared unhealthy before it
+  listened, and the run spent a validation attempt and a repair on what was
+  never an exploit failure. A health-checked service now gets a start period
+  of at least two minutes (`CVELAB_STARTUP_GRACE`), and a run whose services
+  still do not start is repaired from the container logs on its own, up to
+  twice (`CVELAB_STARTUP_REPAIRS`), without spending either. In the latest
+  nginx batch, three of four labs lost their first validation this way.
+
 ## [0.6.8] - 2026-10-24
 
 ### Added

@@ -524,6 +524,23 @@ CPU_PERIOD = 100_000
 _MEMORY = re.compile(r"\d+(?:\.\d+)?\s?(?:[kmgtp]i?)?b?", re.IGNORECASE)
 
 
+DEFAULT_STARTUP_GRACE = 120
+
+
+def startup_grace() -> int:
+    """Seconds a health-checked service may take to come up (CVELAB_STARTUP_GRACE, 0 to 900)."""
+    raw = os.getenv("CVELAB_STARTUP_GRACE", "").strip()
+    if not raw:
+        return DEFAULT_STARTUP_GRACE
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(f"CVELAB_STARTUP_GRACE must be a whole number of seconds, got {raw!r}") from error
+    if not 0 <= value <= 900:
+        raise ValueError("CVELAB_STARTUP_GRACE must be between 0 and 900 seconds")
+    return value
+
+
 def runtime_limits() -> dict[str, object]:
     """Compose service keys for the default runtime ceilings."""
     limits: dict[str, object] = {}
@@ -856,6 +873,9 @@ def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
     # down if it is refused.
     model = policy.enforce(base, lab_dir, environment)
     limits = policy.limits_override(model, runtime_limits())
+    grace = policy.startup_grace_override(model, startup_grace())
+    for name, extra in grace["services"].items():
+        limits.setdefault("services", {}).setdefault(name, {}).update(extra)
     # Outside the lab directory, which is the lab's to shape: a symlink
     # there would turn this write into one anywhere.
     scratch = Path(tempfile.mkdtemp(prefix="cvelab-limits-"))
