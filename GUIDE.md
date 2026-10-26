@@ -508,6 +508,41 @@ be a published image inside the affected range. `resolution.json` records where
 the patch came from, not the patch, since the diff is public anyway and a copy
 would travel with every uploaded report.
 
+### The fixture a product-class attack needs
+
+A product rarely ships the state its own vulnerability needs. An access-control
+flaw in a collaboration tool is reachable only once a project, an item and a
+private comment exist, and creating them is authenticated work the unauthenticated
+attack is not allowed to do. A contract declares that state as a fixture:
+
+```json
+"fixture": {
+  "command": ["app-console", "run", "/cvelab/fixture/seed.script"],
+  "files": { "seed.script": "create project cvelab-canary --public\n" },
+  "env": { "CVELAB_MARKER": "cvelab-canary-7f2a91" },
+  "timeout": 600
+}
+```
+
+The files are copied into `/cvelab/fixture` inside each container and the command
+runs there, once the image answers its health path and before the first attack
+request. `command` is an argv list, never a shell string, and a file name is a
+single name rather than a path. See `examples/closed-contract-fixture.example.json`.
+
+Three things to know:
+
+- A fixture that exits non-zero aborts the run. An unseeded instance discloses
+  nothing, which is indistinguishable from a fixed one, so a fixture that failed
+  quietly would report a differential that was never measured. Have it assert
+  what it built: if the contract attacks item `1`, the fixture should refuse to
+  pass when it created item `4`.
+- `env` and `files` travel inside the contract, and the contract ships with the
+  lab. Put a marker there, not a credential.
+- A product that migrates a database on first boot needs longer than the default
+  two minutes to answer its health path; raise `health_timeout` (up to 1800).
+  It may also need more than the default 2 GB ceiling, which is
+  `CVELAB_RUNTIME_MEMORY`, not a contract key.
+
 ## 11. Troubleshooting
 
 ### Docker does not respond

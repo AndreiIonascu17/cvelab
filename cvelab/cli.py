@@ -257,10 +257,16 @@ def upload_command(
         report = json.loads((lab_dir / "artifacts" / "report.json").read_text("utf-8"))
     except (OSError, ValueError):
         report = {}
+    # Every lab shape records the same two facts, and a closed-software run has
+    # no plan or validator transcript to infer them from. Reading the presence
+    # of proof_checks instead counted a run whose checks had failed as a
+    # validated one, which the control plane then refused with HTTP 422 rather
+    # than storing for what it was.
+    verified = bool(report.get("ok")) and bool(report.get("real_poc_verified"))
     result = {
-        "ok": bool(report.get("proof_checks")),
+        "ok": verified,
         "cve": cve.upper(),
-        "status": report.get("status") or ("VALIDATED" if report.get("proof_checks") else None),
+        "status": report.get("status") or ("VALIDATED" if verified else None),
         "automation": report.get("automation", {}),
     }
     payload = upload.collect(

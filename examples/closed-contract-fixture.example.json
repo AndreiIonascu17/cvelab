@@ -1,0 +1,32 @@
+{
+  "health_timeout": 900,
+  "fixture": {
+    "command": ["app-console", "run", "/cvelab/fixture/seed.script"],
+    "files": {
+      "seed.script": "create project cvelab-canary --public\ncreate note cvelab-canary --private \"$CVELAB_MARKER\"\n"
+    },
+    "env": {
+      "CVELAB_MARKER": "cvelab-canary-7f2a91"
+    },
+    "timeout": 600
+  },
+  "attack": [
+    {
+      "method": "GET",
+      "path": "/api/projects/cvelab-canary/notes",
+      "headers": {
+        "Accept": "application/json"
+      }
+    }
+  ],
+  "observe": {
+    "request": {
+      "method": "GET",
+      "path": "/api/projects/cvelab-canary/notes?include=all"
+    },
+    "match": {
+      "status": 200,
+      "body_contains": "cvelab-canary-7f2a91"
+    }
+  }
+}
