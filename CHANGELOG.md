@@ -62,6 +62,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authorized way, report the gap) and `marker_roundtrip` (a fresh marker sent
   through the vector and observed where it should not surface). Classes whose
   effect is not observable over the wire are declined rather than faked.
+  A spec can carry several `checks`, and each check can `discover` its own
+  targets from the instance -- enumerate public objects, bind an id per
+  step, fill it into the probe -- so one emitted script sweeps every target
+  it finds instead of the objects a fixture created.
 
 ### Changed
 

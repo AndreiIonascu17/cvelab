@@ -587,6 +587,14 @@ Two strategies carry the effect without a listener you have to stand up:
 A spec names the strategy, the effect in words, and the requests; it never names
 a host. See `examples/field-spec.example.json`.
 
+A spec can also discover its own targets instead of naming them. A check's
+`discover` chain enumerates them from the target -- public projects, then the
+items in each -- binding a name per step that the probe and control fill in with
+`{{name}}`. One `field-poc.py` then sweeps every target it finds, so the same
+script works against any instance rather than the objects a fixture happened to
+create. A spec with several `checks` runs each independently and reports them
+together.
+
 ### What the field mode will not do
 
 A class whose effect is not observable on a live target over the wire has no

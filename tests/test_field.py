@@ -68,7 +68,7 @@ class SpecTests(unittest.TestCase):
 
     def test_inband_needs_probe_control_and_extractor(self) -> None:
         validated = field.validate_spec(_inband())
-        self.assertEqual(validated["extract"], {"json_values": "body"})
+        self.assertEqual(validated["checks"][0]["extract"], {"json_values": "body"})
         for drop in ("probe", "control", "extract"):
             spec = _inband()
             del spec[drop]
@@ -77,7 +77,7 @@ class SpecTests(unittest.TestCase):
 
     def test_an_extractor_is_exactly_one_of_two_forms(self) -> None:
         self.assertEqual(
-            field.validate_spec(_inband(extract={"regex": "id=(\\d+)"}))["extract"],
+            field.validate_spec(_inband(extract={"regex": "id=(\\d+)"}))["checks"][0]["extract"],
             {"regex": "id=(\\d+)"},
         )
         for bad in ({}, {"json_values": "a", "regex": "b"}, {"other": "x"},
@@ -93,6 +93,88 @@ class SpecTests(unittest.TestCase):
     def test_a_request_path_must_be_relative(self) -> None:
         with self.assertRaises(ValueError):
             field.validate_spec(_inband(probe=[{"path": "http://evil/x"}]))
+
+
+class DiscoveryTests(unittest.TestCase):
+    def _with_discover(self, discover: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "strategy": "inband_differential",
+            "observable_effect": "disclosed values",
+            "checks": [{
+                "label": "c", "discover": discover,
+                "probe": [{"method": "POST", "path": "/g", "body": "{{project}}"}],
+                "control": [{"method": "POST", "path": "/g", "body": "{{project}}"}],
+                "extract": {"json_values": "body"},
+            }],
+        }
+
+    def test_a_step_may_only_use_names_an_earlier_step_bound(self) -> None:
+        good = self._with_discover([
+            {"bind": "project", "query": [{"method": "POST", "path": "/g", "body": "list"}],
+             "extract": {"json_values": "fullPath"}},
+        ])
+        field.validate_spec(good)
+        bad = self._with_discover([
+            {"bind": "issue", "query": [{"method": "POST", "path": "/g", "body": "{{project}}"}],
+             "extract": {"json_values": "iid"}},
+        ])
+        with self.assertRaises(ValueError):
+            field.validate_spec(bad)
+
+    def test_a_derive_step_binds_a_computed_value(self) -> None:
+        spec = self._with_discover([
+            {"bind": "project", "query": [{"method": "POST", "path": "/g", "body": "list"}],
+             "extract": {"json_values": "fullPath"}},
+            {"bind": "gid", "derive": "gid://x/{{project}}"},
+        ])
+        validated = field.validate_spec(spec)
+        self.assertEqual(validated["checks"][0]["discover"][1],
+                         {"bind": "gid", "derive": "gid://x/{{project}}"})
+
+    def test_probe_cannot_reference_an_undiscovered_name(self) -> None:
+        spec = self._with_discover([])  # probe uses {{project}} but nothing binds it
+        with self.assertRaises(ValueError):
+            field.validate_spec(spec)
+
+    def test_the_engine_fans_out_and_reports_per_target(self) -> None:
+        """Two discovered projects, each leaking a distinct body, yield two findings."""
+        spec = field.validate_spec({
+            "strategy": "inband_differential", "observable_effect": "disclosed bodies",
+            "checks": [{
+                "label": "notes",
+                "discover": [
+                    {"bind": "project",
+                     "query": [{"method": "POST", "path": "/g", "body": "list"}],
+                     "extract": {"json_values": "fullPath"}},
+                ],
+                "probe": [{"method": "POST", "path": "/g", "body": "probe:{{project}}"}],
+                "control": [{"method": "POST", "path": "/g", "body": "control:{{project}}"}],
+                "extract": {"json_values": "body"},
+            }],
+        })
+        script = field.emit_field_poc("CVE-2026-0001", spec)
+        ns: dict[str, Any] = {}
+        exec(compile(script, "<f>", "exec"), ns)
+
+        class FakeTarget:
+            base = "http://x"
+            def send(self, step):
+                body = step.get("body", "")
+                if body == "list":
+                    return 200, json.dumps({"nodes": [{"fullPath": "a"}, {"fullPath": "b"}]})
+                if body.startswith("probe:"):
+                    name = body.split(":", 1)[1]
+                    return 200, json.dumps({"notes": [{"body": "pub"}, {"body": "secret-" + name}]})
+                return 200, json.dumps({"notes": [{"body": "pub"}]})  # control: only public
+
+        check = spec["checks"][0]
+        contexts = ns["discover"](FakeTarget(), check["discover"])
+        self.assertEqual([c["project"] for c in contexts], ["a", "b"])
+        findings: list[dict[str, Any]] = []
+        for ctx in contexts:
+            ns["_run_inband"](FakeTarget(), check, ctx, False, findings)
+        self.assertEqual([f["value"] for f in findings], ["secret-a", "secret-b"])
+        self.assertEqual([f["where"]["project"] for f in findings], ["a", "b"])
 
 
 class EmittedScriptTests(unittest.TestCase):
@@ -116,6 +198,17 @@ class EmittedScriptTests(unittest.TestCase):
         )
         self.assertEqual(ast.literal_eval(assign.value), spec)
 
+    def test_the_fixture_is_not_baked_into_the_deliverable(self) -> None:
+        """The fixture seeds CVELab's own instance; it must not ship in the PoC."""
+        spec = field.validate_spec(_inband(fixture={
+            "command": ["seed"], "files": {"seed.rb": "secret marker xyz"},
+            "env": {"CVELAB_MARKER": "xyz"},
+        }))
+        self.assertIn("fixture", spec)
+        script = field.emit_field_poc("CVE-2026-0001", spec)
+        self.assertNotIn("xyz", script)
+        self.assertNotIn("seed.rb", script)
+
     def test_the_script_refuses_without_authorization(self) -> None:
         script = field.emit_field_poc("CVE-2026-0001", field.validate_spec(_inband()))
         with tempfile.TemporaryDirectory() as root:
@@ -131,14 +224,15 @@ class EmittedScriptTests(unittest.TestCase):
     def test_the_token_extractor_set_difference_is_the_proof(self) -> None:
         """Run the emitted inband logic over canned responses, no network."""
         spec = field.validate_spec(_inband())
+        extractor = spec["checks"][0]["extract"]
         script = field.emit_field_poc("CVE-2026-0001", spec)
         namespace: dict[str, Any] = {}
         exec(compile(script, "<field-poc.py>", "exec"), namespace)
         probe = {"data": {"notes": [{"body": "public"}, {"body": "SECRET"}]}}
         control = {"data": {"notes": [{"body": "public"}]}}
         tokens = namespace["tokens"]
-        probe_tokens = tokens(json.dumps(probe), spec["extract"])
-        control_tokens = set(tokens(json.dumps(control), spec["extract"]))
+        probe_tokens = tokens(json.dumps(probe), extractor)
+        control_tokens = set(tokens(json.dumps(control), extractor))
         disclosed = [t for t in probe_tokens if t not in control_tokens]
         self.assertEqual(disclosed, ["SECRET"])
 
