@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -160,13 +161,19 @@ def _validate_request(request: Any, where: str) -> dict[str, Any]:
     if not isinstance(headers, dict):
         raise ValueError(f"{where} headers must be an object")
     body = request.get("body")
-    if body is not None and not isinstance(body, str):
-        raise ValueError(f"{where} body must be a string")
+    if isinstance(body, (dict, list)):
+        # A JSON body written as an object is what anyone means, and demanding
+        # the escaped string form cost a lab its spec for nothing: the draft
+        # was otherwise correct and was thrown away over quoting. Serialised
+        # here, so what the script sends is still one exact string.
+        body = json.dumps(body)
+    elif body is not None and not isinstance(body, str):
+        raise ValueError(f"{where} body must be a string or a JSON object")
     return {
         "method": method,
         "path": path,
         "headers": {str(k): str(v) for k, v in headers.items()},
-        "body": None if body is None else str(body),
+        "body": body,
     }
 
 
@@ -250,7 +257,11 @@ def _validate_auth(value: Any, transport: str, inputs: list[str]) -> dict[str, s
     supplies it at run time. Left out entirely, the session is anonymous,
     which is a real case for SMB.
     """
-    if value is None:
+    # Empty is the same as absent, which matters because validate_spec emits
+    # auth: {} into every normalised spec: without this, a spec could not be
+    # validated twice, and saving one and reusing it is the ordinary thing to
+    # do with it.
+    if not value:
         return {}
     if transport not in HANDSHAKE_TRANSPORTS:
         raise ValueError(f"auth has no meaning for transport {transport}")
@@ -293,13 +304,17 @@ def _validate_sequence(value: Any, where: str, transport: str = "http") -> list[
     return [one(item, f"{where}[{index}]") for index, item in enumerate(value)]
 
 
+#: A name a discover step or an input binds, used only as a substitution key.
+#: Lowercase-only was arbitrary and cost a measured lab its spec: the draft
+#: was otherwise right and bound oauthState, so a correct answer was thrown
+#: away over a letter's case.
+_BIND_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,31}")
+
 #: Where the evidence is read from. Only bodies could be read at first, which
 #: left two measured labs unprovable for no reason to do with their CVE: one
 #: disclosed a token in a response header, and one differed only in its status
 #: code, 200 against 401. Both are the ordinary shape of an authorization
 #: finding, so both are read now.
-_BIND_NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
-
 EXTRACTORS = ("json_values", "regex", "header", "status")
 
 
@@ -348,7 +363,7 @@ def _validate_inputs(value: Any) -> list[str]:
     for offered in value:
         name = str(offered)
         if not _BIND_NAME.fullmatch(name):
-            raise ValueError(f"inputs name {name!r} must be lowercase letters, digits and _")
+            raise ValueError(f"inputs name {name!r} must match {_BIND_NAME.pattern}")
         if name in ("marker", "callback"):
             raise ValueError(f"inputs cannot redefine {{{{{name}}}}}")
         names.append(name)
@@ -359,7 +374,7 @@ _MAX_DISCOVER_STEPS = 6
 
 
 def _substitutions(text: str) -> set[str]:
-    return set(re.findall(r"\{\{([a-z][a-z0-9_]*)\}\}", text))
+    return set(re.findall(r"\{\{([A-Za-z][A-Za-z0-9_]*)\}\}", text))
 
 
 def _validate_expectation(value: Any, where: str) -> dict[str, Any]:
@@ -387,29 +402,40 @@ def _validate_expectation(value: Any, where: str) -> dict[str, Any]:
     raise ValueError(f"{where}.expect must be one of {listed}")
 
 
-def _validate_discover(value: Any) -> tuple[list[dict[str, Any]], set[str]]:
-    """The chain that enumerates targets before the probe tests each one.
+def _validate_discover(
+    value: Any, inputs: tuple[str, ...] = ()
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """The chain that reads values from the instance before the probe runs.
 
     Each step binds one name. A query step runs requests and binds every value
     its extractor pulls, fanning the run out over them; a derive step binds a
-    value computed from names already bound. A step may use only names bound by
-    an earlier step, so a spec cannot reference a target it never discovered.
+    value computed from names already bound. A step may use only names bound
+    by an earlier step, so a spec cannot reference something it never read.
+
+    The operator's own inputs count as bound from the start. They did not, and
+    that was a bug with a measured cost: a lab that reproduced was refused a
+    spec three times over because its first step had to sign in with a
+    credential only the operator has, which is exactly what an input is for.
     """
+    bound: set[str] = set(inputs)
     if value is None:
-        return [], set()
+        return [], bound
     if not isinstance(value, list):
         raise ValueError("discover must be a list of steps")
     if len(value) > _MAX_DISCOVER_STEPS:
         raise ValueError(f"discover may hold at most {_MAX_DISCOVER_STEPS} steps")
     steps: list[dict[str, Any]] = []
-    bound: set[str] = set()
     for index, step in enumerate(value):
         where = f"discover[{index}]"
         if not isinstance(step, dict):
             raise ValueError(f"{where} must be an object")
         name = str(step.get("bind", ""))
         if not _BIND_NAME.fullmatch(name):
-            raise ValueError(f"{where}.bind must match {_BIND_NAME.pattern}")
+            # The value, not just the rule: a reason that does not say what
+            # was wrong sends whoever reads it back to guessing.
+            raise ValueError(
+                f"{where}.bind {name!r} must match {_BIND_NAME.pattern}"
+            )
         if name in bound:
             raise ValueError(f"{where}.bind {name!r} is already bound")
         if "derive" in step:
@@ -440,8 +466,7 @@ def _validate_check(
 ) -> dict[str, Any]:
     if not isinstance(check, dict):
         raise ValueError(f"{where} must be an object")
-    discover, bound = _validate_discover(check.get("discover"))
-    bound = bound | set(inputs or ())
+    discover, bound = _validate_discover(check.get("discover"), tuple(inputs or ()))
     if discover and transport != "http":
         # Discovery enumerates a target by reading it and binding names. The
         # steps are HTTP requests, so over a socket there is nothing to run
@@ -2453,9 +2478,15 @@ _DRAFT_INSTRUCTIONS = (
     "run time, such as a test account's credential or a tenant id. A request fills one in as "
     "{{name}}. Declare one rather than guessing a credential, and rather than answering "
     "feasible=false because a value is missing.\n"
-    "  A check may also carry discover, steps that read identifiers from the instance and bind "
-    "them for probe and control to fill in as {{name}}, so the spec does not name objects this "
-    "lab happened to create and works against an instance holding its own data.\n\n"
+    "  A check may also carry discover: steps that read a value from the instance and bind it "
+    "for probe, control and observe to fill in as {{name}}. A step's query is a list of "
+    "requests of any method, and its extract pulls the value out of the last response, so "
+    "discover covers two things. It enumerates what a target holds -- public projects, then "
+    "the items in each -- so the spec names no object this lab happened to create. And it "
+    "carries a value out of one response into a later request: a token, a nonce, a session "
+    "or an OAuth state returned by a POST, extracted and then used by the probe. An effect "
+    "that needs that handoff is expressible, and is not a reason to answer "
+    "feasible=false.\n\n"
     "CVELab emits one script from your spec and runs it against both of the lab's builds. It "
     "is kept only if it observes the effect on the vulnerable build and stays silent on the "
     "fixed one, so a spec that watches ordinary behaviour is discarded rather than shipped."
@@ -2513,6 +2544,47 @@ def draft_manual_poc_spec(
     or "reason" when it is not. It never raises: the caller records whatever
     comes back and the lab stands either way.
     """
+    attempts = _draft_retries() + 1
+    complaint = ""
+    for _attempt in range(attempts):
+        answer = _ask_for_spec(
+            cve, plan, complaint, api_key=api_key, model=model,
+            provider=provider, base_url=base_url, lab_dir=lab_dir,
+        )
+        if "spec" in answer or "declined" in answer or not answer.get("retry"):
+            answer.pop("retry", None)
+            return answer
+        # The shape was wrong, which is not the provider declining anything:
+        # it is this validator telling the model its answer did not fit, so
+        # saying what was wrong and asking once more is ordinary iteration.
+        complaint = str(answer["reason"])
+        if _attempt + 1 < attempts:
+            progress.step(f"the drafted spec did not fit, asking again: {complaint[:120]}")
+    answer.pop("retry", None)
+    return answer
+
+
+def _draft_retries() -> int:
+    """How often a spec that did not fit is asked for again (CVELAB_SPEC_RETRIES)."""
+    raw = os.getenv("CVELAB_SPEC_RETRIES", "").strip()
+    try:
+        value = int(raw) if raw else 1
+    except ValueError:
+        return 1
+    return max(0, min(value, 3))
+
+
+def _ask_for_spec(
+    cve: str,
+    plan: dict[str, Any],
+    complaint: str,
+    *,
+    api_key: str | None,
+    model: str | None,
+    provider: str | None,
+    base_url: str | None,
+    lab_dir: Path | None,
+) -> dict[str, Any]:
     try:
         answered = structured_response(
             api_key=api_key,
@@ -2528,6 +2600,7 @@ def draft_manual_poc_spec(
                 "confirmed_attack": plan.get("exploit_contract") or {},
                 "container_port": _port_hint(lab_dir) if lab_dir else None,
                 "validator_that_proved_it": _validator_source(lab_dir) if lab_dir else "",
+                **({"your_previous_answer_was_rejected": complaint} if complaint else {}),
             }, indent=2, ensure_ascii=True)[:_MAX_DRAFT_INPUT],
             schema=MANUAL_POC_DRAFT_SCHEMA,
             schema_name="cvelab_manual_poc_spec",
@@ -2550,23 +2623,23 @@ def draft_manual_poc_spec(
         }
     offered = answered.get("spec_json")
     if not isinstance(offered, str) or not offered.strip():
-        return {"reason": "the answer said feasible but carried no spec"}
+        return {"reason": "the answer said feasible but carried no spec", "retry": True}
     try:
         spec = validate_spec(json.loads(offered))
     except json.JSONDecodeError as error:
-        return {"reason": f"spec_json was not valid JSON: {error}"}
+        return {"reason": f"spec_json was not valid JSON: {error}", "retry": True}
     except (ValueError, TypeError) as error:
         # Named precisely: two of two DeepSeek drafts were rejected for shape,
         # once for a strategy it invented and once for an empty probe, and a
         # bare "not usable" left nothing to correct.
-        return {"reason": f"the drafted spec is not usable: {error}"}
+        return {"reason": f"the drafted spec is not usable: {error}", "retry": True}
     port = answered.get("container_port")
     if not isinstance(port, int) or not 1 <= port <= 65535:
         # The lab states it in its healthcheck, so an answer that leaves it
         # out is not a reason to throw an otherwise usable spec away.
         port = _port_hint(lab_dir) if lab_dir else None
     if not isinstance(port, int) or not 1 <= port <= 65535:
-        return {"reason": "the answer gave no port the service listens on"}
+        return {"reason": "the answer gave no port the service listens on", "retry": True}
     return {"spec": spec, "container_port": port}
 
 
