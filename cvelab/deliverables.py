@@ -19,6 +19,7 @@ from pathlib import Path
 
 from .ai import ai_is_configured, structured_response
 from .core import write_text
+from .field import MANUAL_POC_NAME
 
 ANALYSIS_SCHEMA = {
     "type": "object",
@@ -621,6 +622,10 @@ This result does not authorize or establish exploitability of any remote deploym
         "manual_poc": artifacts / "PoC.ps1",
         "manual_guide": artifacts / "MANUAL-POC.md",
         "manual_runner": artifacts / "manual.sh",
+        # Written by run_lab, and only when it showed the effect on the
+        # vulnerable build and stayed silent on the fixed one, so its
+        # presence is the claim. Most labs will not have one.
+        "target_poc": artifacts / MANUAL_POC_NAME,
     }
     result["deliverables"].update({
         name: str(path) for name, path in optional_deliverables.items() if path.is_file()

@@ -22,7 +22,7 @@ from pathlib import Path
 
 from . import progress, usage
 from .ai import ProviderDeclined
-from .core import CVERecordNotFound, normalize_cve, run_lab, write_text
+from .core import AfterValidation, CVERecordNotFound, normalize_cve, run_lab, write_text
 from .deliverables import create_deliverables
 from .sourcegen import generate_source_lab, repair_source_lab
 
@@ -223,6 +223,7 @@ def run_auto_workflow(
     base_url: str | None = None,
     hint: str | None = None,
     research_mode: str | None = None,
+    after_validation: AfterValidation | None = None,
 ) -> dict:
     """Generate, execute, diagnose, repair, and re-run a CVE lab autonomously."""
     if max_attempts < 1:
@@ -370,7 +371,7 @@ def run_auto_workflow(
         validation_attempt += 1
         announce(f"{cve}: build and E2E validation ({validation_attempt}/{max_attempts})")
         try:
-            validated = run_lab(cve, output_root, keep)
+            validated = run_lab(cve, output_root, keep, after_validation)
         except Exception as exc:
             if (
                 _startup_failure(str(exc))
