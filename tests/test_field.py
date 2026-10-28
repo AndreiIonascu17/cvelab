@@ -1113,6 +1113,62 @@ class HandshakeTransportTests(unittest.TestCase):
         self.assertIn("raise SystemExit", exchange)
 
 
+class RoundTripTests(unittest.TestCase):
+    """A validated spec must validate again.
+
+    validate_spec normalises: it fills in transport, inputs, auth and wraps a
+    single check into a list. Saving that output and feeding it back is the
+    ordinary thing to do with a spec -- it is what `--spec` takes and what the
+    emitted script embeds -- so the output has to be valid input.
+    """
+
+    def _specs(self) -> list[dict[str, Any]]:
+        return [
+            _inband(),
+            {"strategy": "direct_observation", "observable_effect": "x",
+             "probe": [{"method": "GET", "path": "/a"}], "expect": {"status": 200}},
+            {"strategy": "marker_roundtrip", "observable_effect": "x",
+             "probe": [{"method": "POST", "path": "/c", "body": "{{marker}}"}],
+             "observe": {"method": "GET", "path": "/c"}},
+            {"strategy": "oob_callback", "observable_effect": "x",
+             "probe": [{"method": "POST", "path": "/f",
+                        "body": "http://{{callback}}/{{marker}}"}]},
+            {"strategy": "direct_observation", "transport": "tcp",
+             "observable_effect": "x", "probe": [{"send": "PING\r\n"}],
+             "expect": {"body_contains": "PONG"}},
+            {"strategy": "direct_observation", "transport": "ssh",
+             "observable_effect": "x", "inputs": ["user"],
+             "auth": {"username": "{{user}}"},
+             "probe": [{"exec": "id"}], "expect": {"body_contains": "uid="}},
+            {"strategy": "direct_observation", "observable_effect": "x",
+             "inputs": ["victimEmail"],
+             "discover": [{"bind": "state",
+                           "query": [{"method": "POST", "path": "/s",
+                                      "body": {"email": "{{victimEmail}}"}}],
+                           "extract": {"regex": "state=([a-z]+)"}}],
+             "probe": [{"method": "GET", "path": "/v?t={{state}}"}],
+             "expect": {"status": 200}},
+        ]
+
+    def test_validating_twice_gives_the_same_spec(self) -> None:
+        for offered in self._specs():
+            with self.subTest(strategy=offered["strategy"],
+                              transport=offered.get("transport", "http")):
+                once = field.validate_spec(offered)
+                twice = field.validate_spec(json.loads(json.dumps(once)))
+                self.assertEqual(once, twice)
+
+    def test_an_emitted_spec_can_be_handed_back(self) -> None:
+        """The script embeds the normalised spec; `--spec` must accept it."""
+        for offered in self._specs():
+            with self.subTest(strategy=offered["strategy"]):
+                script = field.emit_field_poc("CVE-2026-1", field.validate_spec(offered))
+                embedded = json.loads(
+                    script.split('json.loads(r"""', 1)[1].split('""")', 1)[0]
+                )
+                field.validate_spec(embedded)
+
+
 class ScriptSizeTests(unittest.TestCase):
     """The deliverable is too big to be an argument, and that is a real limit.
 
