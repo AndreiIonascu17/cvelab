@@ -25,6 +25,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 from . import policy, progress
@@ -857,7 +858,53 @@ def _service_logs(
     return redact(output)[-SERVICE_LOG_CHARS:]
 
 
-def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
+
+
+def prepare_compose(lab_dir: Path) -> tuple[str, dict[str, str], list[str], Path]:
+    """Vet a lab's Compose definition and build the command that runs it.
+
+    Every path that starts a lab's containers goes through here, because
+    `policy.enforce` is the gate that refuses a definition reaching for the
+    host, and it has to run before anything is built -- for a lab CVELab
+    generated and one copied from someone else alike, while there is still
+    nothing to tear down.
+
+    Returns the docker executable, the environment both it and Compose need,
+    the Compose command with the runtime-limits override appended, and the
+    scratch directory holding that override, which the caller removes.
+    """
+    docker = docker_executable()
+    environment = docker_environment(docker)
+    ensure_docker(docker, environment)
+    base = compose_command(docker, lab_dir)
+    model = policy.enforce(base, lab_dir, environment)
+    limits = policy.limits_override(model, runtime_limits())
+    grace = policy.startup_grace_override(model, startup_grace())
+    for name, extra in grace["services"].items():
+        limits.setdefault("services", {}).setdefault(name, {}).update(extra)
+    # Outside the lab directory, which is the lab's to shape: a symlink
+    # there would turn this write into one anywhere.
+    scratch = Path(tempfile.mkdtemp(prefix="cvelab-limits-"))
+    override = scratch / "runtime-limits.json"
+    override.write_text(json.dumps(limits, indent=2), encoding="utf-8")
+    return docker, environment, [*base, "-f", str(override)], scratch
+
+
+#: What `run_lab` calls once the lab's verdict is settled and its services are
+#: still up, for an artifact that is not part of the lab's claim. It is passed
+#: in rather than imported so core goes on knowing nothing about model
+#: providers: a lab is built and validated with none configured at all.
+AfterValidation = Callable[
+    [str, Path, dict, list[str], dict[str, str], bool], dict[str, object]
+]
+
+
+def run_lab(
+    cve_value: str,
+    output_root: Path,
+    keep: bool,
+    after_validation: AfterValidation | None = None,
+) -> dict:
     cve = normalize_cve(cve_value)
     lab_dir = output_root.resolve() / cve
     plan_path = lab_dir / "plan.json"
@@ -888,24 +935,7 @@ def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
         missing = [str(path) for path in required if not path.exists()]
         if missing:
             raise RuntimeError("Generated lab preflight failed; missing: " + ", ".join(missing))
-    docker = docker_executable()
-    environment = docker_environment(docker)
-    ensure_docker(docker, environment)
-    base = compose_command(docker, lab_dir)
-    # Before anything is built: this covers a generated lab and one copied
-    # from someone else alike, and nothing has started that needs tearing
-    # down if it is refused.
-    model = policy.enforce(base, lab_dir, environment)
-    limits = policy.limits_override(model, runtime_limits())
-    grace = policy.startup_grace_override(model, startup_grace())
-    for name, extra in grace["services"].items():
-        limits.setdefault("services", {}).setdefault(name, {}).update(extra)
-    # Outside the lab directory, which is the lab's to shape: a symlink
-    # there would turn this write into one anywhere.
-    scratch = Path(tempfile.mkdtemp(prefix="cvelab-limits-"))
-    override = scratch / "runtime-limits.json"
-    override.write_text(json.dumps(limits, indent=2), encoding="utf-8")
-    compose = [*base, "-f", str(override)]
+    docker, environment, compose, scratch = prepare_compose(lab_dir)
     validated_run = False
     try:
         with progress.stage("building lab images"):
@@ -1047,6 +1077,22 @@ def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
             item["passed"] for item in manual_poc_checks.values()
         )
         real_source_proof = all(proof_checks.values())
+        # After proof_checks is complete and never part of it: those are ANDed
+        # into the lab's status, and an artifact beside the lab's claim must
+        # not be able to downgrade a run that reproduced its CVE. The services
+        # are still up here, which is what proving one needs; teardown is in
+        # the finally below.
+        manual_poc_field: dict[str, object] = {"shipped": False, "reason": "not requested"}
+        if after_validation is not None:
+            try:
+                manual_poc_field = after_validation(
+                    cve, lab_dir, plan, compose, environment, real_source_proof
+                )
+            except Exception as error:  # noqa: BLE001 - the lab's verdict stands
+                manual_poc_field = {
+                    "shipped": False,
+                    "reason": f"{type(error).__name__}: {error}"[:600],
+                }
         # Compose can surface a lifecycle exit code after `docker wait` even
         # when the validator completed and emitted a complete proof document.
         # Accept only the strict, independently checked proof contract; retain
@@ -1075,6 +1121,7 @@ def run_lab(cve_value: str, output_root: Path, keep: bool) -> dict:
             "fidelity": fidelity,
             "proof_checks": proof_checks,
             "manual_poc_checks": manual_poc_checks,
+            "manual_poc_field": manual_poc_field,
             "validator_exit_code": validator_exit,
             "real_poc_verified": real_source_proof,
             "product_e2e_verified": product_e2e_verified,

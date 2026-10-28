@@ -44,6 +44,13 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+# CVELab's core has no runtime dependencies and keeps none: a lab is built and
+# validated with nothing installed. These are for the single-target scripts
+# that speak a protocol with a handshake, which cannot be written as bytes to
+# send, and they are asked for explicitly -- never installed on your behalf.
+ssh = ["paramiko>=3.4"]
+smb = ["impacket>=0.12"]
+protocols = ["paramiko>=3.4", "impacket>=0.12"]
 dev = [
     "pytest>=8.0",
     "ruff>=0.14",

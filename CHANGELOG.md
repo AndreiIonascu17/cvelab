@@ -9,6 +9,177 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `cvelab manual-poc <lab-dir> --spec spec.json --container-port N` writes
+  `Manual-PoC.py` beside the `PoC.py` that validates the lab. It takes
+  `--target host:port` and runs against one server the operator is permitted
+  to test, to demonstrate impact rather than compare two builds. The spec is
+  the operator's, in the shape `cvelab field` already accepts: the strategy,
+  the effect to observe, and the requests that produce it, never a host. It is
+  a separate command, so a lab's own run is untouched and the script can be
+  asked for on any lab already generated and validated, including one built by
+  someone else. CVELab writes it only after running that exact script against
+  the lab's own two revisions, from a sidecar joined to each container's
+  network namespace: it must observe the effect on the vulnerable revision and
+  stay silent on the fixed one, so a script that fires on both is watching
+  normal behaviour rather than the bug, and one that crashed observed nothing
+  because it never looked. Neither is handed over, and the run that refused
+  the spec is kept in `Manual-PoC.json` so it can be fixed. A lab that never
+  reproduced, and one with no fixed build to stay silent against, are refused.
+  `Manual-PoC.md` travels beside the script; none of the three is uploaded
+  with the lab. Most vulnerabilities cannot be shown this way at all -- an
+  effect that needs no listener, a crash, a race or a timing signal.
+
+- `direct_observation`, a strategy for the shape most authorization and
+  disclosure findings actually have: the effect is in the one response the
+  weakness lets you ask for, with no second reading to compare against. It
+  takes `probe` and `expect`, one of `status`, `header`, `body_contains` or
+  `extract`. This was measured rather than reasoned. Asked to prove a token
+  leaking in a response header, and a route answering 200 where it should
+  answer 401, `inband_differential` found nothing on the vulnerable build --
+  an authorized control legitimately sees the data, so the difference is
+  empty -- and on the fixed build it found the 401 the probe got and the
+  control did not, firing on the patched side. The proof gate caught that and
+  handed nothing over, which is what it is for, but the shape needed its own
+  strategy.
+
+- `extract` reads more than bodies: `header` for a value in a response header
+  and `status` for the status code, alongside `json_values` and `regex`. Two
+  of the five labs measured on the previous release were unprovable for this
+  reason alone and neither had anything to do with their CVE.
+
+- `inputs`, values the lab cannot know and the operator supplies at run time:
+  a test account's credential, a tenant id. A spec declares the names, a
+  request fills one in as `{{name}}`, and the script takes
+  `--input NAME=VALUE` and refuses to start when one is missing rather than
+  sending `{{credential}}` literally and reporting a clean target. They are
+  merged at substitution time and never join the context, so a credential
+  cannot reach a printout or a recorded finding.
+
+- `ssh` and `smb` transports, for protocols whose handshake cannot be written
+  as bytes to send. A message is an operation -- `{"exec": "..."}` over SSH,
+  `list_shares`, `list_path` or `read` over SMB -- and both authenticate
+  through `auth`, whose values come from `inputs`, so a credential is the
+  operator's and never the spec's. A bare `--target 10.0.0.5` assumes port 22
+  or 445. What they reach is access and what an authenticated session is
+  permitted to do: a file an account should not read, a share that should not
+  be exported, a restricted shell that can be escaped. They are not a way to
+  attack the handshake, which the library performs correctly on purpose.
+  A protocol refusal is treated as an answer rather than a broken run, because
+  a share that is gone is exactly what a fixed build says; a session that
+  cannot be established, or credentials refused, still stops the run, since
+  neither answers anything about the weakness.
+
+- Those two need a library, so `pip install 'cvelab[ssh]'`, `[smb]` or
+  `[protocols]` declare it and CVELab's core keeps no runtime dependencies of
+  its own. Proving the script inside a lab needs it in the sidecar, and a
+  lab's network is `internal: true`, so nothing can be fetched once the
+  sidecar has joined it: the image is prepared beforehand, tagged by what is
+  in it, built once and reused. CVELab asks first, printing exactly what would
+  be installed and where, and `--yes` agrees in advance; without a terminal
+  and without it the run stops rather than treating silence as consent.
+  Nothing is installed outside Docker and none of it needs root.
+
+- The proof step can supply the operator's `inputs`, which it could not
+  before: a spec that declared one could never be proved, because the sidecar
+  ran the script without it and the script rightly refused to start. They
+  travel as one JSON environment value rather than in the sidecar's command
+  line, and a spec whose inputs were not given is refused before anything is
+  built rather than failing as an absent effect.
+
+- `oob_callback`, the third strategy, for an effect that sends nothing back: a
+  blind injection, a blind fetch of a URL the caller supplies, a command whose
+  output goes nowhere. It was named in the spec vocabulary but refused,
+  because it needs a listener. The script now starts its own, substitutes
+  `{{callback}}` for where it can be reached, and counts a run only when
+  something arrives carrying that run's `{{marker}}` -- without which an
+  unrelated request, or a payload an earlier run left stored, would read as a
+  result. It listens rather than using a third-party collaborator service,
+  which on a client engagement would route their traffic through
+  infrastructure neither party controls. Anything that connects is recorded,
+  HTTP or not, since a payload may reach out with something else. Across a
+  network the operator says how the target reaches them with `--callback`;
+  the bound address is the default and is right only when the target can
+  reach it directly, which is the case inside the lab, where the proving
+  sidecar shares the target container's network namespace.
+
+- A single-target spec can carry `transport`: `http`, or `tcp` and `tls` for a
+  service that speaks its own protocol over a socket -- a cache, a queue, a
+  database, a daemon with a text protocol. HTTP was the only transport
+  because the spec vocabulary was taken from one web disclosure, not because
+  the proof needed it: the sidecar, the two builds and the
+  effect-here-silence-there bar were always transport-blind. A socket message
+  is `send` (text, carrying `{{marker}}`) or `send_hex` (even-length hex, for
+  framing that is not text) with an optional `read_until`, and a whole
+  sequence shares one connection, so a protocol that needs a login before a
+  command can be expressed. What a sequence returns is everything read during
+  it. Only the standard library is used, because the delivered script has to
+  run on the operator's machine with nothing installed -- which is also the
+  boundary: a protocol needing a real handshake, SSH or SMB, cannot be written
+  as bytes to send and is out of scope rather than a reason to take a
+  dependency. `discover` stays HTTP-only and is refused for a socket spec
+  rather than silently skipped. Existing specs are unchanged: `transport`
+  defaults to `http`, and `observe` still accepts a single request.
+
+- `Manual-PoC.py` is handed over the way a published single-file PoC is. The
+  target is positional, `python3 Manual-PoC.py 10.0.0.5:8080`, with `--target`
+  still accepted; the header names the CVE, the effect, the affected and fixed
+  package versions the lab installed, the fix commit, the strategy, any
+  `--input` it needs, and that CVELab proved it against a build before and
+  after the fix. What the run leaves on the target is now described for the
+  strategy in use instead of for all of them: a read-only script said a marker
+  roundtrip's footprint was its own.
+
+- `cvelab manual-poc <lab-dir>` no longer needs `--spec`. Without one it asks
+  for a spec itself, in a call of its own, so the dedicated command does the
+  whole job. The draft call is also given what the lab already knew and was
+  being refused for want of: the port, read from the lab's own healthcheck,
+  and the validator that proved the effect, which holds the exact requests and
+  the response shape a prose contract leaves out. With those, a draft that had
+  been declined for having to guess at the extraction produced a spec that
+  proved on the first attempt.
+
+- The post-validation call is off by default on `run`, `auto`, `source-all`
+  and `all`, and asked for with `--manual-poc`. Generating labs and
+  demonstrating one on a server are separate jobs: a batch run wants the labs
+  and their `PoC.py`, and the single-target script is a deliberate step taken
+  for one engagement.
+
+- A lab that reproduces is now asked, in one separate call, whether the effect
+  it confirmed can also be observed on a single running instance -- and if it
+  can, the script is drafted, proved and written without being asked for. The
+  call happens after the lab's verdict is recorded and settled, which is the
+  whole point: asking for the same thing inside the generation prompt cost two
+  of three labs a `PROVIDER_DECLINED`, while here a decline costs one small
+  call and the lab stands. It is on by default for `run`, `auto`, `source-all`
+  and `all`, skipped with `--no-manual-poc`, and can be pointed at another
+  provider with `--manual-poc-provider`, because lab generation and this
+  request are judged separately under each provider's policy. The answer is
+  recorded in `report.json` under `manual_poc_field` and never enters the
+  lab's proof checks, so it cannot change a status. "Not observable on one
+  instance" is the expected answer for most vulnerabilities and the model is
+  told to prefer it over a guess.
+
+- `cvelab demo-target up <lab-dir>` starts a lab's vulnerable build where the
+  host can reach it and prints the host and port to point at, so a
+  single-target script can be rehearsed end to end before it is pointed at
+  anyone else's server; `down` puts the lab back. A lab is sealed -- its
+  network is `internal: true` and it publishes no port -- and in that state
+  neither a published port nor the container's own address answers from the
+  host, so the command lifts `internal` for that one run through an override
+  written outside the lab directory and never named
+  `docker-compose.override.yml`, which Compose would load by name on every
+  later run of the lab. The fixed build is never started.
+
+### Changed
+
+- The single-target scripts, `field-poc.py` and `Manual-PoC.py`, no longer
+  take `--authorized`. The flag verified nothing and anyone could pass it;
+  running the script is the operator's own statement that they may test the
+  host. Both still name the target and the effect on stderr before the first
+  request, so a run against the wrong host is visible in the output and in
+  whatever captured it, and `--show-bodies` is documented for what it does:
+  print each disclosed value in full instead of its first 120 characters.
+
 - `PROVIDER_DECLINED`, an outcome of its own for a run the model provider
   declined under its usage policy. It used to end as `AUTO_GENERATION_FAILED`
   and count as a failure of the tool. The run stops at once, without retrying

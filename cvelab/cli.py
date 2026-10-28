@@ -36,10 +36,51 @@ from .core import (
 )
 from .deliverables import create_deliverables
 from .doctor import doctor_command
-from .field import run_field_lab
+from .field import manual_poc_step, run_demo_target, run_field_lab, run_manual_poc
 from .providers import SELECTABLE
 from .providers import get as get_provider
 from .sourcegen import generate_source_lab
+
+
+def _named_values(given: list[str]) -> dict[str, str]:
+    """NAME=VALUE pairs, as the spec's declared inputs are supplied."""
+    values = {}
+    for item in given:
+        name, sep, value = str(item).partition("=")
+        if not sep or not name:
+            raise ValueError(f"--input takes NAME=VALUE, not {item!r}")
+        values[name] = value
+    return values
+
+
+def add_manual_poc_options(command: argparse.ArgumentParser) -> None:
+    """Flags for asking, after a lab reproduces, for the artifact beside it.
+
+    Off by default. Generating a lab and demonstrating a vulnerability on
+    someone's server are separate jobs: a batch run wants the lab and its
+    PoC.py and nothing else, and the single-target script is a deliberate
+    step taken for one engagement, which `cvelab manual-poc` is. The provider
+    can be chosen apart from the lab's own, because lab generation and this
+    request are judged separately under each provider's policy.
+    """
+    command.add_argument(
+        "--manual-poc",
+        action="store_true",
+        help="Also ask whether the confirmed effect can be shown on one instance, and "
+             "write the single-target script if it proves (one extra model call)",
+    )
+    command.add_argument(
+        "--manual-poc-provider",
+        choices=SELECTABLE,
+        help="Provider for that one call (default: the same as the run). Its own key "
+             "variable is used, not --key",
+    )
+    command.add_argument("--manual-poc-model", help="Model for that one call")
+    command.add_argument(
+        "--yes", action="store_true",
+        help="Agree in advance to building the prepared sidecar image a protocol "
+             "transport needs, instead of being asked",
+    )
 
 
 def add_ai_credentials(command: argparse.ArgumentParser) -> None:
@@ -139,6 +180,7 @@ def parser() -> argparse.ArgumentParser:
     source_all.add_argument("--vulnerable-ref", help="Vulnerable commit (default: parent of fixed commit)")
     add_source_steering(source_all)
     source_all.add_argument("--keep", action="store_true", help="Keep containers running")
+    add_manual_poc_options(source_all)
     add_ai_credentials(source_all)
     add_upload_flags(source_all)
 
@@ -158,6 +200,7 @@ def parser() -> argparse.ArgumentParser:
         help="AI generation is always enabled for the automatic workflow",
     )
     auto.add_argument("--keep", action="store_true", help="Keep containers running")
+    add_manual_poc_options(auto)
     auto.add_argument(
         "--max-attempts",
         type=int,
@@ -202,6 +245,7 @@ def parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="Build containers and validate the available source variants")
     run.add_argument("cve")
     run.add_argument("--keep", action="store_true", help="Keep containers running")
+    add_manual_poc_options(run)
     add_upload_flags(run)
 
     closed = sub.add_parser(
@@ -227,6 +271,50 @@ def parser() -> argparse.ArgumentParser:
     field_cmd.add_argument("--health-path", default="/", help="Relative readiness path")
     field_cmd.add_argument("--spec", required=True, type=Path, help="Field PoC spec: strategy, effect, requests")
 
+    manual_poc = sub.add_parser(
+        "manual-poc",
+        help="Prove your spec against a validated lab's two builds and write the "
+             "single-target script you run against one server yourself",
+    )
+    manual_poc.add_argument("lab_dir", type=Path, help="A generated, validated lab directory")
+    manual_poc.add_argument(
+        "--spec", type=Path,
+        help="Your spec: strategy, the effect to observe, and the requests that produce it. "
+             "Omit it and CVELab asks the model for one, in a call of its own",
+    )
+    manual_poc.add_argument(
+        "--container-port", type=int,
+        help="Port the service listens on inside its container, which the lab need not "
+             "declare. Required with --spec; otherwise it comes from the drafted answer",
+    )
+    add_ai_credentials(manual_poc)
+    manual_poc.add_argument(
+        "--keep", action="store_true", help="Leave the lab's containers running afterwards",
+    )
+    manual_poc.add_argument(
+        "--input", action="append", default=[], metavar="NAME=VALUE",
+        help="A value the spec declares and only you have, such as a test account's "
+             "credential. Needed to prove the script against the lab's own builds; "
+             "repeat for each one",
+    )
+    manual_poc.add_argument(
+        "--yes", action="store_true",
+        help="Agree in advance to building the prepared sidecar image a protocol "
+             "transport needs, instead of being asked",
+    )
+
+    demo_target = sub.add_parser(
+        "demo-target",
+        help="Start a lab's vulnerable build where your host can reach it, to rehearse "
+             "the single-target script before pointing it at anyone else's server",
+    )
+    demo_target.add_argument("action", choices=("up", "down"))
+    demo_target.add_argument("lab_dir", type=Path, help="A generated lab directory")
+    demo_target.add_argument(
+        "--container-port", type=int,
+        help="Port the service listens on; read from the proved record when omitted",
+    )
+
     closed_auto = sub.add_parser(
         "closed-auto",
         help="Resolve and validate a closed software HTTP PoC from only a CVE identifier",
@@ -246,6 +334,7 @@ def parser() -> argparse.ArgumentParser:
     all_cmd.add_argument("--ai", choices=("off", "auto", "on"), default="auto")
     add_ai_credentials(all_cmd)
     all_cmd.add_argument("--keep", action="store_true", help="Keep containers running")
+    add_manual_poc_options(all_cmd)
     return root
 
 
@@ -395,6 +484,19 @@ def _run_command(args: argparse.Namespace) -> int:
         model = getattr(args, "model", None)
         provider = getattr(args, "provider", None)
         base_url = getattr(args, "base_url", None)
+        chosen_provider = getattr(args, "manual_poc_provider", None)
+        after_validation = (
+            manual_poc_step(
+                # A different provider reads its own key variable, so the
+                # run's --key and --base-url are not carried across.
+                api_key=None if chosen_provider else api_key,
+                model=getattr(args, "manual_poc_model", None) or model,
+                provider=chosen_provider or provider,
+                base_url=None if chosen_provider else base_url,
+                assume_yes=getattr(args, "yes", False),
+            )
+            if getattr(args, "manual_poc", False) else None
+        )
         if args.command == "upload":
             return upload_command(
                 args.cve, args.output_root, not args.no_poc, args.dry_run,
@@ -425,6 +527,7 @@ def _run_command(args: argparse.Namespace) -> int:
                 base_url=base_url,
                 hint=args.hint,
                 research_mode=args.research,
+                after_validation=after_validation,
             )
         elif args.command in {"source", "source-all"}:
             generated = generate_source_lab(
@@ -441,7 +544,9 @@ def _run_command(args: argparse.Namespace) -> int:
                 research_mode=args.research,
             )
             if args.command == "source-all" and generated.get("ok"):
-                result = run_lab(args.cve, args.output_root, args.keep)
+                result = run_lab(
+                    args.cve, args.output_root, args.keep, after_validation
+                )
             else:
                 result = generated
         elif args.command == "closed-auto":
@@ -456,6 +561,14 @@ def _run_command(args: argparse.Namespace) -> int:
                 args.cve, args.output_root, api_key, model, provider, base_url,
                 args.repo, args.fixed_ref,
             )
+        elif args.command == "manual-poc":
+            result = run_manual_poc(
+                args.lab_dir, args.spec, args.container_port, args.keep, args.yes,
+                _named_values(args.input),
+                api_key=api_key, model=model, provider=provider, base_url=base_url,
+            )
+        elif args.command == "demo-target":
+            result = run_demo_target(args.action, args.lab_dir, args.container_port)
         elif args.command == "field":
             result = run_field_lab(
                 args.cve,
@@ -477,7 +590,9 @@ def _run_command(args: argparse.Namespace) -> int:
                 args.contract,
             )
         elif args.command == "run":
-            validated = run_lab(args.cve, args.output_root, args.keep)
+            validated = run_lab(
+                args.cve, args.output_root, args.keep, after_validation
+            )
             result = create_deliverables(
                 args.cve.upper(), args.output_root.resolve() / args.cve.upper(), validated
             )
@@ -486,7 +601,9 @@ def _run_command(args: argparse.Namespace) -> int:
                 args.cve, args.output_root, args.cwe, args.ai,
                 api_key, model, provider, base_url,
             )
-            result = run_lab(args.cve, args.output_root, args.keep)
+            result = run_lab(
+                args.cve, args.output_root, args.keep, after_validation
+            )
         print(redact(json.dumps(result, indent=2)))
         summary = usage.format_summary()
         if summary:
