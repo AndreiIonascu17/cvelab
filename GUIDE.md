@@ -798,14 +798,14 @@ ships. A source lab has no equivalent: it builds its two revisions itself. For
 one of those, ask for the script separately, once the lab has been validated:
 
 ```bash
-cvelab manual-poc out/CVE-YYYY-NNNNN \
+cvelab manual CVE-YYYY-NNNNN --poc out \
   --spec spec.json --container-port 8000
 # then, from out/CVE-YYYY-NNNNN/artifacts:
 python3 Manual-PoC.py --target 10.0.0.5:8080 --show-bodies
 ```
 
 `--spec` is optional. Without it CVELab asks for one itself, in a call of its
-own, and writes the script if it proves -- so `cvelab manual-poc out/CVE-...`
+own, and writes the script if it proves -- so `cvelab manual CVE-... --poc out`
 on its own is the whole thing. Pass `--spec` when you disagree with the answer
 it gave, or when you know something the lab does not: a credential, a tenant
 id, the one route that matters.

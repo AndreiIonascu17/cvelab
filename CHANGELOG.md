@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The command is `cvelab manual <CVE> --poc <location>`. A CVE identifier is
+  what anyone remembers once the lab is built; the path with that identifier
+  already inside it is not. Both spellings of the location work -- the
+  directory holding `CVE-YYYY-NNNNN`, and that directory itself -- and
+  without `--poc` it falls back to `--output-root`.
+
+- `expect: {"status": <code>}` takes any code, and the prompt now says so.
+  It always did, but the wording read `{"status": 200}` "when the finding is
+  that the route answered at all", so a lab whose effect was a 401-versus-403
+  split was told by its own instructions that `direct_observation` could not
+  express it.
+
 ### Added
+
+- `{{target}}` and `{{targetHost}}`, the host and port the script was pointed
+  at. A spec names no host by design, but some effects are about the target's
+  own address: an Origin or Referer a server should reject, a rebinding check,
+  a redirect back to itself.
+
+### Added (earlier)
 
 - A lab can be built from a tagged release pair when there is no fixing
   commit. Discovery will not invent one and is right not to, so a CVE whose
@@ -87,7 +108,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that *reports* the effect is not, because a spec aimed at it would pass
   against the lab and mean nothing against a real server.
 
-- `cvelab manual-poc <lab-dir> --spec spec.json --container-port N` writes
+- `cvelab manual <CVE> --poc <location>` writes
   `Manual-PoC.py` beside the `PoC.py` that validates the lab. It takes
   `--target host:port` and runs against one server the operator is permitted
   to test, to demonstrate impact rather than compare two builds. The spec is
@@ -207,7 +228,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   strategy in use instead of for all of them: a read-only script said a marker
   roundtrip's footprint was its own.
 
-- `cvelab manual-poc <lab-dir>` no longer needs `--spec`. Without one it asks
+- `cvelab manual <CVE> --poc <location>` no longer needs `--spec`. Without one it asks
   for a spec itself, in a call of its own, so the dedicated command does the
   whole job. The draft call is also given what the lab already knew and was
   being refused for want of: the port, read from the lab's own healthcheck,

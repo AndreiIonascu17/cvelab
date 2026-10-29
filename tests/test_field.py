@@ -881,8 +881,15 @@ class OperatorInputTests(unittest.TestCase):
         exec(compile(script, "<f>", "exec"), namespace)
         target = namespace["Target"].__new__(namespace["Target"])
         target.inputs = {"credential": "s3cret"}
+        target.transport = "http"
+        target.base = "http://10.0.0.5:8080"
         filled = target.fill([{"path": "/r/{{credential}}"}], {})
         self.assertEqual(filled[0]["path"], "/r/s3cret")
+        # the target is filled in alongside, and must not shadow an input
+        self.assertEqual(
+            target.fill([{"path": "/{{target}}/{{credential}}"}], {})[0]["path"],
+            "/10.0.0.5:8080/s3cret",
+        )
         self.assertIn("dict(self.inputs, **ctx)", script)
         self.assertIn('"where": ctx', script)
 
