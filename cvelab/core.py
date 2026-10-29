@@ -860,6 +860,35 @@ def _service_logs(
 
 
 
+def evidence_label(lab_type: str, reproduced: bool, manual_poc: bool) -> str:
+    """One line saying what this run established, for a listing or a report.
+
+    A fixed build is what you want, because it answers the question a single
+    observation cannot: is this the bug, or is it how the thing always
+    behaves. Plenty of projects publish no resolvable fixed revision, and the
+    effect is still worth showing, so the two cases have to read differently
+    rather than both saying "reproduced".
+
+    The wording says what the evidence is rather than what the lab contained.
+    "Vulnerable only" is this code's own name for a lab shape and means
+    nothing to someone reading a report, and "no patched version" said twice
+    over added nothing; what a reader needs is that there was no fixed build
+    to compare against. The manual PoC clause says "proven" rather than
+    "provided" because the script is only written after it showed the effect
+    on the vulnerable build and, where there was one, stayed silent on the
+    fixed one -- which is the whole difference between it and a script found
+    in the wild.
+    """
+    if not reproduced:
+        return "Not reproduced"
+    base = (
+        "Reproduced on the vulnerable build; no fixed build available"
+        if lab_type == "VULNERABLE_ONLY_REPRODUCTION"
+        else "Reproduced, differential against the fixed build"
+    )
+    return base + ", manual PoC proven" if manual_poc else base
+
+
 def prepare_compose(lab_dir: Path) -> tuple[str, dict[str, str], list[str], Path]:
     """Vet a lab's Compose definition and build the command that runs it.
 
@@ -1124,6 +1153,10 @@ def run_lab(
             "manual_poc_field": manual_poc_field,
             "validator_exit_code": validator_exit,
             "real_poc_verified": real_source_proof,
+            "evidence_label": evidence_label(
+                str(plan.get("lab_type") or ""), real_source_proof,
+                bool(manual_poc_field.get("shipped")),
+            ),
             "product_e2e_verified": product_e2e_verified,
             "fix_status": plan.get("fix_status", "PUBLIC_FIX_AVAILABLE"),
             "patched_tested": not vulnerable_only,

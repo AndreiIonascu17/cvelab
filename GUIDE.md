@@ -852,6 +852,22 @@ over -- and so is one with no fixed build to go silent against, because half the
 proof would be missing. `Manual-PoC.py`, `Manual-PoC.md` and `Manual-PoC.json`
 stay local; none of them is uploaded with the lab.
 
+### Without a fixed build
+
+A fixed build is preferred, and `report.json` says when there was none. It
+answers what a single observation cannot -- whether the effect is the bug or
+how the thing always behaves -- so a run that had one reads
+`Reproduced, differential against the fixed build`, and one that did not reads
+`Reproduced on the vulnerable build; no fixed build available`.
+
+The second is not refused. Plenty of projects publish no resolvable fixed
+revision, and the effect is still worth showing. What has to replace the fixed
+build is a strategy that carries its own control inside the one instance it
+runs against: `inband_differential`, `marker_roundtrip` or `oob_callback`.
+`direct_observation` is refused there, because its only check *was* the fixed
+build. Say so in a report: that run shows the effect happening, not that a fix
+removes it.
+
 ### Rehearsing it against the lab
 
 A lab is sealed: its network is `internal: true` and it publishes no port, so

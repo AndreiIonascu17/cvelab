@@ -760,3 +760,65 @@ class NoFixedBuildTests(unittest.TestCase):
         )
         self.assertIn("stayed silent on the fixed one", with_fix)
         self.assertNotIn("weaker evidence", with_fix)
+
+
+class EvidenceLabelTests(unittest.TestCase):
+    """One line a reader can take at face value.
+
+    A fixed build answers what a single observation cannot -- is this the bug
+    or is it how the thing always behaves -- so a run with one and a run
+    without must not read the same.
+    """
+
+    def test_the_four_outcomes_read_differently(self) -> None:
+        said = {
+            core.evidence_label("SOURCE_REPRODUCTION", True, False),
+            core.evidence_label("SOURCE_REPRODUCTION", True, True),
+            core.evidence_label("VULNERABLE_ONLY_REPRODUCTION", True, False),
+            core.evidence_label("VULNERABLE_ONLY_REPRODUCTION", True, True),
+        }
+        self.assertEqual(len(said), 4)
+
+    def test_a_missing_fixed_build_is_stated_not_implied(self) -> None:
+        for poc in (False, True):
+            with self.subTest(manual_poc=poc):
+                label = core.evidence_label("VULNERABLE_ONLY_REPRODUCTION", True, poc)
+                self.assertIn("no fixed build available", label)
+                self.assertNotIn("differential", label)
+
+    def test_a_differential_run_says_so(self) -> None:
+        label = core.evidence_label("END_TO_END_REPRODUCTION", True, False)
+        self.assertIn("differential against the fixed build", label)
+        self.assertNotIn("no fixed build", label)
+
+    def test_the_poc_clause_says_proven_not_provided(self) -> None:
+        """The script is only written after it earned it, which is the whole
+        difference between it and a script found in the wild."""
+        for lab_type in ("SOURCE_REPRODUCTION", "VULNERABLE_ONLY_REPRODUCTION"):
+            with self.subTest(lab_type=lab_type):
+                self.assertTrue(
+                    core.evidence_label(lab_type, True, True).endswith(
+                        ", manual PoC proven"
+                    )
+                )
+                self.assertNotIn(
+                    "manual PoC", core.evidence_label(lab_type, True, False)
+                )
+
+    def test_it_carries_none_of_the_internal_lab_shape_names(self) -> None:
+        """A report reader has no idea what VULNERABLE_ONLY means."""
+        for lab_type in ("SOURCE_REPRODUCTION", "VULNERABLE_ONLY_REPRODUCTION"):
+            for poc in (False, True):
+                label = core.evidence_label(lab_type, True, poc).lower()
+                self.assertNotIn("vulnerable_only", label)
+                self.assertNotIn("reproduction", label)
+
+    def test_a_failed_run_claims_nothing(self) -> None:
+        for lab_type in ("SOURCE_REPRODUCTION", "VULNERABLE_ONLY_REPRODUCTION"):
+            self.assertEqual(core.evidence_label(lab_type, False, False), "Not reproduced")
+            # not even when a PoC somehow exists
+            self.assertEqual(core.evidence_label(lab_type, False, True), "Not reproduced")
+
+    def test_the_report_carries_it(self) -> None:
+        source = Path(core.__file__).read_text(encoding="utf-8")
+        self.assertIn('"evidence_label": evidence_label(', source)
