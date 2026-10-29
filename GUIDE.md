@@ -724,6 +724,26 @@ rather than treating silence as consent. The image is built once and reused.
 Your own copy comes from `pip install 'cvelab[ssh]'`, `[smb]` or
 `[protocols]`; CVELab's core keeps no runtime dependencies.
 
+### Frames after an upgrade
+
+`ws` and `wss` reach an effect that is only visible in WebSocket frames.
+`ws_path` is the upgrade route, and a message is `send` and `read_until` as
+over a socket:
+
+```json
+{"strategy": "direct_observation", "transport": "ws", "ws_path": "/ws",
+ "observable_effect": "the device list is served to a client that never authenticated",
+ "probe":  [{"send": "{\"type\":\"devices/list\"}", "read_until": "}"}],
+ "expect": {"body_contains": "dev-"}}
+```
+
+The sequence shares one session and the transcript is every frame read.
+`--target 10.0.0.5` assumes port 80, or 443 for `wss`. Nothing is installed:
+the handshake is HTTP and the framing is documented. A server that answers the
+upgrade without the right `Sec-WebSocket-Accept` is refused rather than treated
+as upgraded, because every read after that would come back empty and look
+exactly like an absent effect.
+
 ### Services that do not speak HTTP
 
 `transport` picks how the script talks to the target: `http` by default, or

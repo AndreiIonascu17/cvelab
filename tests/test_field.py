@@ -1136,6 +1136,10 @@ class RoundTripTests(unittest.TestCase):
             {"strategy": "direct_observation", "transport": "tcp",
              "observable_effect": "x", "probe": [{"send": "PING\r\n"}],
              "expect": {"body_contains": "PONG"}},
+            {"strategy": "direct_observation", "transport": "ws",
+             "ws_path": "/ws", "observable_effect": "x",
+             "probe": [{"send": "{\"type\":\"devices/list\"}", "read_until": "}"}],
+             "expect": {"body_contains": "requires_auth"}},
             {"strategy": "direct_observation", "transport": "ssh",
              "observable_effect": "x", "inputs": ["user"],
              "auth": {"username": "{{user}}"},
@@ -1246,3 +1250,95 @@ class SidecarImageTests(unittest.TestCase):
         source = Path(sidecar.__file__).read_text(encoding="utf-8")
         self.assertNotIn("sudo", source)
         self.assertNotIn("setuid", source)
+
+
+class WebSocketTransportTests(unittest.TestCase):
+    """An effect that lives in frames after an upgrade.
+
+    This was the one gap in a measured batch that was the format's fault
+    rather than the vulnerability's: a lab whose evidence was in frames after
+    a `/ws` upgrade had no way to be expressed, while HTTP and raw sockets
+    could not carry the handshake and framing between them.
+    """
+
+    def _ws(self, **extra: Any) -> dict[str, Any]:
+        spec = {
+            "strategy": "direct_observation",
+            "transport": "ws",
+            "ws_path": "/ws",
+            "observable_effect": "the device list is served to a client that never authenticated",
+            "probe": [{"send": '{"type":"devices/list"}', "read_until": "}"}],
+            "expect": {"body_contains": "dev-"},
+        }
+        spec.update(extra)
+        return spec
+
+    def test_it_validates_and_keeps_its_upgrade_path(self) -> None:
+        spec = field.validate_spec(self._ws())
+        self.assertEqual(spec["transport"], "ws")
+        self.assertEqual(spec["ws_path"], "/ws")
+        self.assertEqual(field.validate_spec(self._ws(transport="wss"))["transport"], "wss")
+
+    def test_the_upgrade_path_must_be_a_path(self) -> None:
+        for bad in ("ws", "http://host/ws", ""):
+            with self.subTest(ws_path=bad):
+                with self.assertRaises(ValueError):
+                    field.validate_spec(self._ws(ws_path=bad))
+
+    def test_those_fields_mean_nothing_elsewhere_and_are_not_emitted(self) -> None:
+        """Emitting them everywhere broke validating a spec twice."""
+        with self.assertRaises(ValueError):
+            field.validate_spec({
+                "strategy": "direct_observation", "observable_effect": "x",
+                "ws_path": "/ws", "probe": [{"method": "GET", "path": "/"}],
+                "expect": {"status": 200},
+            })
+        plain = field.validate_spec({
+            "strategy": "direct_observation", "observable_effect": "x",
+            "probe": [{"method": "GET", "path": "/"}], "expect": {"status": 200},
+        })
+        self.assertNotIn("ws_path", plain)
+        self.assertNotIn("ws_headers", plain)
+
+    def test_it_needs_nothing_installed(self) -> None:
+        """The handshake is HTTP and the framing is documented, so no image."""
+        for transport in ("ws", "wss"):
+            with self.subTest(transport=transport):
+                self.assertEqual(sidecar.packages_for({transport}), ())
+                self.assertNotIn(transport, field.HANDSHAKE_TRANSPORTS)
+
+    def test_the_conventional_ports_are_assumed(self) -> None:
+        for transport, port in (("ws", 80), ("wss", 443)):
+            with self.subTest(transport=transport):
+                script = field.emit_field_poc(
+                    "CVE-2026-1", field.validate_spec(self._ws(transport=transport))
+                )
+                namespace: dict[str, Any] = {}
+                exec(compile(script, "<f>", "exec"), namespace)
+                self.assertEqual(namespace["normalize_target"]("10.0.0.5"), ("10.0.0.5", port))
+
+    def test_a_server_that_does_not_upgrade_is_not_silence(self) -> None:
+        """A plain 200 would otherwise read as a successful upgrade, and every
+        later read would come back empty -- indistinguishable from the effect
+        being absent."""
+        script = field.emit_field_poc("CVE-2026-1", field.validate_spec(self._ws()))
+        exchange = script.split("def _ws_exchange", 1)[1].split("\n    def _ws_write", 1)[0]
+        self.assertIn('" 101" not in head', exchange)
+        self.assertIn("Sec-WebSocket-Accept", exchange)
+        self.assertIn("sha1", exchange)
+
+    def test_a_client_frame_is_masked_and_a_ping_is_answered(self) -> None:
+        script = field.emit_field_poc("CVE-2026-1", field.validate_spec(self._ws()))
+        namespace: dict[str, Any] = {}
+        exec(compile(script, "<f>", "exec"), namespace)
+        target = namespace["Target"].__new__(namespace["Target"])
+        sent: list[bytes] = []
+        target._ws_write(type("S", (), {"sendall": lambda _s, b: sent.append(b)})(), b"hi", 1)
+        frame = sent[0]
+        self.assertEqual(frame[0], 0x81)          # FIN + text
+        self.assertTrue(frame[1] & 0x80)          # masked, as a client must
+        mask = frame[2:6]
+        self.assertEqual(bytes(b ^ mask[i % 4] for i, b in enumerate(frame[6:])), b"hi")
+        read = script.split("def _ws_read", 1)[1].split("\n    def _ws_frame", 1)[0]
+        self.assertIn("if opcode == 9:", read)    # ping
+        self.assertIn("if opcode == 8:", read)    # close ends the read

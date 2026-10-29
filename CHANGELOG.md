@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ws` and `wss` transports, for an effect that lives in frames after a
+  WebSocket upgrade. `ws_path` names the upgrade route and a message is `send`
+  and `read_until` as over a socket, with the sequence sharing one session.
+  The handshake is HTTP and the framing is a documented wire format, so this
+  needs nothing installed: the `Sec-WebSocket-Accept` header is checked rather
+  than assumed, because a plain 200 from a server that does not speak
+  WebSocket would otherwise read as a successful upgrade and every later read
+  would come back empty -- indistinguishable from the effect being absent. A
+  ping is answered so the peer does not drop the exchange, and a close ends a
+  read rather than failing it. This was the one gap in a ten-CVE batch that
+  was the format's fault rather than the vulnerability's.
+
+- The spec call is given what the lab declared it simulated. Measured on that
+  batch: four of the five labs that reproduced but shipped nothing had proved
+  their CVE through an endpoint the product does not serve -- a `/lab/state`
+  added so the validator could read internal state, a `/probe` page rendered
+  to watch a browser, a wrapper around a library that ships no listener at
+  all -- and `fidelity.simulated_components` is where the lab says so. The
+  prompt now draws the distinction that matters: a harness standing in for an
+  application route is fine, because a real deployment has its own route of
+  that shape and the weakness is still reached through it, while a harness
+  that *reports* the effect is not, because a spec aimed at it would pass
+  against the lab and mean nothing against a real server.
+
 - `cvelab manual-poc <lab-dir> --spec spec.json --container-port N` writes
   `Manual-PoC.py` beside the `PoC.py` that validates the lab. It takes
   `--target host:port` and runs against one server the operator is permitted
