@@ -265,12 +265,13 @@ class OperatorSpecTests(unittest.TestCase):
                 self._call(lab_dir)
             self.assertIn("has not been validated", str(raised.exception))
 
-    def test_a_vulnerable_only_lab_is_refused(self) -> None:
-        """Without a fixed build to stay silent against, half the proof is missing."""
+    def test_a_vulnerable_only_lab_is_not_refused_outright(self) -> None:
+        """A patched build is a check against self-deception, not what makes a
+        vulnerability real. Some projects publish no resolvable fixed build at
+        all, and the effect is still worth showing."""
         with _lab(spec=_spec(), lab_type="VULNERABLE_ONLY_REPRODUCTION") as lab_dir:
-            with self.assertRaises(RuntimeError) as raised:
-                self._call(lab_dir)
-            self.assertIn("no fixed build", str(raised.exception))
+            result = self._call(lab_dir)
+            self.assertIs(result["ok"], True)
 
     def test_an_unusable_spec_is_refused_before_anything_starts(self) -> None:
         """Here a bad spec is the operator's own input, so it is an error.
@@ -555,14 +556,22 @@ class AfterValidationHookTests(unittest.TestCase):
         self.assertIs(out["shipped"], False)
         self.assertIn("did not reproduce", out["reason"])
 
-    def test_a_vulnerable_only_lab_is_not_asked_about(self) -> None:
-        with mock.patch.object(field, "draft_manual_poc_spec") as drafted:
-            out = self._step()(
-                "CVE-2026-0001", Path("/lab"),
+    def test_a_vulnerable_only_lab_is_asked_about_too(self) -> None:
+        """It used to be skipped. The effect is still worth showing."""
+        with mock.patch.object(field, "ai_is_configured", return_value=True), \
+             mock.patch.object(
+                 field, "draft_manual_poc_spec",
+                 return_value={"spec": field.validate_spec(_spec()), "container_port": 8000},
+             ) as drafted, \
+             mock.patch.object(
+                 field, "prove_manual_poc",
+                 return_value={"shipped": False, "reason": "x", "proof_checks": {}, "runs": {}},
+             ), _lab() as lab_dir:
+            self._step()(
+                "CVE-2026-0001", lab_dir,
                 {"lab_type": "VULNERABLE_ONLY_REPRODUCTION"}, ["docker"], {}, True,
             )
-        drafted.assert_not_called()
-        self.assertIn("no fixed build", out["reason"])
+        drafted.assert_called_once()
 
     def test_no_model_configured_costs_nothing(self) -> None:
         with mock.patch.object(field, "ai_is_configured", return_value=False), \
@@ -656,3 +665,98 @@ class HookOptionsTests(unittest.TestCase):
             with self.subTest(command=argv[0]):
                 args = cli.parser().parse_args(argv)
                 self.assertFalse(hasattr(args, "no_manual_poc"))
+
+
+class NoFixedBuildTests(unittest.TestCase):
+    """A lab with no patched build may still hand over a script.
+
+    The patched build answers one question -- is this the bug, or is it how the
+    thing always behaves -- and it is a check against self-deception rather
+    than what makes a vulnerability real. Some projects publish no resolvable
+    fixed revision at all. What has to replace it is a strategy that carries
+    its own control inside the one instance it runs against.
+    """
+
+    def _prove(self, strategy: str, observed: bool = True) -> dict[str, Any]:
+        spec = {
+            "inband_differential": _spec(),
+            "marker_roundtrip": {
+                "strategy": "marker_roundtrip", "observable_effect": "a stored marker",
+                "probe": [{"method": "POST", "path": "/c", "body": "{{marker}}"}],
+                "observe": {"method": "GET", "path": "/c"},
+            },
+            "oob_callback": {
+                "strategy": "oob_callback", "observable_effect": "a callback",
+                "probe": [{"method": "POST", "path": "/f",
+                           "body": "http://{{callback}}/{{marker}}"}],
+            },
+            "direct_observation": {
+                "strategy": "direct_observation", "observable_effect": "a 200",
+                "probe": [{"method": "GET", "path": "/a"}], "expect": {"status": 200},
+            },
+        }[strategy]
+        with mock.patch.object(
+            field, "_service_container", side_effect=lambda c, n, d, e: f"cid-{n}"
+        ), mock.patch.object(
+            field, "_run_field_script",
+            side_effect=lambda cid, port, script, transport, image, given: _run(observed, True),
+        ):
+            return field.prove_manual_poc(
+                "CVE-2026-0001", field.validate_spec(spec), 8000, Path("/lab"),
+                ["docker", "compose"], {},
+                {"lab_type": "VULNERABLE_ONLY_REPRODUCTION"},
+            )
+
+    def test_a_self_controlled_strategy_earns_the_handover(self) -> None:
+        for strategy in field.SELF_CONTROLLED:
+            with self.subTest(strategy=strategy):
+                out = self._prove(strategy)
+                self.assertIs(out["shipped"], True)
+                self.assertIs(out["fixed_build_compared"], False)
+                self.assertIs(out["proof_checks"]["control_is_in_the_strategy"], True)
+                self.assertNotIn("silent_on_fixed", out["proof_checks"])
+
+    def test_direct_observation_is_refused_without_a_fixed_build(self) -> None:
+        """Its only check was the fixed build. On its own, "the route answered
+        200" is the shape of proof that passed a lab on `existsSync` seeing a
+        path with "..", which had to be rejected by hand."""
+        out = self._prove("direct_observation")
+        self.assertIs(out["shipped"], False)
+        self.assertIn("no control of its own", out["reason"])
+        self.assertIn("inband_differential", out["reason"])
+
+    def test_the_effect_still_has_to_be_observed(self) -> None:
+        out = self._prove("inband_differential", observed=False)
+        self.assertIs(out["shipped"], False)
+        self.assertIn("did not observe the effect", out["reason"])
+
+    def test_only_the_vulnerable_service_is_asked_for(self) -> None:
+        seen: list[str] = []
+        with mock.patch.object(
+            field, "_service_container",
+            side_effect=lambda c, n, d, e: (seen.append(n), f"cid-{n}")[1],
+        ), mock.patch.object(
+            field, "_run_field_script",
+            side_effect=lambda cid, port, script, transport, image, given: _run(True, True),
+        ):
+            field.prove_manual_poc(
+                "CVE-2026-0001", field.validate_spec(_spec()), 8000, Path("/lab"),
+                ["docker", "compose"], {},
+                {"lab_type": "VULNERABLE_ONLY_REPRODUCTION"},
+            )
+        self.assertEqual(seen, ["vulnerable"])
+
+    def test_the_guide_says_the_evidence_is_weaker(self) -> None:
+        """A report should not read as if a patch was shown to remove it."""
+        guide = field._manual_poc_guide(
+            "CVE-2026-0001", field.validate_spec(_spec()),
+            {"lab_type": "VULNERABLE_ONLY_REPRODUCTION", "repository": "r"}, 8000,
+        )
+        self.assertIn("no fixed revision to compare against", guide)
+        self.assertIn("weaker evidence", guide)
+        self.assertIn("not that a fix removes it", guide)
+        with_fix = field._manual_poc_guide(
+            "CVE-2026-0001", field.validate_spec(_spec()), {"repository": "r"}, 8000,
+        )
+        self.assertIn("stayed silent on the fixed one", with_fix)
+        self.assertNotIn("weaker evidence", with_fix)

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- A lab with no fixed build can hand over a manual PoC. It was refused
+  outright, on the grounds that half the proof was missing. That had it
+  backwards: a patched build answers one question -- is this the bug, or is it
+  how the thing always behaves -- and it is a check against self-deception,
+  not what makes a vulnerability real. Some projects publish no resolvable
+  patched revision at all, and the effect is still worth showing.
+
+  What replaces it is not nothing. `inband_differential`, `marker_roundtrip`
+  and `oob_callback` each carry their own control inside the one instance they
+  run against -- the same resource read the way that authorizes correctly, or
+  a marker surfacing where it cannot legitimately -- so one of those is
+  required. `direct_observation` is refused there, because its only check was
+  the fixed build and "the route answered 200" on its own is the shape of
+  proof that once passed a lab on `existsSync` seeing a path with `..`.
+  `Manual-PoC.json` records `fixed_build_compared`, and the guide says plainly
+  that this shows the effect happening rather than that a fix removes it.
+
 ### Added
 
 - `ws` and `wss` transports, for an effect that lives in frames after a
