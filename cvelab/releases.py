@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -215,3 +216,132 @@ def render(releases: list[dict]) -> str:
         "patched one, with everything else identical. The pair carries the fix and whatever else that "
         "release changed, so the snapshots stay the reference for what the fix does.\n"
     )
+
+
+#: A release pair is often all a lab needs, and it is sometimes all a project
+#: publishes. An advisory that says "affected through 2.3.34, fixed in 2.3.35"
+#: names a before and an after; when the repository tags its releases, those
+#: two tags are immutable refs and give the same differential a fix commit
+#: would. Resolving them costs one `git ls-remote` and no model call, and it
+#: turns the whole class of "the fix is a release, not a commit" from a dead
+#: run into an ordinary lab.
+_TAG_TIMEOUT = 60
+
+
+def tag_candidates(
+    version: str, package: str | None = None, repo: str | None = None
+) -> list[str]:
+    """How projects spell a release tag, most common first.
+
+    Matched exactly and never by prefix. A repository that tags v2.3.34
+    frequently also tags v2.3.34-gae for a different build of the same
+    release, and a prefix match would quietly pick whichever came first.
+    """
+    version = str(version).strip().lstrip("vV")
+    if not version:
+        return []
+    underscored = version.replace(".", "_")
+    names = [
+        f"v{version}", version, f"V{version}",
+        f"rel_{underscored}", f"REL_{underscored}",
+        f"release-{version}", f"release/{version}", f"releases/{version}",
+        f"r{version}",
+    ]
+    # The prefix a project puts on a release tag follows the repository far
+    # more often than the package: netty tags netty-4.1.127.Final while the
+    # advisory names io.netty:netty-handler, so the repository name is tried
+    # first and the package coordinate is split on both : and / to reach the
+    # artifact inside a Maven or scoped name.
+    prefixes = []
+    if repo:
+        prefixes.append(str(repo).rstrip("/").rsplit("/", 1)[-1].removesuffix(".git"))
+    coordinate = str(package or "").strip()
+    for part in (coordinate.rsplit(":", 1)[-1], coordinate.rsplit("/", 1)[-1]):
+        if part and part not in prefixes:
+            prefixes.append(part)
+    for prefix in prefixes:
+        names += [f"{prefix}-{version}", f"{prefix}_{version}",
+                  f"{prefix}-v{version}", f"{prefix}/v{version}"]
+    return names
+
+
+def repo_tags(repo_url: str) -> dict[str, str]:
+    """Every tag the repository publishes, by name. Empty when it cannot be read."""
+    try:
+        listed = subprocess.run(
+            ["git", "ls-remote", "--tags", "--refs", repo_url],
+            capture_output=True, text=True, timeout=_TAG_TIMEOUT, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if listed.returncode != 0:
+        return {}
+    tags = {}
+    for line in listed.stdout.splitlines():
+        sha, _, ref = line.partition("\t")
+        if ref.startswith("refs/tags/") and len(sha.strip()) == 40:
+            tags[ref[len("refs/tags/"):].strip()] = sha.strip()
+    return tags
+
+
+def pair_from_advisory(cve: str) -> list[dict]:
+    """Affected and fixed versions as the advisory itself states them.
+
+    `find_releases` asks a package registry which versions exist, so it can
+    name the last vulnerable one even for a `< X` range. It also returns
+    nothing when the registry cannot be read, which is what happened to the
+    Maven lookup for the CVE that prompted this: the advisory said `<= 2.3.34,
+    fixed in 2.3.35` and the pair was dropped on the floor anyway. An
+    inclusive upper bound already names the version, so take it from there and
+    keep the registry as the fallback rather than the requirement.
+    """
+    entries = []
+    for entry in advisory_packages(cve):
+        fixed = str(entry.get("first_patched") or "").strip()
+        bound = re.search(
+            r"<=\s*([0-9][0-9A-Za-z._+-]*)", str(entry.get("vulnerable_range") or "")
+        )
+        if fixed and bound:
+            entries.append({
+                "ecosystem": entry.get("ecosystem"),
+                "package": entry.get("package"),
+                "last_vulnerable": bound.group(1),
+                "first_patched": fixed,
+            })
+    if entries:
+        return entries
+    return find_releases(cve)
+
+
+def tag_pair(repo_url: str, entries: list[dict]) -> dict | None:
+    """The affected and fixed tags for one of the advisory's release pairs.
+
+    Returns the first entry whose both ends resolve, so a CVE affecting
+    several packages is not half-resolved into a mismatched pair.
+    """
+    if not repo_url or not entries:
+        return None
+    tags = repo_tags(repo_url)
+    if not tags:
+        return None
+    for entry in entries:
+        affected, fixed = entry.get("last_vulnerable"), entry.get("first_patched")
+        if not affected or not fixed:
+            continue
+        package = entry.get("package")
+        found = {}
+        for role, version in (("vulnerable", affected), ("fixed", fixed)):
+            for name in tag_candidates(version, package, repo_url):
+                if name in tags:
+                    found[role] = name
+                    break
+        if len(found) == 2:
+            return {
+                "repository": repo_url,
+                "package": package,
+                "vulnerable_version": affected,
+                "fixed_version": fixed,
+                "vulnerable_tag": found["vulnerable"],
+                "fixed_tag": found["fixed"],
+            }
+    return None

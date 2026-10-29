@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A lab can be built from a tagged release pair when there is no fixing
+  commit. Discovery will not invent one and is right not to, so a CVE whose
+  fix is a release ended with `ARTIFACT_REQUIRED` and nothing else -- while
+  the advisory said plainly "affected through 2.3.34, fixed in 2.3.35" and
+  both tags were sitting in the repository. Resolving them costs one
+  `git ls-remote` and no model call. Tags are matched exactly and never by
+  prefix, because a repository that tags `v2.3.34` often also tags
+  `v2.3.34-gae` for a different build; the repository name is tried as the
+  tag prefix before the package coordinate, since netty tags
+  `netty-4.1.127.Final` while the advisory names `io.netty:netty-handler`;
+  and both ends must resolve or the pair is dropped. The versions are read
+  from the advisory's own inclusive upper bound rather than from a package
+  registry, which is what had dropped this pair -- the registry lookup
+  returned nothing and took the pair with it.
+
+### Added (manual PoC)
+
 - `report.json` carries `evidence_label`, one line saying what a run
   established rather than what the lab contained:
 

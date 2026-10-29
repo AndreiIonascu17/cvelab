@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from cvelab import field, sidecar
+from cvelab import field, releases, sidecar
 
 
 def _inband(**extra: Any) -> dict[str, Any]:
@@ -1342,3 +1342,79 @@ class WebSocketTransportTests(unittest.TestCase):
         read = script.split("def _ws_read", 1)[1].split("\n    def _ws_frame", 1)[0]
         self.assertIn("if opcode == 9:", read)    # ping
         self.assertIn("if opcode == 8:", read)    # close ends the read
+
+
+class ReleaseTagPairTests(unittest.TestCase):
+    """A tagged release pair is a before and an after, with no fix commit.
+
+    A CVE whose fix is a release rather than a commit used to end with
+    nothing: discovery will not invent a fixing commit, and it is right not
+    to. But an advisory that says "affected through 2.3.34, fixed in 2.3.35"
+    names both ends, and where the project tags its releases those two tags
+    are immutable refs that give the same differential.
+    """
+
+    def test_a_tag_is_matched_exactly_and_never_by_prefix(self) -> None:
+        """A repository that tags v2.3.34 often also tags v2.3.34-gae for a
+        different build of the same release, and picking that would build the
+        wrong thing."""
+        tags = {"v2.3.34-gae": "a" * 40, "v2.3.34": "b" * 40, "v2.3.35": "c" * 40}
+        with mock.patch.object(releases, "repo_tags", return_value=tags):
+            pair = releases.tag_pair("https://example.invalid/p.git", [
+                {"last_vulnerable": "2.3.34", "first_patched": "2.3.35"}
+            ])
+        self.assertEqual(pair["vulnerable_tag"], "v2.3.34")
+        self.assertEqual(pair["fixed_tag"], "v2.3.35")
+
+    def test_the_repository_name_is_tried_as_a_prefix(self) -> None:
+        """netty tags netty-4.1.127.Final while the advisory names
+        io.netty:netty-handler, so the package coordinate alone is not it."""
+        candidates = releases.tag_candidates(
+            "4.1.127.Final", "io.netty:netty-handler", "https://github.com/netty/netty.git"
+        )
+        self.assertIn("netty-4.1.127.Final", candidates)
+        self.assertIn("netty-handler-4.1.127.Final", candidates)
+
+    def test_common_spellings_are_covered(self) -> None:
+        for version, wanted in (
+            ("2.3.34", "v2.3.34"), ("5.2.7", "5.2.7"), ("1.0.0", "rel_1_0_0"),
+        ):
+            with self.subTest(version=version):
+                self.assertIn(wanted, releases.tag_candidates(version))
+
+    def test_a_half_resolved_pair_is_no_pair(self) -> None:
+        """Returning one end would build a lab comparing a release to nothing."""
+        with mock.patch.object(
+            releases, "repo_tags", return_value={"v1.0.0": "a" * 40}
+        ):
+            self.assertIsNone(releases.tag_pair("https://example.invalid/p.git", [
+                {"last_vulnerable": "1.0.0", "first_patched": "1.0.1"}
+            ]))
+
+    def test_the_versions_come_from_the_advisory_not_a_registry(self) -> None:
+        """find_releases asks a registry which versions exist and returns
+        nothing when it cannot be read, which is what dropped the measured
+        pair. An inclusive upper bound already names the version."""
+        advisory = [{"ecosystem": "maven", "package": "org.freemarker:freemarker",
+                     "vulnerable_range": ">= 2.2.0, <= 2.3.34", "first_patched": "2.3.35"}]
+        with mock.patch.object(releases, "advisory_packages", return_value=advisory), \
+             mock.patch.object(releases, "find_releases", return_value=[]):
+            entries = releases.pair_from_advisory("CVE-2026-84939")
+        self.assertEqual(entries[0]["last_vulnerable"], "2.3.34")
+        self.assertEqual(entries[0]["first_patched"], "2.3.35")
+
+    def test_an_exclusive_bound_falls_back_to_the_registry(self) -> None:
+        """`< X` does not name the last affected release, so the registry is
+        still the only way to learn it."""
+        advisory = [{"vulnerable_range": "< 2.3.35", "first_patched": "2.3.35"}]
+        with mock.patch.object(releases, "advisory_packages", return_value=advisory), \
+             mock.patch.object(
+                 releases, "find_releases",
+                 return_value=[{"last_vulnerable": "2.3.34", "first_patched": "2.3.35"}]
+             ):
+            entries = releases.pair_from_advisory("CVE-2026-84939")
+        self.assertEqual(entries[0]["last_vulnerable"], "2.3.34")
+
+    def test_an_unreadable_repository_resolves_nothing(self) -> None:
+        with mock.patch.object(releases.subprocess, "run", side_effect=OSError("no git")):
+            self.assertEqual(releases.repo_tags("https://example.invalid/p.git"), {})
