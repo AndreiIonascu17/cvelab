@@ -1580,6 +1580,31 @@ def generate_source_lab(
                     _safe_repo_url(candidate_repo),
                     _safe_revision(candidate_vulnerable, "vulnerable revision source discovery returned"),
                 )
+    if not resolved and not vulnerable_only_resolved and discovery:
+        # Last, and mechanical: discovery corroborates the repository even when
+        # it will not pin a fixing commit, and an advisory that says "affected
+        # through X, fixed in Y" names a before and an after. Where the project
+        # tags its releases, those two tags are immutable refs and give the
+        # same differential a commit would. Measured on freemarker, whose fix
+        # is an Apache release and whose run ended with nothing: v2.3.34 and
+        # v2.3.35 are both there. Costs one `git ls-remote` and no model call.
+        candidate_repo = discovery.get("repository_url")
+        if candidate_repo:
+            try:
+                safe_repo = _safe_repo_url(candidate_repo)
+            except ValueError:
+                safe_repo = ""
+            pair = (
+                releases.tag_pair(safe_repo, releases.pair_from_advisory(cve))
+                if safe_repo else None
+            )
+            if pair:
+                resolved = (safe_repo, pair["fixed_tag"])
+                vulnerable_ref = pair["vulnerable_tag"]
+                progress.step(
+                    "no fixing commit, but the release pair is tagged: "
+                    f"{pair['vulnerable_tag']} -> {pair['fixed_tag']}"
+                )
     if not resolved and not vulnerable_only_resolved:
         status = discovery.get("status") if discovery else "INSUFFICIENT_DATA"
         if status == "VENDOR_ARTIFACT_REQUIRED":
