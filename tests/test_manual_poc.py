@@ -940,6 +940,7 @@ class ProvenSpecIsReusedTests(unittest.TestCase):
             held = json.loads(
                 (lab_dir / "artifacts" / field.MANUAL_POC_RECORD_NAME).read_text())
             self.assertIn("spec", held)
+            self.assertNotIn("attempted_spec", held)
         with _lab() as lab_dir:
             refused = {"shipped": False, "reason": "x"}
             field.write_manual_poc("CVE-2026-0001", lab_dir, {},
@@ -947,6 +948,24 @@ class ProvenSpecIsReusedTests(unittest.TestCase):
             held = json.loads(
                 (lab_dir / "artifacts" / field.MANUAL_POC_RECORD_NAME).read_text())
             self.assertNotIn("spec", held)
+
+    def test_a_refused_spec_is_kept_where_it_can_be_read(self) -> None:
+        """Centrifugo: "did not tell the two builds apart" and nothing else.
+
+        The lab's own PoC had the forged header working on the vulnerable
+        build and rejected on the fixed one, so the finding was real and the
+        manual script simply looked in the wrong place -- and the spec that
+        looked there was gone, so there was nothing to correct.
+        """
+        with _lab() as lab_dir:
+            refused = {"shipped": False, "reason": "did not tell them apart"}
+            field.write_manual_poc("CVE-2026-0001", lab_dir, {},
+                                   field.validate_spec(_spec()), 8000, refused)
+            held = json.loads(
+                (lab_dir / "artifacts" / field.MANUAL_POC_RECORD_NAME).read_text())
+            self.assertEqual(held["attempted_spec"]["strategy"], "inband_differential")
+            # Kept to be read, not to be repeated.
+            self.assertIsNone(field._proven_spec(lab_dir))
 
 
 class ServiceWentAwayTests(unittest.TestCase):

@@ -3095,13 +3095,15 @@ def write_manual_poc(
     artifacts.mkdir(parents=True, exist_ok=True)
     script = str(outcome.pop("script", ""))
     record = {"cve": cve, **outcome}
-    if script:
-        # The spec that earned the handover is kept, so asking again for the
-        # same lab reuses the answer instead of sampling a new one. Nothing
-        # remembered it before, and a drafted spec varies between calls, so
-        # the operation was never idempotent: a lab that produced a script
-        # one day could refuse the next with nothing having changed.
-        record["spec"] = spec
+    # The spec goes down either way, under a key that says whether it earned
+    # the handover. A proven one is read back, so asking again for the same
+    # lab reuses the answer instead of sampling a new one: a drafted spec
+    # varies between calls, so without that a lab that produced a script one
+    # day could refuse the next with nothing having changed. A refused one is
+    # kept because "the script did not tell the two builds apart" says
+    # nothing about which check was wrong, and the attempt is the only place
+    # that holds the answer.
+    record["spec" if script else "attempted_spec"] = spec
     write_text(
         artifacts / MANUAL_POC_RECORD_NAME,
         json.dumps(record, indent=2, ensure_ascii=True) + "\n",
