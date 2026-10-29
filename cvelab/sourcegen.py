@@ -404,7 +404,12 @@ def discover_source_with_ai(
             "fix. If an affected revision is evidenced but the fixing commit is absent or ambiguous, you MUST return "
             "VULNERABLE_ONLY even when an advisory names a patched release. "
             "Use VENDOR_ARTIFACT_REQUIRED for proprietary products, appliances, operating systems, licensed "
-            "installers, or authenticated downloads. Never invent URLs, versions, repositories, commit hashes, "
+            "installers, or authenticated downloads -- but only when every affected product is one of "
+            "those. A record frequently lists a commercial edition and an open-source one together, and "
+            "the open-source edition is the one to resolve: name its repository and its affected revision, "
+            "and say in the rationale that the commercial edition is not covered. Letting the proprietary "
+            "entry decide the answer throws away a reproduction that was available. "
+            "Never invent URLs, versions, repositories, commit hashes, "
             "patches, or runtime-test details. If provenance is ambiguous, return INSUFFICIENT_DATA. This step is "
             "provenance research only; do not design or expand a reproduction procedure."
         ),
