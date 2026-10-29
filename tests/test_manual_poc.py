@@ -426,15 +426,32 @@ class StaysLocalTests(unittest.TestCase):
 
 
 class CommandLineTests(unittest.TestCase):
-    def test_manual_poc_accepts_a_lab_a_spec_and_a_port(self) -> None:
+    def test_manual_takes_a_cve_and_where_its_poc_lives(self) -> None:
+        """A CVE is what anyone remembers; the path with the CVE in it is not."""
         args = cli.parser().parse_args([
-            "manual-poc", "/labs/CVE-2026-0001", "--spec", "s.json",
-            "--container-port", "8000",
+            "manual", "CVE-2026-0001", "--poc", "/labs",
+            "--spec", "s.json", "--container-port", "8000",
         ])
-        self.assertEqual(args.command, "manual-poc")
-        self.assertEqual(args.lab_dir, Path("/labs/CVE-2026-0001"))
+        self.assertEqual(args.command, "manual")
+        self.assertEqual(args.cve, "CVE-2026-0001")
+        self.assertEqual(args.poc, Path("/labs"))
         self.assertEqual(args.container_port, 8000)
         self.assertIs(args.keep, False)
+
+    def test_either_spelling_of_the_location_is_accepted(self) -> None:
+        """Both are what gets typed: the directory holding the lab, and the lab."""
+        with _lab() as lab_dir:
+            self.assertEqual(cli._locate_lab("CVE-2026-0001", lab_dir.parent), lab_dir)
+            self.assertEqual(cli._locate_lab("cve-2026-0001", lab_dir), lab_dir)
+
+    def test_a_missing_lab_says_where_it_looked(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(RuntimeError) as raised:
+                cli._locate_lab("CVE-2026-0001", Path(root))
+            said = str(raised.exception)
+            self.assertIn("CVE-2026-0001", said)
+            self.assertIn("plan.json", said)
+            self.assertIn("cvelab auto", said)
 
     def test_demo_target_takes_up_or_down(self) -> None:
         for action in ("up", "down"):
@@ -655,7 +672,7 @@ class HookOptionsTests(unittest.TestCase):
 
     def test_the_dedicated_command_needs_neither_a_spec_nor_a_port(self) -> None:
         """`cvelab manual-poc <lab>` asks for the spec itself."""
-        args = cli.parser().parse_args(["manual-poc", "/labs/CVE-2026-0001"])
+        args = cli.parser().parse_args(["manual", "CVE-2026-0001"])
         self.assertIsNone(args.spec)
         self.assertIsNone(args.container_port)
 

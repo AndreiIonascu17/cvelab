@@ -29,6 +29,7 @@ from .closed import run_closed_lab
 from .closed_auto import run_closed_auto
 from .core import (
     build_lab,
+    normalize_cve,
     redact,
     register_environment_secrets,
     register_secret,
@@ -40,6 +41,24 @@ from .field import manual_poc_step, run_demo_target, run_field_lab, run_manual_p
 from .providers import SELECTABLE
 from .providers import get as get_provider
 from .sourcegen import generate_source_lab
+
+
+def _locate_lab(cve: str, where: Path) -> Path:
+    """The lab for this CVE, given the CVE and where its PoC lives.
+
+    A CVE is what anyone remembers; the path with the CVE already in it is
+    not. Both spellings are accepted because both are what gets typed: the
+    directory that holds CVE-YYYY-NNNNN, and that directory itself.
+    """
+    cve = normalize_cve(cve)
+    where = where.expanduser()
+    for candidate in (where / cve, where):
+        if (candidate / "plan.json").is_file():
+            return candidate
+    raise RuntimeError(
+        f"No lab for {cve} under {where}: looked for {where / cve}/plan.json and "
+        f"{where}/plan.json. Build it first with `cvelab auto {cve}`, or pass --poc"
+    )
 
 
 def _named_values(given: list[str]) -> dict[str, str]:
@@ -272,11 +291,16 @@ def parser() -> argparse.ArgumentParser:
     field_cmd.add_argument("--spec", required=True, type=Path, help="Field PoC spec: strategy, effect, requests")
 
     manual_poc = sub.add_parser(
-        "manual-poc",
-        help="Prove your spec against a validated lab's two builds and write the "
-             "single-target script you run against one server yourself",
+        "manual",
+        help="Write the single-target script for a lab you already built: name the CVE "
+             "and where its PoC lives",
     )
-    manual_poc.add_argument("lab_dir", type=Path, help="A generated, validated lab directory")
+    manual_poc.add_argument("cve")
+    manual_poc.add_argument(
+        "--poc", type=Path,
+        help="Where the Docker PoC for that CVE lives: either the directory holding "
+             "CVE-YYYY-NNNNN, or that directory itself. Defaults to --output-root",
+    )
     manual_poc.add_argument(
         "--spec", type=Path,
         help="Your spec: strategy, the effect to observe, and the requests that produce it. "
@@ -561,9 +585,10 @@ def _run_command(args: argparse.Namespace) -> int:
                 args.cve, args.output_root, api_key, model, provider, base_url,
                 args.repo, args.fixed_ref,
             )
-        elif args.command == "manual-poc":
+        elif args.command == "manual":
             result = run_manual_poc(
-                args.lab_dir, args.spec, args.container_port, args.keep, args.yes,
+                _locate_lab(args.cve, args.poc or args.output_root),
+                args.spec, args.container_port, args.keep, args.yes,
                 _named_values(args.input),
                 api_key=api_key, model=model, provider=provider, base_url=base_url,
             )

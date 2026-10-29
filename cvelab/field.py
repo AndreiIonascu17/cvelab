@@ -117,6 +117,13 @@ EXPECTATIONS = ("status", "header", "body_contains", "extract")
 #: reflection from an earlier run is never mistaken for this one's.
 _MARKER_TOKEN = "{{marker}}"
 
+#: The target as the operator wrote it, and its host alone. A spec cannot
+#: name a host -- the operator supplies that at run time -- but some effects
+#: are about the target's own address: an Origin or Referer the server is
+#: supposed to reject, a DNS-rebinding check, a redirect back to itself. A
+#: measured lab reproduced and then had no spec for exactly this reason.
+_TARGET_TOKENS = ("target", "targetHost")
+
 #: Where the script's own listener can be reached, substituted into the probe.
 #: The operator names it when the target cannot reach the bound address
 #: directly, which is the usual case across a network.
@@ -386,7 +393,7 @@ def _validate_inputs(value: Any) -> list[str]:
         name = str(offered)
         if not _BIND_NAME.fullmatch(name):
             raise ValueError(f"inputs name {name!r} must match {_BIND_NAME.pattern}")
-        if name in ("marker", "callback"):
+        if name in ("marker", "callback", *_TARGET_TOKENS):
             raise ValueError(f"inputs cannot redefine {{{{{name}}}}}")
         names.append(name)
     return names
@@ -497,7 +504,10 @@ def _validate_check(
     out: dict[str, Any] = {"label": str(check.get("label", where)), "discover": discover}
 
     def _allowed(sequence: list[dict[str, Any]], what: str) -> None:
-        missing = _substitutions(json.dumps(sequence)) - bound - {"marker", "callback"}
+        missing = (
+            _substitutions(json.dumps(sequence)) - bound
+            - {"marker", "callback"} - set(_TARGET_TOKENS)
+        )
         if missing:
             raise ValueError(f"{where}.{what} uses names nothing binds: {sorted(missing)}")
 
@@ -814,6 +824,19 @@ class Target:
                 self.ctx.check_hostname = False
                 self.ctx.verify_mode = ssl.CERT_NONE
 
+    def about_target(self):
+        """What the spec may say about the host it was pointed at.
+
+        A spec names no host, because the operator supplies it. But an effect
+        can be about the target's own address -- an Origin the server should
+        reject, a redirect back to itself -- and only the run knows it.
+        """
+        if self.transport == "http":
+            authority = urllib.parse.urlsplit(self.base).netloc
+        else:
+            authority = "%s:%s" % (self.host, self.port)
+        return {"target": authority, "targetHost": authority.rsplit(":", 1)[0].strip("[]")}
+
     def fill(self, obj, ctx):
         """Substitute discovered names and the operator's own inputs.
 
@@ -822,7 +845,7 @@ class Target:
         passed on the command line must not end up in the output or in the
         JSON a report quotes.
         """
-        return _subst(obj, dict(self.inputs, **ctx))
+        return _subst(obj, dict(self.about_target(), **dict(self.inputs, **ctx)))
 
     def exchange(self, messages):
         """Run one sequence and return (status, text, headers) for the proof.
@@ -2700,8 +2723,10 @@ _DRAFT_INSTRUCTIONS = (
     "  observable_effect: one sentence naming what a run shows.\n"
     "  For direct_observation, which fits most authorization and disclosure findings and "
     "is the one to reach for first: probe, a list of requests asking the way the weakness "
-    "allows, and expect, exactly one of {\"status\": 200} when the finding is that the "
-    "route answered at all, {\"header\": \"<name>\"} when the evidence is a response "
+    "allows, and expect, exactly one of {\"status\": <code>} when the finding is the "
+    "status itself -- any code, not only 200: a route answering 200 where it should "
+    "refuse, and equally a 401 where a fixed build answers 403, are both expressed this "
+    "way -- {\"header\": \"<name>\"} when the evidence is a response "
     "header, {\"body_contains\": \"<text>\"} for a literal, or {\"extract\": {...}} "
     "when a value has to be pulled out. The effect is that this response came back at all; "
     "CVELab checks that a fixed build does not produce it, so no second reading is needed. "
@@ -2739,6 +2764,10 @@ _DRAFT_INSTRUCTIONS = (
     "only reading is allowed, which is how a banner is taken.\n"
     "  Paths and messages name no host: the operator supplies the one target at run time, so "
     "a hostname anywhere in the spec is wrong. Over tcp and tls there is no discover chain.\n"
+    "  A request may also use {{target}}, the host and port the operator pointed the script "
+    "at, and {{targetHost}}, that host alone. A spec names no host, but an effect can be "
+    "about the target's own address -- an Origin or Referer the server is supposed to "
+    "reject, a rebinding check, a redirect back to itself -- and only the run knows it.\n"
     "  inputs: a list of names for values this lab cannot know and the operator supplies at "
     "run time, such as a test account's credential or a tenant id. A request fills one in as "
     "{{name}}. Declare one rather than guessing a credential, and rather than answering "
