@@ -322,6 +322,11 @@ def parser() -> argparse.ArgumentParser:
              "repeat for each one",
     )
     manual_poc.add_argument(
+        "--redraft", action="store_true",
+        help="Ask for a new spec even though this lab already proved one. Without it "
+             "the proven spec is reused, so asking twice gives the same answer",
+    )
+    manual_poc.add_argument(
         "--yes", action="store_true",
         help="Agree in advance to building the prepared sidecar image a protocol "
              "transport needs, instead of being asked",
@@ -589,7 +594,7 @@ def _run_command(args: argparse.Namespace) -> int:
             result = run_manual_poc(
                 _locate_lab(args.cve, args.poc or args.output_root),
                 args.spec, args.container_port, args.keep, args.yes,
-                _named_values(args.input),
+                _named_values(args.input), args.redraft,
                 api_key=api_key, model=model, provider=provider, base_url=base_url,
             )
         elif args.command == "demo-target":

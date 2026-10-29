@@ -2139,6 +2139,34 @@ def _wait_container_port(container: str, port: int, timeout: int) -> bool:
     return completed.returncode == 0
 
 
+def _still_serving(container: str, port: int) -> bool:
+    """Is this container still up and still answering on its port.
+
+    Two questions, because they fail differently: a container that exited and
+    one that is running but no longer listening both ruin a proof, and both
+    used to arrive as an unreachable target minutes later.
+    """
+    state = _docker("inspect", "--format", "{{.State.Running}}", container, check=False)
+    if state.strip().lower() != "true":
+        return False
+    return _wait_container_port(container, port, 15)
+
+
+#: Terminal colour and cursor control. A dev server writes plenty of it, and
+#: the first time these logs were read for a real stop they were almost
+#: entirely escape codes with the one useful line buried in them.
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
+def _container_logs(container: str, limit: int = 2000) -> str:
+    """The tail of what the service said, for a stop that needs explaining."""
+    shown = _docker("logs", "--tail", "40", container, check=False)
+    plain = _ANSI.sub("", shown)
+    # Blank lines left behind by stripped colour runs carry nothing.
+    plain = "\n".join(line.rstrip() for line in plain.splitlines() if line.strip())
+    return plain[-limit:]
+
+
 def _bring_up(
     services: list[str],
     probe: list[str],
@@ -2261,12 +2289,23 @@ def prove_manual_poc(
         missing = [name for name, cid in containers.items() if not cid]
         if missing:
             return {"shipped": False, "reason": f"no running container for {', '.join(missing)}"}
-        runs = {
-            name: _run_field_script(
+        # Checked again here, not only at startup. A service can answer the
+        # readiness probe and then stop before its turn comes: Storybook
+        # 10.6.1 did exactly that, twice, while the fixed build served both
+        # runs, and the proof reported "did not finish against both builds" --
+        # true, and useless. A service that went away is named.
+        runs = {}
+        for name, cid in containers.items():
+            if not _still_serving(cid, port):
+                return {
+                    "shipped": False,
+                    "reason": f"the {name} service stopped answering on port {port} "
+                              "before the script ran, so nothing was observed against it",
+                    "service_logs": {name: _container_logs(cid)},
+                }
+            runs[name] = _run_field_script(
                 cid, port, script, spec.get("transport", "http"), image, inputs
             )
-            for name, cid in containers.items()
-        }
     except Exception as error:  # noqa: BLE001 - the outcome is the report
         return {"shipped": False, "reason": f"{type(error).__name__}: {error}"[:600]}
 
@@ -2327,6 +2366,31 @@ def prove_manual_poc(
     return outcome
 
 
+def _proven_spec(lab_dir: Path) -> tuple[dict[str, Any], int] | None:
+    """The spec this lab already proved, if one is on record.
+
+    Reusing it is what makes asking twice give the same answer. A drafted
+    spec is sampled, so without this a lab that handed over a script one day
+    could refuse the next with nothing having changed.
+    """
+    record = lab_dir / "artifacts" / MANUAL_POC_RECORD_NAME
+    if not record.is_file():
+        return None
+    try:
+        held = json.loads(record.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if not (isinstance(held, dict) and held.get("shipped") and held.get("spec")):
+        return None
+    port = held.get("container_port")
+    if not isinstance(port, int):
+        return None
+    try:
+        return validate_spec(held["spec"]), port
+    except (ValueError, TypeError):
+        return None
+
+
 def run_manual_poc(
     lab_dir: Path,
     spec_path: Path | None = None,
@@ -2334,6 +2398,7 @@ def run_manual_poc(
     keep: bool = False,
     assume_yes: bool = False,
     inputs: dict[str, str] | None = None,
+    redraft: bool = False,
     *,
     api_key: str | None = None,
     model: str | None = None,
@@ -2366,6 +2431,9 @@ def run_manual_poc(
                 "--container-port is the port the service listens on inside its "
                 "container, and a spec cannot be proved without it"
             )
+    elif (held := None if redraft else _proven_spec(lab_dir)) is not None:
+        spec, container_port = held
+        progress.step("reusing the spec this lab already proved; --redraft asks again")
     else:
         if not ai_is_configured(api_key, model, provider):
             raise RuntimeError(
@@ -3026,9 +3094,17 @@ def write_manual_poc(
     artifacts = lab_dir / "artifacts"
     artifacts.mkdir(parents=True, exist_ok=True)
     script = str(outcome.pop("script", ""))
+    record = {"cve": cve, **outcome}
+    if script:
+        # The spec that earned the handover is kept, so asking again for the
+        # same lab reuses the answer instead of sampling a new one. Nothing
+        # remembered it before, and a drafted spec varies between calls, so
+        # the operation was never idempotent: a lab that produced a script
+        # one day could refuse the next with nothing having changed.
+        record["spec"] = spec
     write_text(
         artifacts / MANUAL_POC_RECORD_NAME,
-        json.dumps({"cve": cve, **outcome}, indent=2, ensure_ascii=True) + "\n",
+        json.dumps(record, indent=2, ensure_ascii=True) + "\n",
     )
     if not script:
         return outcome

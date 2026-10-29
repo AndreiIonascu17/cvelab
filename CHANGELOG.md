@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A proven spec is kept and reused, so `cvelab manual` on the same lab gives
+  the same answer and costs nothing the second time. It existed only embedded
+  in the generated script before, so asking again re-asked the model and
+  sampled a new spec -- a lab that produced a script one day could refuse the
+  next with nothing having changed. `--redraft` asks again on purpose. A
+  refusal is not kept; only a spec that passed the proof is worth repeating.
+
+- Each service is checked again immediately before the script runs, both that
+  the container is up and that the port still answers. A service can pass the
+  readiness probe and then stop before its turn comes -- Storybook 10.6.1 did,
+  twice, while the fixed build served both runs -- and the proof reported
+  "the script did not finish against both builds", which was true and useless.
+  The service that went away is named, nothing is run against it, and the tail
+  of its log comes with the refusal, with terminal colour stripped: the first
+  time those logs were needed the one informative line was buried in several
+  hundred escape codes.
+
+### Changed (earlier)
+
 - The command is `cvelab manual <CVE> --poc <location>`. A CVE identifier is
   what anyone remembers once the lab is built; the path with that identifier
   already inside it is not. Both spellings of the location work -- the
