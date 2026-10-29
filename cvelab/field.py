@@ -124,7 +124,14 @@ _MAX_FIELD_OUTPUT = 32 * 1024
 #: protocol needing a real handshake, SSH or SMB or a TLS-wrapped negotiation,
 #: cannot be expressed as bytes to send and is out of scope rather than a
 #: reason to take on a dependency.
-TRANSPORTS = ("http", "tcp", "tls", "ssh", "smb")
+TRANSPORTS = ("http", "tcp", "tls", "ws", "wss", "ssh", "smb")
+
+#: WebSocket is its own case: the handshake is an HTTP upgrade and the framing
+#: is a documented wire format, so the standard library covers both and the
+#: script needs nothing installed. It was the one gap in a measured batch that
+#: was the format's fault rather than the vulnerability's -- a lab whose effect
+#: lived in frames after a /ws upgrade had no way to be expressed.
+WS_TRANSPORTS = ("ws", "wss")
 
 #: Transports whose handshake cannot be written as bytes to send -- SSH
 #: negotiates keys, SMB negotiates a dialect -- so a library speaks it and the
@@ -298,6 +305,8 @@ def _validate_sequence(value: Any, where: str, transport: str = "http") -> list[
         "http": _validate_request,
         "tcp": _validate_message,
         "tls": _validate_message,
+        "ws": _validate_message,
+        "wss": _validate_message,
         "ssh": _validate_exec,
         "smb": _validate_smb_op,
     }[transport]
@@ -562,6 +571,14 @@ def validate_spec(spec: Any) -> dict[str, Any]:
         raise ValueError(f"transport must be one of {', '.join(TRANSPORTS)}")
 
     inputs = _validate_inputs(spec.get("inputs"))
+    ws_path = str(spec.get("ws_path", "/"))
+    if not ws_path.startswith("/"):
+        raise ValueError("ws_path must be the upgrade path and start with /")
+    ws_headers = spec.get("ws_headers") or {}
+    if not isinstance(ws_headers, dict):
+        raise ValueError("ws_headers must be an object")
+    if transport not in WS_TRANSPORTS and (spec.get("ws_path") or ws_headers):
+        raise ValueError(f"ws_path and ws_headers have no meaning for transport {transport}")
     auth = _validate_auth(spec.get("auth"), transport, inputs)
     out: dict[str, Any] = {
         "strategy": strategy,
@@ -570,6 +587,12 @@ def validate_spec(spec: Any) -> dict[str, Any]:
         "inputs": inputs,
         "auth": auth,
     }
+    if transport in WS_TRANSPORTS:
+        # Emitted only where it means something, so a spec for any other
+        # transport stays valid input to validate_spec a second time -- the
+        # round-trip caught this on the first change after the test was added.
+        out["ws_path"] = ws_path
+        out["ws_headers"] = {str(k): str(v) for k, v in ws_headers.items()}
 
     # A spec may list several checks -- work items and merge requests are two
     # for the same disclosure -- or, in the short form, carry one check's keys
@@ -627,7 +650,7 @@ Requests carry User-Agent: CVELab-Field-PoC/1.0, so the target's own logs can
 be matched to this run.
 """
 from __future__ import annotations
-import argparse, json, re, socket, socketserver, ssl, sys, threading, time
+import argparse, base64, hashlib, json, re, socket, socketserver, ssl, sys, threading, time
 import urllib.error, urllib.parse, urllib.request, uuid
 
 # The spec travels as JSON text rather than as a Python literal. A bodyless
@@ -718,7 +741,7 @@ def normalize_target(value):
         except ValueError as error:
             raise SystemExit("--target is not a usable host and port: %s" % error) from None
         # SSH and SMB have a conventional port, so a bare host means it.
-        port = port or {"ssh": 22, "smb": 445}.get(transport)
+        port = port or {"ssh": 22, "smb": 445, "ws": 80, "wss": 443}.get(transport)
         if not host or not port:
             raise SystemExit("--target needs a host and a port, e.g. 10.0.0.5:6379")
         if split.path or split.query or split.fragment:
@@ -759,6 +782,7 @@ class Target:
         self.timeout = timeout
         self.read_timeout = read_timeout
         self.inputs = {}
+        self.insecure = insecure
         self.ctx = None
         if self.transport == "http":
             base = normalize_target(base)
@@ -801,6 +825,8 @@ class Target:
             for message in messages:
                 last = self.send(message)
             return last
+        if self.transport in ("ws", "wss"):
+            return (0, self._ws_exchange(messages), {})
         if self.transport == "ssh":
             return (0, self._ssh_exchange(messages), {})
         if self.transport == "smb":
@@ -928,6 +954,175 @@ class Target:
 
         conn.getFile(message["share"], message["path"], collect)
         return b"".join(chunks).decode("utf-8", "replace")
+
+    #: What RFC 6455 says a server must echo back, hashed with the key.
+    _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    def _ws_exchange(self, messages):
+        """Upgrade, then talk in frames, over one connection.
+
+        The handshake is ordinary HTTP and the framing is a documented wire
+        format, so this needs nothing installed. The accept header is checked
+        rather than assumed: a plain 200 from a server that does not speak
+        WebSocket would otherwise be read as a successful upgrade and every
+        later read would return nothing, which looks exactly like an absent
+        effect.
+        """
+        key = base64.b64encode(uuid.uuid4().bytes).decode()
+        try:
+            sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        except OSError as error:
+            raise SystemExit("cannot reach %s: %s" % (self.base, error))
+        transcript = []
+        try:
+            if self.transport == "wss":
+                context = ssl.create_default_context()
+                if self.insecure:
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                sock = context.wrap_socket(sock, server_hostname=self.host)
+            headers = {
+                "Host": "%s:%s" % (self.host, self.port),
+                "Upgrade": "websocket",
+                "Connection": "Upgrade",
+                "Sec-WebSocket-Key": key,
+                "Sec-WebSocket-Version": "13",
+                "User-Agent": "CVELab-Field-PoC/1.0",
+            }
+            headers.update(_subst(SPEC.get("ws_headers") or {}, self.inputs))
+            request = "GET %s HTTP/1.1\r\n%s\r\n\r\n" % (
+                SPEC.get("ws_path", "/"),
+                "\r\n".join("%s: %s" % kv for kv in headers.items()),
+            )
+            sock.settimeout(self.timeout)
+            sock.sendall(request.encode())
+            reply = b""
+            while b"\r\n\r\n" not in reply and len(reply) < 65536:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                reply += chunk
+            head = reply.split(b"\r\n\r\n", 1)[0].decode("utf-8", "replace")
+            if " 101" not in head.split("\r\n")[0]:
+                raise SystemExit(
+                    "%s did not upgrade to WebSocket: %s"
+                    % (self.base, head.split("\r\n")[0][:120])
+                )
+            expected = base64.b64encode(
+                hashlib.sha1((key + self._WS_GUID).encode()).digest()
+            ).decode()
+            if expected.lower() not in head.lower():
+                raise SystemExit(
+                    "%s accepted the upgrade without the right "
+                    "Sec-WebSocket-Accept, so it is not speaking WebSocket" % self.base
+                )
+            leftover = reply.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in reply else b""
+            for message in messages:
+                payload = (
+                    bytes.fromhex(message["send_hex"]) if "send_hex" in message
+                    else str(message.get("send", "")).encode("utf-8")
+                )
+                if payload:
+                    self._ws_write(sock, payload, 2 if "send_hex" in message else 1)
+                text, leftover = self._ws_read(sock, message, leftover)
+                transcript.append(text)
+        except ssl.SSLError as error:
+            raise SystemExit(
+                "TLS failed against %s: %s (--insecure skips verification)"
+                % (self.base, error)
+            )
+        except OSError as error:
+            raise SystemExit("cannot talk to %s: %s" % (self.base, error))
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        return "".join(transcript)
+
+    def _ws_write(self, sock, payload, opcode):
+        """One masked frame. A client frame must be masked; a server's is not."""
+        header = bytearray([0x80 | opcode])
+        size = len(payload)
+        if size < 126:
+            header.append(0x80 | size)
+        elif size < 65536:
+            header.append(0x80 | 126)
+            header += size.to_bytes(2, "big")
+        else:
+            header.append(0x80 | 127)
+            header += size.to_bytes(8, "big")
+        mask = uuid.uuid4().bytes[:4]
+        header += mask
+        masked = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+        sock.sendall(bytes(header) + masked)
+
+    def _ws_read(self, sock, message, buffered):
+        """Frames until the delimiter, the cap, or the peer goes quiet.
+
+        A ping is answered so the server does not drop the connection
+        mid-exchange, and a close ends the read rather than being reported as
+        a failure: a server closing after it has answered is ordinary.
+        """
+        want = str(message.get("read_until") or "").encode("utf-8")
+        cap = int(message.get("read_bytes", 1024 * 1024))
+        sock.settimeout(self.read_timeout)
+        out = bytearray()
+        while len(out) < cap:
+            frame, buffered = self._ws_frame(sock, buffered)
+            if frame is None:
+                break
+            opcode, data = frame
+            if opcode == 8:
+                break
+            if opcode == 9:
+                self._ws_write(sock, data, 10)
+                continue
+            if opcode == 10:
+                continue
+            out += data
+            if want and want in bytes(out):
+                break
+        return bytes(out).decode("utf-8", "replace"), buffered
+
+    def _ws_frame(self, sock, buffered):
+        """One frame, or None when the peer stops. Returns (opcode, payload)."""
+        def take(count):
+            nonlocal buffered
+            while len(buffered) < count:
+                try:
+                    chunk = sock.recv(65536)
+                except (TimeoutError, ssl.SSLWantReadError):
+                    return None
+                except OSError as error:
+                    raise SystemExit("cannot read from %s: %s" % (self.base, error))
+                if not chunk:
+                    return None
+                buffered += chunk
+            head, buffered = buffered[:count], buffered[count:]
+            return head
+
+        first = take(2)
+        if first is None:
+            return None, buffered
+        opcode = first[0] & 0x0F
+        size = first[1] & 0x7F
+        if size == 126:
+            more = take(2)
+            if more is None:
+                return None, buffered
+            size = int.from_bytes(more, "big")
+        elif size == 127:
+            more = take(8)
+            if more is None:
+                return None, buffered
+            size = int.from_bytes(more, "big")
+        if size > 8 * 1024 * 1024:
+            raise SystemExit("%s sent a frame larger than 8 MiB" % self.base)
+        body = take(size) if size else b""
+        if body is None:
+            return None, buffered
+        return (opcode, bytes(body)), buffered
 
     def _socket_exchange(self, messages):
         try:
@@ -2417,7 +2612,9 @@ _DRAFT_INSTRUCTIONS = (
     "inside its container, and put the spec in spec_json as a JSON string with these keys.\n"
     "  transport: http when the service speaks HTTP, which is the default and may be left "
     "out; tcp when it speaks its own protocol over a plain socket, a cache, a queue, a "
-    "database or a daemon with a text protocol; tls for the same wrapped in TLS; ssh when "
+    "database or a daemon with a text protocol; tls for the same wrapped in TLS; ws or wss "
+    "when the effect is in frames after a WebSocket upgrade, with ws_path naming the "
+    "upgrade route, where a message is send and read_until as over a socket; ssh when "
     "the weakness is in what an authenticated session may do, such as a file an account "
     "should not be able to read or a restricted shell that can be escaped; smb when it is "
     "in what a share or a path exposes. The service not speaking HTTP is not a reason to "
@@ -2487,6 +2684,14 @@ _DRAFT_INSTRUCTIONS = (
     "or an OAuth state returned by a POST, extracted and then used by the probe. An effect "
     "that needs that handoff is expressible, and is not a reason to answer "
     "feasible=false.\n\n"
+    "Read what_the_lab_simulated before you answer. A harness that stands in for an "
+    "application route is fine -- the weakness is still reached through it, and a real "
+    "deployment has its own route of that shape. A harness that reports the effect is not: "
+    "an endpoint the lab added so the validator could read internal state, or a page it "
+    "renders to observe a browser, does not exist on a stock instance, so a spec aimed at "
+    "it would pass against the lab and mean nothing against a real server. When the only "
+    "evidence is of that kind, or the project ships no listener of its own at all, answer "
+    "feasible=false and say which. "
     "CVELab emits one script from your spec and runs it against both of the lab's builds. It "
     "is kept only if it observes the effect on the vulnerable build and stays silent on the "
     "fixed one, so a spec that watches ordinary behaviour is discarded rather than shipped."
@@ -2600,6 +2805,13 @@ def _ask_for_spec(
                 "confirmed_attack": plan.get("exploit_contract") or {},
                 "container_port": _port_hint(lab_dir) if lab_dir else None,
                 "validator_that_proved_it": _validator_source(lab_dir) if lab_dir else "",
+                # What the lab says it stood in for. Measured: four of five
+                # labs that reproduced but shipped nothing had proved their
+                # CVE through an endpoint the product does not serve, and this
+                # is where the lab admits that.
+                "what_the_lab_simulated": (plan.get("fidelity") or {}).get(
+                    "simulated_components"
+                ) or [],
                 **({"your_previous_answer_was_rejected": complaint} if complaint else {}),
             }, indent=2, ensure_ascii=True)[:_MAX_DRAFT_INPUT],
             schema=MANUAL_POC_DRAFT_SCHEMA,
