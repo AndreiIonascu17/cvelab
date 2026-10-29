@@ -1057,3 +1057,126 @@ class ServiceLogsAreReadableTests(unittest.TestCase):
     def test_it_is_bounded(self) -> None:
         with mock.patch.object(field, "_docker", return_value="x" * 10000):
             self.assertLessEqual(len(field._container_logs("cid", limit=500)), 500)
+
+
+class SampledSpecGetsASecondAskTests(unittest.TestCase):
+    """A spec that failed the proof is asked for again, once.
+
+    Centrifugo reproduced a forged-header auth bypass on one build and
+    rejected it on the other, and the first spec drawn for it observed
+    nothing on either -- it reached ws:// with no path, where the service
+    serves /connection/websocket. Asked again, for the same lab and the same
+    model, the second spec named the path and proved it. The demonstration
+    was there; one sample lost it.
+    """
+
+    def _failed(self, **extra: Any) -> dict[str, Any]:
+        outcome = {
+            "shipped": False,
+            "reason": "the script did not tell the two builds apart",
+            "proof_checks": {"manual_poc_proven": False},
+            "runs": {},
+            "spec_at_fault": True,
+            "output": {"vulnerable": {"stderr": "0 finding(s)", "tail": "NOT_OBSERVED"}},
+        }
+        outcome.update(extra)
+        return outcome
+
+    def _shipped(self) -> dict[str, Any]:
+        return {"shipped": True, "proof_checks": {"manual_poc_proven": True},
+                "runs": {}, "script": "#!/usr/bin/env python3\n"}
+
+    def _prove(self, outcomes: list[dict[str, Any]], drafts: Any) -> Any:
+        with _lab() as lab_dir, mock.patch.object(
+            field, "prove_manual_poc", side_effect=outcomes,
+        ) as proved, mock.patch.object(
+            field, "draft_manual_poc_spec", side_effect=drafts,
+        ) as drafted:
+            spec, port, outcome = field._prove_drafted_spec(
+                "CVE-2026-0001", {}, field.validate_spec(_spec()), 8000, lab_dir,
+                ["docker", "compose"], {}, True, None,
+                api_key="k", model="m", provider="anthropic", base_url=None,
+            )
+        return spec, port, outcome, proved, drafted
+
+    def test_a_second_spec_is_proved_and_can_ship(self) -> None:
+        # The spec that worked on centrifugo, in shape: same finding, same
+        # transport, the path the service actually serves.
+        second = field.validate_spec({
+            "strategy": "direct_observation",
+            "transport": "ws",
+            "observable_effect": "a connect reply whose data has principal admin",
+            "ws_path": "/connection/websocket",
+            "probe": [{"send": '{"id":1,"connect":{"headers":{"X-Trusted-User":"admin"}}}',
+                       "read_until": "\n"}],
+            "expect": {"body_contains": "forwarded-header"},
+        })
+        spec, port, outcome, proved, drafted = self._prove(
+            [self._failed(), self._shipped()],
+            [{"spec": second, "container_port": 9000}],
+        )
+        self.assertIs(outcome["shipped"], True)
+        self.assertEqual(spec["ws_path"], "/connection/websocket")
+        self.assertEqual(port, 9000)
+        self.assertEqual(proved.call_count, 2)
+        # What the first script printed goes with the request: "did not tell
+        # them apart" alone is not enough to write a different spec with.
+        complaint = drafted.call_args.kwargs["complaint"]
+        self.assertIn("did not tell the two builds apart", complaint)
+        self.assertIn("0 finding(s)", complaint)
+
+    def test_what_the_spec_could_not_have_caused_is_not_retried(self) -> None:
+        """A stopped service would sample a new answer against the same wall."""
+        stopped = {"shipped": False, "runs": {},
+                   "reason": "the vulnerable service stopped answering on port 8000"}
+        _, _, outcome, proved, drafted = self._prove([stopped], [])
+        self.assertEqual(proved.call_count, 1)
+        drafted.assert_not_called()
+        self.assertIn("stopped answering", outcome["reason"])
+
+    def test_the_measured_failure_is_kept_when_the_second_ask_gives_nothing(self) -> None:
+        first = self._failed()
+        _, _, outcome, proved, drafted = self._prove(
+            [first], [{"reason": "the effect is a worker crash"}],
+        )
+        self.assertEqual(proved.call_count, 1)
+        drafted.assert_called_once()
+        # A judgement about the finding does not outrank a run against it.
+        self.assertIn("did not tell the two builds apart", outcome["reason"])
+        self.assertIn("vulnerable", outcome["output"])
+
+    def test_the_retry_flag_stays_out_of_the_record(self) -> None:
+        with _lab() as lab_dir:
+            _, _, outcome, _, _ = self._prove([self._failed(), self._failed()], [
+                {"spec": field.validate_spec(_spec()), "container_port": 8000},
+            ])
+            self.assertNotIn("spec_at_fault", outcome)
+            field.write_manual_poc("CVE-2026-0001", lab_dir, {},
+                                   field.validate_spec(_spec()), 8000, outcome)
+            held = json.loads(
+                (lab_dir / "artifacts" / field.MANUAL_POC_RECORD_NAME).read_text())
+        self.assertNotIn("spec_at_fault", held)
+
+    def test_asking_can_be_switched_off(self) -> None:
+        with mock.patch.object(field, "_draft_retries", return_value=0):
+            _, _, outcome, proved, drafted = self._prove([self._failed()], [])
+        self.assertEqual(proved.call_count, 1)
+        drafted.assert_not_called()
+        self.assertIs(outcome["shipped"], False)
+
+    def test_a_failed_proof_says_the_spec_was_at_fault(self) -> None:
+        """The marker _prove_drafted_spec reads is set where the proof is run."""
+        with _lab() as lab_dir, mock.patch.object(
+            field, "_service_container", return_value="cid",
+        ), mock.patch.object(field, "_still_serving", return_value=True), \
+             mock.patch.object(field.sidecar, "ensure_image", return_value="img"), \
+             mock.patch.object(
+                 field, "_run_field_script",
+                 return_value=_run(observed=False, ran=True),
+             ):
+            outcome = field.prove_manual_poc(
+                "CVE-2026-0001", field.validate_spec(_spec()), 8000, lab_dir,
+                ["docker", "compose"], {}, {}, True, None,
+            )
+        self.assertIs(outcome["shipped"], False)
+        self.assertIs(outcome["spec_at_fault"], True)

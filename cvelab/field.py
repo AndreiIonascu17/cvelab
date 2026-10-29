@@ -2275,6 +2275,7 @@ def prove_manual_poc(
         if vulnerable_only and spec["strategy"] not in SELF_CONTROLLED:
             return {
                 "shipped": False,
+                "spec_at_fault": True,
                 "reason": f"{spec['strategy']} has no control of its own, and this lab has "
                           f"no fixed build to supply one; use one of "
                           f"{', '.join(SELF_CONTROLLED)}",
@@ -2357,6 +2358,11 @@ def prove_manual_poc(
             if both_ran
             else "the script did not finish against both builds"
         )
+    # The script ran and the finding is known to be real, so what was wrong
+    # is in the spec: the caller may ask for another one. Dropped from the
+    # outcome before it is recorded, being this call's business and not the
+    # report's.
+    outcome["spec_at_fault"] = True
     # Kept because a spec that was refused is only fixable if the run that
     # refused it is visible: a generic reason sends the operator back to guess.
     outcome["output"] = {
@@ -2364,6 +2370,88 @@ def prove_manual_poc(
         for name, run in runs.items()
     }
     return outcome
+
+
+def _spec_complaint(outcome: dict[str, Any]) -> str:
+    """What to tell the next draft about the spec that just failed.
+
+    The reason alone ("did not tell the two builds apart") is not enough to
+    write a different spec with: what the script printed is, because it shows
+    whether it reached the service at all and what came back when it did.
+    """
+    lines = [
+        "A spec you gave for this same finding was emitted as a script and run "
+        f"against the lab's own builds. It failed: {outcome.get('reason')}.",
+    ]
+    for name, run in (outcome.get("output") or {}).items():
+        said = " ".join(
+            part.strip() for part in (run.get("stderr", ""), run.get("tail", "")) if part
+        )
+        lines.append(f"Against the {name} build it printed: {said[-600:]}")
+    lines.append(
+        "The effect is real -- the lab's own validator proves it -- so the spec was "
+        "wrong, not the finding. Check the request path, the port, the protocol "
+        "framing and what the expectation matches on, and give a different spec. "
+        "Answer feasible=false only if you now judge the effect genuinely "
+        "unobservable from one instance."
+    )
+    return "\n".join(lines)
+
+
+def _prove_drafted_spec(
+    cve: str,
+    plan: dict[str, Any],
+    spec: dict[str, Any],
+    port: int,
+    lab_dir: Path,
+    compose: list[str],
+    environment: dict[str, str],
+    assume_yes: bool,
+    inputs: dict[str, str] | None,
+    *,
+    api_key: str | None,
+    model: str | None,
+    provider: str | None,
+    base_url: str | None,
+    before_each: Callable[[int], None] | None = None,
+) -> tuple[dict[str, Any], int, dict[str, Any]]:
+    """Prove a drafted spec, asking for another one if the spec was at fault.
+
+    A drafted spec is sampled, so a refusal is not always the lab's answer.
+    Centrifugo reproduced its forged-header bypass on one build and rejected
+    it on the other, and the first spec drawn for it found nothing on either:
+    asked again, for the same lab, the same finding and the same model, the
+    second named the WebSocket path the service actually serves and proved it.
+    Without this, that demonstration was lost to one sample.
+
+    Only a failure the spec could have caused is retried. A service that
+    stopped, a value only the operator has, or a sidecar that could not be
+    built would sample a new answer against the same unchanged obstacle, so
+    those come back as they are. An operator's own spec is never retried
+    either: it is theirs to correct, and this is only called for drafts.
+    """
+    outcome: dict[str, Any] = {}
+    for remaining in range(_draft_retries(), -1, -1):
+        if before_each is not None:
+            before_each(port)
+        progress.step("proving the single-target script against both builds")
+        outcome = prove_manual_poc(
+            cve, spec, port, lab_dir, compose, environment, plan, assume_yes, inputs
+        )
+        at_fault = bool(outcome.pop("spec_at_fault", False))
+        if outcome["shipped"] or not at_fault or not remaining:
+            return spec, port, outcome
+        progress.step(f"the spec did not hold up, asking for another: {outcome['reason']}")
+        again = draft_manual_poc_spec(
+            cve, plan, api_key=api_key, model=model, provider=provider,
+            base_url=base_url, lab_dir=lab_dir, complaint=_spec_complaint(outcome),
+        )
+        if "spec" not in again:
+            # The second answer is a judgement about the finding, not a run
+            # against it. The failure that was measured is the better record.
+            return spec, port, outcome
+        spec, port = again["spec"], again["container_port"]
+    return spec, port, outcome
 
 
 def _proven_spec(lab_dir: Path) -> tuple[dict[str, Any], int] | None:
@@ -2417,6 +2505,7 @@ def run_manual_poc(
     deliverables: a refused spec leaves the lab exactly as it was.
     """
     lab_dir = lab_dir.resolve()
+    asked_for = False
     plan = _lab_plan(lab_dir)
     cve = str(plan.get("cve") or lab_dir.name).upper()
     _require_reproduced(lab_dir)
@@ -2453,6 +2542,7 @@ def run_manual_poc(
                     **drafted}
         spec = drafted["spec"]
         container_port = container_port or drafted["container_port"]
+        asked_for = True
     timeout = int(spec.get("health_timeout", DEFAULT_HEALTH_TIMEOUT)) + startup_grace()
 
     vulnerable_only = plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION"
@@ -2470,11 +2560,33 @@ def run_manual_poc(
             services, list(needed), container_port, timeout,
             lab_dir, compose, docker, environment, resolved,
         )
-        progress.step("proving the single-target script against both builds")
-        outcome = prove_manual_poc(
-            cve, spec, container_port, lab_dir, compose, environment, plan,
-            assume_yes, inputs,
-        )
+        if asked_for:
+            probed = container_port
+
+            def ready(port: int) -> None:
+                """A later draft may name another port than the one waited on."""
+                nonlocal probed
+                if port != probed:
+                    _bring_up(
+                        services, list(needed), port, timeout,
+                        lab_dir, compose, docker, environment, resolved,
+                    )
+                    probed = port
+
+            spec, container_port, outcome = _prove_drafted_spec(
+                cve, plan, spec, container_port, lab_dir, compose, environment,
+                assume_yes, inputs, api_key=api_key, model=model,
+                provider=provider, base_url=base_url, before_each=ready,
+            )
+        else:
+            # The spec is the operator's, or one this lab already proved.
+            # Neither is ours to redraft.
+            progress.step("proving the single-target script against both builds")
+            outcome = prove_manual_poc(
+                cve, spec, container_port, lab_dir, compose, environment, plan,
+                assume_yes, inputs,
+            )
+            outcome.pop("spec_at_fault", None)
     finally:
         if not keep:
             subprocess.run(
@@ -2912,15 +3024,20 @@ def draft_manual_poc_spec(
     provider: str | None,
     base_url: str | None,
     lab_dir: Path | None = None,
+    complaint: str = "",
 ) -> dict[str, Any]:
     """Ask once whether the confirmed effect can be shown on one instance.
 
     Returns a dict with "spec" and "container_port" when the answer is usable,
     or "reason" when it is not. It never raises: the caller records whatever
     comes back and the lab stands either way.
+
+    `complaint` is what a previous answer got wrong, which is put in front of
+    the model with the request. It is set here for a spec whose shape this
+    validator refused, and passed in by a caller whose spec was proved against
+    the lab and did not hold up.
     """
     attempts = _draft_retries() + 1
-    complaint = ""
     for _attempt in range(attempts):
         answer = _ask_for_spec(
             cve, plan, complaint, api_key=api_key, model=model,
@@ -3063,10 +3180,10 @@ def manual_poc_step(
         if "spec" not in drafted:
             progress.step(f"no manual PoC: {drafted['reason']}")
             return {"shipped": False, **drafted}
-        spec, port = drafted["spec"], drafted["container_port"]
-        progress.step("proving the single-target script against both builds")
-        outcome = prove_manual_poc(
-            cve, spec, port, lab_dir, compose, environment, plan, assume_yes, inputs
+        spec, port, outcome = _prove_drafted_spec(
+            cve, plan, drafted["spec"], drafted["container_port"], lab_dir,
+            compose, environment, assume_yes, inputs, api_key=api_key,
+            model=model, provider=provider, base_url=base_url,
         )
         write_manual_poc(cve, lab_dir, plan, spec, port, outcome)
         if not outcome["shipped"]:
