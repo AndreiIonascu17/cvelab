@@ -147,6 +147,8 @@ class ProofTests(unittest.TestCase):
             field, "_service_container",
             side_effect=lambda c, name, d, e: ids.get(name, ""),
         ), mock.patch.object(
+            field, "_still_serving", return_value=True
+        ), mock.patch.object(
             field, "_run_field_script",
             side_effect=lambda cid, port, script, transport, image, given: outcomes[cid],
         ):
@@ -715,6 +717,8 @@ class NoFixedBuildTests(unittest.TestCase):
         with mock.patch.object(
             field, "_service_container", side_effect=lambda c, n, d, e: f"cid-{n}"
         ), mock.patch.object(
+            field, "_still_serving", return_value=True
+        ), mock.patch.object(
             field, "_run_field_script",
             side_effect=lambda cid, port, script, transport, image, given: _run(observed, True),
         ):
@@ -752,6 +756,8 @@ class NoFixedBuildTests(unittest.TestCase):
         with mock.patch.object(
             field, "_service_container",
             side_effect=lambda c, n, d, e: (seen.append(n), f"cid-{n}")[1],
+        ), mock.patch.object(
+            field, "_still_serving", return_value=True
         ), mock.patch.object(
             field, "_run_field_script",
             side_effect=lambda cid, port, script, transport, image, given: _run(True, True),
@@ -839,3 +845,196 @@ class EvidenceLabelTests(unittest.TestCase):
     def test_the_report_carries_it(self) -> None:
         source = Path(core.__file__).read_text(encoding="utf-8")
         self.assertIn('"evidence_label": evidence_label(', source)
+
+
+class ProvenSpecIsReusedTests(unittest.TestCase):
+    """Asking twice for the same lab gives the same answer.
+
+    A drafted spec is sampled, and nothing remembered the one that earned the
+    handover: it existed only embedded in the generated script. So a lab that
+    produced a script one day could refuse the next with nothing having
+    changed, which is the one piece of this instability that is ours.
+    """
+
+    def _record(self, lab_dir: Path, **extra: Any) -> None:
+        held = {"cve": "CVE-2026-0001", "shipped": True, "container_port": 8000,
+                "spec": field.validate_spec(_spec())}
+        held.update(extra)
+        artifacts = lab_dir / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        (artifacts / field.MANUAL_POC_RECORD_NAME).write_text(json.dumps(held))
+
+    def test_a_proven_spec_comes_back(self) -> None:
+        with _lab() as lab_dir:
+            self._record(lab_dir)
+            found = field._proven_spec(lab_dir)
+        self.assertIsNotNone(found)
+        self.assertEqual(found[1], 8000)
+        self.assertEqual(found[0]["strategy"], "inband_differential")
+
+    def test_a_refusal_is_not_reused(self) -> None:
+        """Only a spec that passed the proof is worth repeating."""
+        with _lab() as lab_dir:
+            self._record(lab_dir, shipped=False)
+            self.assertIsNone(field._proven_spec(lab_dir))
+
+    def test_an_unusable_or_missing_record_is_ignored(self) -> None:
+        for extra in ({"spec": {"strategy": "nonsense"}}, {"container_port": "8000"},
+                      {"spec": None}):
+            with self.subTest(extra=extra), _lab() as lab_dir:
+                self._record(lab_dir, **extra)
+                self.assertIsNone(field._proven_spec(lab_dir))
+        with _lab() as lab_dir:
+            (lab_dir / "artifacts").mkdir(exist_ok=True)
+            (lab_dir / "artifacts" / field.MANUAL_POC_RECORD_NAME).write_text("{not json")
+            self.assertIsNone(field._proven_spec(lab_dir))
+
+    def test_reuse_asks_the_model_nothing(self) -> None:
+        with _lab() as lab_dir, mock.patch.object(
+            field, "prepare_compose",
+            return_value=("docker", {}, ["docker", "compose"], lab_dir.parent / "s"),
+        ), mock.patch.object(field, "_resolved_compose", return_value={}), \
+             mock.patch.object(field, "_bring_up"), \
+             mock.patch.object(field.subprocess, "run",
+                               return_value=subprocess.CompletedProcess(["d"], 0, "", "")), \
+             mock.patch.object(field, "draft_manual_poc_spec") as drafted, \
+             mock.patch.object(
+                 field, "prove_manual_poc",
+                 return_value={"shipped": True, "proof_checks": {}, "runs": {},
+                               "script": "#!/usr/bin/env python3\n"},
+             ):
+            (lab_dir.parent / "s").mkdir(exist_ok=True)
+            self._record(lab_dir)
+            result = field.run_manual_poc(lab_dir)
+        drafted.assert_not_called()
+        self.assertIs(result["ok"], True)
+
+    def test_redraft_asks_again(self) -> None:
+        with _lab() as lab_dir, mock.patch.object(
+            field, "prepare_compose",
+            return_value=("docker", {}, ["docker", "compose"], lab_dir.parent / "s"),
+        ), mock.patch.object(field, "_resolved_compose", return_value={}), \
+             mock.patch.object(field, "_bring_up"), \
+             mock.patch.object(field.subprocess, "run",
+                               return_value=subprocess.CompletedProcess(["d"], 0, "", "")), \
+             mock.patch.object(field, "ai_is_configured", return_value=True), \
+             mock.patch.object(
+                 field, "draft_manual_poc_spec",
+                 return_value={"spec": field.validate_spec(_spec()), "container_port": 9000},
+             ) as drafted, \
+             mock.patch.object(
+                 field, "prove_manual_poc",
+                 return_value={"shipped": False, "reason": "x", "proof_checks": {}, "runs": {}},
+             ):
+            (lab_dir.parent / "s").mkdir(exist_ok=True)
+            self._record(lab_dir)
+            field.run_manual_poc(lab_dir, redraft=True)
+        drafted.assert_called_once()
+
+    def test_the_spec_is_written_only_when_it_shipped(self) -> None:
+        with _lab() as lab_dir:
+            outcome = {"shipped": True, "proof_checks": {}, "runs": {},
+                       "script": "#!/usr/bin/env python3\n"}
+            field.write_manual_poc("CVE-2026-0001", lab_dir, {},
+                                   field.validate_spec(_spec()), 8000, outcome)
+            held = json.loads(
+                (lab_dir / "artifacts" / field.MANUAL_POC_RECORD_NAME).read_text())
+            self.assertIn("spec", held)
+        with _lab() as lab_dir:
+            refused = {"shipped": False, "reason": "x"}
+            field.write_manual_poc("CVE-2026-0001", lab_dir, {},
+                                   field.validate_spec(_spec()), 8000, refused)
+            held = json.loads(
+                (lab_dir / "artifacts" / field.MANUAL_POC_RECORD_NAME).read_text())
+            self.assertNotIn("spec", held)
+
+
+class ServiceWentAwayTests(unittest.TestCase):
+    """A service that stopped is named, not reported as an absent effect.
+
+    Storybook 10.6.1 answered the readiness probe and then stopped before its
+    turn came, twice, while the fixed build served both runs. The proof said
+    "did not finish against both builds" -- true, and useless for working out
+    what to do about it.
+    """
+
+    def _prove(self, serving: dict[str, bool]) -> dict[str, Any]:
+        with mock.patch.object(
+            field, "_service_container", side_effect=lambda c, n, d, e: f"cid-{n}"
+        ), mock.patch.object(
+            field, "_still_serving", side_effect=lambda cid, port: serving[cid]
+        ), mock.patch.object(
+            field, "_container_logs", return_value="killed: out of memory"
+        ), mock.patch.object(
+            field, "_run_field_script",
+            side_effect=lambda cid, port, script, transport, image, given: _run(True, True),
+        ):
+            return field.prove_manual_poc(
+                "CVE-2026-0001", field.validate_spec(_spec()), 8000, Path("/lab"),
+                ["docker", "compose"], {},
+            )
+
+    def test_the_service_that_stopped_is_named(self) -> None:
+        out = self._prove({"cid-vulnerable": False, "cid-patched": True})
+        self.assertIs(out["shipped"], False)
+        self.assertIn("vulnerable service stopped answering", out["reason"])
+        self.assertIn("port 8000", out["reason"])
+
+    def test_its_logs_come_with_it(self) -> None:
+        """A stop that needs explaining is explained by what the service said."""
+        out = self._prove({"cid-vulnerable": False, "cid-patched": True})
+        self.assertIn("out of memory", out["service_logs"]["vulnerable"])
+
+    def test_the_fixed_build_going_away_is_caught_too(self) -> None:
+        out = self._prove({"cid-vulnerable": True, "cid-patched": False})
+        self.assertIn("patched service stopped answering", out["reason"])
+
+    def test_nothing_is_run_against_a_service_that_went_away(self) -> None:
+        """Running it anyway is how a dead target became a clean bill."""
+        ran: list[str] = []
+        with mock.patch.object(
+            field, "_service_container", side_effect=lambda c, n, d, e: f"cid-{n}"
+        ), mock.patch.object(
+            field, "_still_serving", side_effect=lambda cid, port: cid != "cid-vulnerable"
+        ), mock.patch.object(field, "_container_logs", return_value=""), \
+             mock.patch.object(
+                 field, "_run_field_script",
+                 side_effect=lambda cid, *a: ran.append(cid) or _run(True, True),
+             ):
+            field.prove_manual_poc(
+                "CVE-2026-0001", field.validate_spec(_spec()), 8000, Path("/lab"),
+                ["docker", "compose"], {},
+            )
+        self.assertEqual(ran, [])
+
+    def test_both_serving_proceeds_as_before(self) -> None:
+        out = self._prove({"cid-vulnerable": True, "cid-patched": True})
+        self.assertIn("proof_checks", out)
+        self.assertNotIn("service_logs", out)
+
+
+class ServiceLogsAreReadableTests(unittest.TestCase):
+    """A dev server's output is mostly colour. The first time these logs were
+    read for a real stop, the one useful line was buried in escape codes."""
+
+    def test_colour_and_cursor_control_are_stripped(self) -> None:
+        noisy = (
+            "\x1b[38;2;255;71;133m─\x1b[39m\x1b[90m│\x1b[39m\n"
+            "\x1b[34m●\x1b[39m  124 ms for manager\n"
+            "\x1b[33m▲\x1b[39m  Change detection unavailable: git is not available\n"
+        )
+        with mock.patch.object(field, "_docker", return_value=noisy):
+            said = field._container_logs("cid")
+        self.assertNotIn("\x1b", said)
+        self.assertIn("124 ms for manager", said)
+        self.assertIn("git is not available", said)
+
+    def test_blank_lines_left_by_stripping_are_dropped(self) -> None:
+        with mock.patch.object(
+            field, "_docker", return_value="\x1b[90m\x1b[39m\n\nreal line\n\x1b[90m\x1b[39m\n"
+        ):
+            self.assertEqual(field._container_logs("cid"), "real line")
+
+    def test_it_is_bounded(self) -> None:
+        with mock.patch.object(field, "_docker", return_value="x" * 10000):
+            self.assertLessEqual(len(field._container_logs("cid", limit=500)), 500)
