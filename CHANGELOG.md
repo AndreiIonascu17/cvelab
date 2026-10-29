@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `report.json` carries `evidence_label`, one line saying what a run
+  established rather than what the lab contained:
+
+  | | |
+  | --- | --- |
+  | `Reproduced, differential against the fixed build` | and `, manual PoC proven` |
+  | `Reproduced on the vulnerable build; no fixed build available` | and `, manual PoC proven` |
+  | `Not reproduced` | |
+
+  A fixed build is preferred and the label says when there was none, because
+  it answers what a single observation cannot: whether the effect is the bug
+  or how the thing always behaves. It is stated rather than implied, carries
+  none of this code's internal lab-shape names, and says the manual PoC was
+  *proven* rather than provided -- the script is only written after it showed
+  the effect and, where there was a fixed build, stayed silent against it.
+
 ### Changed
 
 - A lab with no fixed build can hand over a manual PoC. It was refused
