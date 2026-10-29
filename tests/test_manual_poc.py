@@ -1234,3 +1234,50 @@ class ExpectationMustBeAbleToFireTests(unittest.TestCase):
                     "expect": expect,
                 })
                 self.assertEqual(spec["checks"][0]["expect"], expect)
+
+
+class PromptSaysWhatTheValidatorAcceptsTests(unittest.TestCase):
+    """The spec vocabulary and the instructions that ask for it stay together.
+
+    Each absence was paid for. A write was refused as "state-changing" when
+    marker_roundtrip is the strategy for exactly that; a discover step's
+    binding key had to be guessed, because the prose said "bind it" and never
+    named `bind`; a status expectation was describable over a socket, where
+    there is no status line to read it from.
+    """
+
+    def test_every_key_a_spec_may_carry_is_described(self) -> None:
+        for key in (
+            "strategy", "transport", "observable_effect", "inputs", "auth",
+            "ws_path", "ws_headers", "checks", "label", "discover", "bind",
+            "derive", "query", "extract", "probe", "control", "observe",
+            "match", "expect", "health_timeout", "send", "send_hex",
+            "read_until", "container_port", "body_contains", "json_values",
+        ):
+            with self.subTest(key=key):
+                self.assertIn(key, field._DRAFT_INSTRUCTIONS)
+
+    def test_every_name_the_validator_will_accept_is_offered(self) -> None:
+        names = (
+            field.STRATEGIES + field.TRANSPORTS + field.SMB_OPS + field.EXPECTATIONS
+            + tuple(sorted({f for fields in field.AUTH_FIELDS.values() for f in fields}))
+        )
+        for name in names:
+            with self.subTest(name=name):
+                self.assertIn(name, field._DRAFT_INSTRUCTIONS)
+
+    def test_the_tokens_a_spec_may_place_are_described(self) -> None:
+        for token in (field._MARKER_TOKEN, field._CALLBACK_TOKEN,
+                      *(f"{{{{{name}}}}}" for name in field._TARGET_TOKENS)):
+            with self.subTest(token=token):
+                self.assertIn(token, field._DRAFT_INSTRUCTIONS)
+
+    def test_the_contract_only_key_is_not_offered(self) -> None:
+        """A fixture seeds a contract run, and this proof never applies one.
+
+        validate_spec accepts it, because the same validator serves the
+        closed-source contract flow. Asking a draft for one would get a spec
+        that depends on state nothing seeds, and the proof would read the
+        absence as the effect being absent.
+        """
+        self.assertNotIn("fixture", field._DRAFT_INSTRUCTIONS)
