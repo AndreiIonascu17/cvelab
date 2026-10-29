@@ -1180,3 +1180,57 @@ class SampledSpecGetsASecondAskTests(unittest.TestCase):
             )
         self.assertIs(outcome["shipped"], False)
         self.assertIs(outcome["spec_at_fault"], True)
+
+
+class ExpectationMustBeAbleToFireTests(unittest.TestCase):
+    """An expectation the transport cannot produce is a spec error.
+
+    A socket exchange returns a transcript and no status line. A spec
+    expecting a status over tcp would run, read exactly the right bytes and
+    report nothing -- which reads as the effect being absent, and sends the
+    operator looking for a vulnerability that was there all along.
+    """
+
+    def _ws(self, expect: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "strategy": "direct_observation",
+            "transport": "ws",
+            "observable_effect": "a reply naming a principal the caller never proved",
+            "ws_path": "/connection/websocket",
+            "probe": [{"send": '{"id":1}', "read_until": "\n"}],
+            "expect": expect,
+        }
+
+    def test_a_status_or_header_over_a_socket_is_refused(self) -> None:
+        for transport in ("tcp", "tls", "ws", "wss", "ssh", "smb"):
+            for expect in ({"status": 200}, {"header": "X-Who"}):
+                spec = self._ws(expect)
+                spec["transport"] = transport
+                if transport not in field.WS_TRANSPORTS:
+                    spec.pop("ws_path")
+                if transport == "ssh":
+                    spec["probe"] = [{"exec": "id"}]
+                elif transport == "smb":
+                    spec["probe"] = [{"op": "list_shares"}]
+                with self.subTest(transport=transport, expect=expect):
+                    with self.assertRaises(ValueError) as refused:
+                        field.validate_spec(spec)
+                    self.assertIn("transport http", str(refused.exception))
+
+    def test_the_bytes_are_what_a_socket_matches_on(self) -> None:
+        for expect in ({"body_contains": "forwarded-header"},
+                       {"extract": {"json_values": "principal"}}):
+            with self.subTest(expect=expect):
+                spec = field.validate_spec(self._ws(expect))
+                self.assertEqual(spec["checks"][0]["expect"], expect)
+
+    def test_http_still_takes_a_status_and_a_header(self) -> None:
+        for expect in ({"status": 401}, {"header": "X-Debug-User"}):
+            with self.subTest(expect=expect):
+                spec = field.validate_spec({
+                    "strategy": "direct_observation",
+                    "observable_effect": "a route that answers where it should refuse",
+                    "probe": [{"method": "GET", "path": "/admin"}],
+                    "expect": expect,
+                })
+                self.assertEqual(spec["checks"][0]["expect"], expect)

@@ -528,6 +528,18 @@ def _validate_check(
         # not have, and on a fixed build the same request does not.
         out["probe"] = _validate_sequence(check.get("probe"), f"{where}.probe", transport)
         out["expect"] = _validate_expectation(check.get("expect"), where)
+        asserted = next(iter(out["expect"]))
+        if transport != "http" and asserted in ("status", "header"):
+            # A socket exchange returns a transcript and no status line, so
+            # this expectation could never fire: the script would run, read
+            # the right bytes and report nothing, which is indistinguishable
+            # from the effect being absent. Refused here instead, where the
+            # reason can be said and another spec asked for.
+            raise ValueError(
+                f"{where}.expect.{asserted} needs transport http; over {transport} there "
+                "is no status line or header to read, so match on the bytes with "
+                "body_contains or extract"
+            )
         _allowed(out["probe"], "probe")
     elif strategy == "oob_callback":
         probe = _validate_sequence(check.get("probe"), f"{where}.probe", transport)
