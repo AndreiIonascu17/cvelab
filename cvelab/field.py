@@ -97,6 +97,19 @@ STRATEGIES = (
     "inband_differential", "marker_roundtrip", "oob_callback", "direct_observation",
 )
 
+#: The strategies that carry their own control, inside the one instance they
+#: run against. inband_differential reads the same resource the way the
+#: weakness allows and the way that authorizes correctly, and reports only the
+#: difference. marker_roundtrip and oob_callback observe a marker surfacing
+#: where it cannot legitimately, or the target reaching out -- neither is
+#: ordinary behaviour whatever the version.
+#:
+#: This is what makes a lab with no fixed build usable. A patched build answers
+#: one question: is what I am seeing the bug, or how the thing always behaves.
+#: It is a check against self-deception, not the definition of a vulnerability,
+#: and these three answer it on their own.
+SELF_CONTROLLED = ("inband_differential", "marker_roundtrip", "oob_callback")
+
 #: What direct_observation may assert about the one response it reads.
 EXPECTATIONS = ("status", "header", "body_contains", "extract")
 
@@ -2171,10 +2184,19 @@ def prove_manual_poc(
     The lab's own proof is the differential between two builds it controls,
     and that proof cannot leave the lab: PoC.py is the validator, bound to the
     service names, and contract-checked to reach no other host. This is the
-    other artifact, and it is held to the same bar -- the effect against the
-    vulnerable build, silence against the fixed one. A script that fires on
-    both is watching normal behaviour rather than the bug; one that crashed
-    observed nothing because it never looked. Neither is handed over.
+    other artifact, and where there are two builds it is held to the same bar
+    -- the effect against the vulnerable one, silence against the fixed one. A
+    script that fires on both is watching normal behaviour rather than the bug;
+    one that crashed observed nothing because it never looked.
+
+    A lab with no fixed build is not refused. A patched build answers one
+    question -- is this the bug or is it how the thing always behaves -- and it
+    is a check against self-deception, not what makes a vulnerability real. A
+    strategy in SELF_CONTROLLED answers that question inside the one instance
+    it runs against, so such a lab may hand over a script using one of those.
+    direct_observation may not: its only check was the fixed build, and
+    "the route answered 200" on its own is the shape of proof that passed a
+    lab on `existsSync` seeing a path with "..".
 
     The script is run from a sidecar joined to each service container's network
     namespace, so `--target 127.0.0.1` reaches the product although the lab
@@ -2198,11 +2220,20 @@ def prove_manual_poc(
                           + ", ".join(missing)
                           + ". Pass each as --input NAME=VALUE",
             }
+        vulnerable_only = (plan or {}).get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION"
+        if vulnerable_only and spec["strategy"] not in SELF_CONTROLLED:
+            return {
+                "shipped": False,
+                "reason": f"{spec['strategy']} has no control of its own, and this lab has "
+                          f"no fixed build to supply one; use one of "
+                          f"{', '.join(SELF_CONTROLLED)}",
+            }
         image = sidecar.ensure_image({spec.get("transport", "http")}, assume_yes)
         script = emit_field_poc(cve, spec, plan, MANUAL_POC_NAME)
+        wanted = ("vulnerable",) if vulnerable_only else ("vulnerable", "patched")
         containers = {
             name: _service_container(compose, name, lab_dir, environment)
-            for name in ("vulnerable", "patched")
+            for name in wanted
         }
         missing = [name for name, cid in containers.items() if not cid]
         if missing:
@@ -2216,20 +2247,35 @@ def prove_manual_poc(
     except Exception as error:  # noqa: BLE001 - the outcome is the report
         return {"shipped": False, "reason": f"{type(error).__name__}: {error}"[:600]}
 
-    vulnerable, patched = runs["vulnerable"], runs["patched"]
-    both_ran = bool(vulnerable["ran"] and patched["ran"])
-    proven = bool(both_ran and vulnerable["observed"] and not patched["observed"])
+    vulnerable = runs["vulnerable"]
+    patched = runs.get("patched")
+    if patched is None:
+        # No fixed build to go silent against, so the strategy's own control
+        # is the check. It was required to be one that has one.
+        both_ran = bool(vulnerable["ran"])
+        proven = bool(both_ran and vulnerable["observed"])
+        checks = {
+            "script_ran": both_ran,
+            "effect_observed_on_vulnerable": bool(vulnerable["observed"]),
+            "control_is_in_the_strategy": True,
+            "manual_poc_proven": proven,
+        }
+    else:
+        both_ran = bool(vulnerable["ran"] and patched["ran"])
+        proven = bool(both_ran and vulnerable["observed"] and not patched["observed"])
+        checks = {
+            "script_ran_on_both": both_ran,
+            "effect_observed_on_vulnerable": bool(vulnerable["observed"]),
+            "silent_on_fixed": bool(patched["ran"] and not patched["observed"]),
+            "manual_poc_proven": proven,
+        }
     outcome: dict[str, Any] = {
         "shipped": proven,
         "strategy": spec["strategy"],
         "observable_effect": spec["observable_effect"],
         "container_port": port,
-        "proof_checks": {
-            "script_ran_on_both": both_ran,
-            "effect_observed_on_vulnerable": bool(vulnerable["observed"]),
-            "silent_on_fixed": bool(patched["ran"] and not patched["observed"]),
-            "manual_poc_proven": proven,
-        },
+        "fixed_build_compared": patched is not None,
+        "proof_checks": checks,
         "runs": {
             name: {key: run[key] for key in ("observed", "ran", "verdict", "exit_code")}
             for name, run in runs.items()
@@ -2238,11 +2284,17 @@ def prove_manual_poc(
     if proven:
         outcome["script"] = script
         return outcome
-    outcome["reason"] = (
-        "the script did not tell the two builds apart"
-        if both_ran
-        else "the script did not finish against both builds"
-    )
+    if patched is None:
+        outcome["reason"] = (
+            "the script did not observe the effect on the vulnerable build"
+            if both_ran else "the script did not finish"
+        )
+    else:
+        outcome["reason"] = (
+            "the script did not tell the two builds apart"
+            if both_ran
+            else "the script did not finish against both builds"
+        )
     # Kept because a spec that was refused is only fixable if the run that
     # refused it is visible: a generic reason sends the operator back to guess.
     outcome["output"] = {
@@ -2279,11 +2331,6 @@ def run_manual_poc(
     lab_dir = lab_dir.resolve()
     plan = _lab_plan(lab_dir)
     cve = str(plan.get("cve") or lab_dir.name).upper()
-    if plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION":
-        raise RuntimeError(
-            f"{cve} has no fixed build, so a script cannot be shown to go silent against "
-            "one; without that half the proof is missing"
-        )
     _require_reproduced(lab_dir)
     if spec_path is not None:
         try:
@@ -2317,8 +2364,11 @@ def run_manual_poc(
         container_port = container_port or drafted["container_port"]
     timeout = int(spec.get("health_timeout", DEFAULT_HEALTH_TIMEOUT)) + startup_grace()
 
-    services = list(plan.get("startup_services") or [])
-    for required in ("vulnerable", "patched"):
+    vulnerable_only = plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION"
+    needed = ("vulnerable",) if vulnerable_only else ("vulnerable", "patched")
+    services = [s for s in (plan.get("startup_services") or []) if s in needed or
+                s not in ("vulnerable", "patched")]
+    for required in needed:
         if required not in services:
             services.append(required)
 
@@ -2326,7 +2376,7 @@ def run_manual_poc(
     try:
         resolved = _resolved_compose(compose, lab_dir, environment)
         _bring_up(
-            services, ["vulnerable", "patched"], container_port, timeout,
+            services, list(needed), container_port, timeout,
             lab_dir, compose, docker, environment, resolved,
         )
         progress.step("proving the single-target script against both builds")
@@ -2371,6 +2421,28 @@ def _manual_poc_guide(cve: str, spec: dict[str, Any], plan: dict[str, Any], port
         "marker stays until someone removes it -- this script does not remove it, so "
         "tell the owner and clean it up."
     )
+    project = plan.get("repository") or "the affected project"
+    if plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION":
+        trust = (
+            f"CVELab built the affected revision of {project} and ran this exact script\n"
+            f"against it, on port {port} inside the container, before writing it here. It\n"
+            "observed the effect.\n\n"
+            "There was no fixed revision to compare against -- the project publishes no\n"
+            "resolvable patched build for this one -- so that half of the usual check is\n"
+            "missing. What stands in for it is the strategy: a "
+            f"{spec['strategy']} run carries\nits own control, so the effect it reports is "
+            "one the same instance does not\nproduce when asked the legitimate way. That is "
+            "weaker evidence than a patched\nbuild staying silent, and worth saying plainly "
+            "in a report: this shows the\neffect happening, not that a fix removes it."
+        )
+    else:
+        trust = (
+            f"CVELab built both revisions of {project}\n"
+            f"and ran this exact script against each, on port {port} inside the container,\n"
+            "before writing it here. It observed the effect on the vulnerable build and\n"
+            "stayed silent on the fixed one. A script that fired on both would be watching\n"
+            "normal behaviour rather than the bug, and would not have been written."
+        )
     return f"""# {cve} Manual PoC
 
 A single-target script you run yourself, against one server you are permitted to
@@ -2437,11 +2509,7 @@ matched to your run.
 
 ## Why you can trust it
 
-CVELab built both revisions of {plan.get('repository') or 'the affected project'}
-and ran this exact script against each, on port {port} inside the container,
-before writing it here. It observed the effect on the vulnerable build and
-stayed silent on the fixed one. A script that fired on both would be watching
-normal behaviour rather than the bug, and would not have been written.
+{trust}
 """
 
 
@@ -2692,9 +2760,14 @@ _DRAFT_INSTRUCTIONS = (
     "it would pass against the lab and mean nothing against a real server. When the only "
     "evidence is of that kind, or the project ships no listener of its own at all, answer "
     "feasible=false and say which. "
-    "CVELab emits one script from your spec and runs it against both of the lab's builds. It "
-    "is kept only if it observes the effect on the vulnerable build and stays silent on the "
-    "fixed one, so a spec that watches ordinary behaviour is discarded rather than shipped."
+    "CVELab emits one script from your spec and runs it against the lab's builds. Where there "
+    "are two it is kept only if it observes the effect on the vulnerable one and stays silent "
+    "on the fixed one, so a spec that watches ordinary behaviour is discarded rather than "
+    "shipped. Where the lab has no fixed build, which happens when the project publishes no "
+    "resolvable patched revision, that check is unavailable and the strategy has to supply it: "
+    "inband_differential, marker_roundtrip and oob_callback each carry their own control and "
+    "are allowed, while direct_observation is not, because its only check was the fixed build. "
+    "A lab with no fixed build is not a reason to answer feasible=false."
 )
 
 
@@ -2882,11 +2955,6 @@ def manual_poc_step(
             return {
                 "shipped": False,
                 "reason": "the lab did not reproduce, so there was nothing to hand over",
-            }
-        if plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION":
-            return {
-                "shipped": False,
-                "reason": "no fixed build for the script to go silent against",
             }
         if not ai_is_configured(api_key, model, provider):
             return {"shipped": False, "reason": "no model configured for the spec call"}
