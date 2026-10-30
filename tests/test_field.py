@@ -1334,12 +1334,31 @@ class WebSocketTransportTests(unittest.TestCase):
     def test_a_server_that_does_not_upgrade_is_not_silence(self) -> None:
         """A plain 200 would otherwise read as a successful upgrade, and every
         later read would come back empty -- indistinguishable from the effect
-        being absent."""
+        being absent. This spec reads the frames, so that stays an error."""
         script = field.emit_field_poc("CVE-2026-1", field.validate_spec(self._ws()))
         exchange = script.split("def _ws_exchange", 1)[1].split("\n    def _ws_write", 1)[0]
-        self.assertIn('" 101" not in head', exchange)
+        self.assertIn("if code != 101:", exchange)
+        self.assertIn("did not upgrade to WebSocket", exchange)
         self.assertIn("Sec-WebSocket-Accept", exchange)
         self.assertIn("sha1", exchange)
+        namespace: dict[str, Any] = {}
+        exec(compile(script, "<f>", "exec"), namespace)  # noqa: S102
+        self.assertFalse(namespace["_handshake_is_the_finding"]())
+
+    def test_the_handshake_itself_can_be_the_finding(self) -> None:
+        """Origin checks: 101 to a foreign Origin, 403 on the fixed build.
+
+        Storybook was refused a script three times, the third time for this:
+        "the confirmed effect is the HTTP status line of the WebSocket
+        upgrade ... over ws the expectation kinds are body_contains or
+        extract, so the 101 cannot be matched directly".
+        """
+        script = field.emit_field_poc("CVE-2026-1", field.validate_spec(
+            self._ws(expect={"status": 101}, ws_headers={"Origin": "http://evil.invalid"})
+        ))
+        namespace: dict[str, Any] = {}
+        exec(compile(script, "<f>", "exec"), namespace)  # noqa: S102
+        self.assertTrue(namespace["_handshake_is_the_finding"]())
 
     def test_a_client_frame_is_masked_and_a_ping_is_answered(self) -> None:
         script = field.emit_field_poc("CVE-2026-1", field.validate_spec(self._ws()))
@@ -1444,8 +1463,11 @@ class WebSocketDiscoveryTests(unittest.TestCase):
         """Only the discovery step is HTTP; the effect is in the frames."""
         target = self._target("ws", "10.0.0.5:6006")
         target.send = lambda message: self.fail("the probe must not go over http")
-        target._ws_exchange = lambda messages: "dev-1 dev-2"
-        self.assertEqual(target.exchange([{"send": "x"}]), (0, "dev-1 dev-2", {}))
+        target._ws_exchange = lambda messages: (101, "dev-1 dev-2", {"Upgrade": "websocket"})
+        self.assertEqual(
+            target.exchange([{"send": "x"}]),
+            (101, "dev-1 dev-2", {"Upgrade": "websocket"}),
+        )
 
 
 class ReleaseTagPairTests(unittest.TestCase):

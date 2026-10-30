@@ -1202,7 +1202,7 @@ class ExpectationMustBeAbleToFireTests(unittest.TestCase):
         }
 
     def test_a_status_or_header_over_a_socket_is_refused(self) -> None:
-        for transport in ("tcp", "tls", "ws", "wss", "ssh", "smb"):
+        for transport in ("tcp", "tls", "ssh", "smb"):
             for expect in ({"status": 200}, {"header": "X-Who"}):
                 spec = self._ws(expect)
                 spec["transport"] = transport
@@ -1215,7 +1215,23 @@ class ExpectationMustBeAbleToFireTests(unittest.TestCase):
                 with self.subTest(transport=transport, expect=expect):
                     with self.assertRaises(ValueError) as refused:
                         field.validate_spec(spec)
-                    self.assertIn("transport http", str(refused.exception))
+                    self.assertIn("http, ws or wss", str(refused.exception))
+
+    def test_an_extractor_hides_nothing(self) -> None:
+        """{"extract": {"status": true}} reads the same absent status line."""
+        spec = self._ws(expect={"extract": {"status": True}})
+        spec["transport"] = "tcp"
+        spec.pop("ws_path")
+        with self.assertRaises(ValueError) as refused:
+            field.validate_spec(spec)
+        self.assertIn("http, ws or wss", str(refused.exception))
+
+    def test_the_websocket_handshake_is_a_response_and_keeps_both(self) -> None:
+        """An Origin check's whole finding is that the upgrade was accepted."""
+        for expect in ({"status": 101}, {"header": "Sec-WebSocket-Accept"}):
+            with self.subTest(expect=expect):
+                spec = field.validate_spec(self._ws(expect))
+                self.assertEqual(spec["checks"][0]["expect"], expect)
 
     def test_the_bytes_are_what_a_socket_matches_on(self) -> None:
         for expect in ({"body_contains": "forwarded-header"},
