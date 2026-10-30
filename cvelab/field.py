@@ -2495,8 +2495,7 @@ def _spec_complaint(outcome: dict[str, Any]) -> str:
 def _prove_drafted_spec(
     cve: str,
     plan: dict[str, Any],
-    spec: dict[str, Any],
-    port: int,
+    drafted: dict[str, Any],
     lab_dir: Path,
     compose: list[str],
     environment: dict[str, str],
@@ -2524,16 +2523,26 @@ def _prove_drafted_spec(
     those come back as they are. An operator's own spec is never retried
     either: it is theirs to correct, and this is only called for drafts.
     """
+    spec, port = drafted["spec"], drafted["container_port"]
+    offered = drafted.get("lab_values") or {}
     outcome: dict[str, Any] = {}
     for remaining in range(_draft_retries(), -1, -1):
         if before_each is not None:
             before_each(port)
         progress.step("proving the single-target script against both builds")
+        # The operator's own values win: these are only what the lab knows,
+        # and the script takes them at run time either way.
         outcome = prove_manual_poc(
-            cve, spec, port, lab_dir, compose, environment, plan, assume_yes, inputs
+            cve, spec, port, lab_dir, compose, environment, plan, assume_yes,
+            dict(offered, **(inputs or {})),
         )
         at_fault = bool(outcome.pop("spec_at_fault", False))
         if outcome["shipped"] or not at_fault or not remaining:
+            if offered:
+                # Kept for the record, which is read back when the same lab is
+                # asked again: a spec that needed them once needs them again,
+                # and nothing else remembers what the lab's own values were.
+                outcome["lab_values"] = dict(offered)
             return spec, port, outcome
         progress.step(f"the spec did not hold up, asking for another: {outcome['reason']}")
         again = draft_manual_poc_spec(
@@ -2545,10 +2554,11 @@ def _prove_drafted_spec(
             # against it. The failure that was measured is the better record.
             return spec, port, outcome
         spec, port = again["spec"], again["container_port"]
+        offered = again.get("lab_values") or {}
     return spec, port, outcome
 
 
-def _proven_spec(lab_dir: Path) -> tuple[dict[str, Any], int] | None:
+def _proven_spec(lab_dir: Path) -> tuple[dict[str, Any], int, dict[str, str]] | None:
     """The spec this lab already proved, if one is on record.
 
     Reusing it is what makes asking twice give the same answer. A drafted
@@ -2568,9 +2578,12 @@ def _proven_spec(lab_dir: Path) -> tuple[dict[str, Any], int] | None:
     if not isinstance(port, int):
         return None
     try:
-        return validate_spec(held["spec"]), port
+        spec = validate_spec(held["spec"])
     except (ValueError, TypeError):
         return None
+    return spec, port, _lab_values(
+        json.dumps(held.get("lab_values") or {}), spec["inputs"]
+    )
 
 
 def run_manual_poc(
@@ -2600,6 +2613,7 @@ def run_manual_poc(
     """
     lab_dir = lab_dir.resolve()
     asked_for = False
+    known: dict[str, str] = {}
     plan = _lab_plan(lab_dir)
     cve = str(plan.get("cve") or lab_dir.name).upper()
     _require_reproduced(lab_dir)
@@ -2615,7 +2629,7 @@ def run_manual_poc(
                 "container, and a spec cannot be proved without it"
             )
     elif (held := None if redraft else _proven_spec(lab_dir)) is not None:
-        spec, container_port = held
+        spec, container_port, known = held
         progress.step("reusing the spec this lab already proved; --redraft asks again")
     else:
         if not ai_is_configured(api_key, model, provider):
@@ -2636,6 +2650,7 @@ def run_manual_poc(
                     **drafted}
         spec = drafted["spec"]
         container_port = container_port or drafted["container_port"]
+        drafted = {**drafted, "container_port": container_port}
         asked_for = True
     timeout = int(spec.get("health_timeout", DEFAULT_HEALTH_TIMEOUT)) + startup_grace()
 
@@ -2668,7 +2683,7 @@ def run_manual_poc(
                     probed = port
 
             spec, container_port, outcome = _prove_drafted_spec(
-                cve, plan, spec, container_port, lab_dir, compose, environment,
+                cve, plan, drafted, lab_dir, compose, environment,
                 assume_yes, inputs, api_key=api_key, model=model,
                 provider=provider, base_url=base_url, before_each=ready,
             )
@@ -2678,7 +2693,7 @@ def run_manual_poc(
             progress.step("proving the single-target script against both builds")
             outcome = prove_manual_poc(
                 cve, spec, container_port, lab_dir, compose, environment, plan,
-                assume_yes, inputs,
+                assume_yes, dict(known, **(inputs or {})),
             )
             outcome.pop("spec_at_fault", None)
     finally:
@@ -2952,12 +2967,18 @@ _MAX_DRAFT_INPUT = 40_000
 MANUAL_POC_DRAFT_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["feasible", "reason", "container_port", "spec_json"],
+    "required": ["feasible", "reason", "container_port", "spec_json", "lab_values_json"],
     "properties": {
         "feasible": {"type": "boolean"},
         "reason": {"type": "string"},
         "container_port": {"type": ["integer", "null"]},
         "spec_json": {"type": ["string", "null"]},
+        # Values for the spec's own inputs, good for this lab only, so the
+        # script can be proved here. Without them a spec that declares an
+        # input -- which is the right answer whenever the effect needs an
+        # account or an object the operator owns -- can never be proved, and
+        # three labs in one afternoon were refused for exactly that.
+        "lab_values_json": {"type": ["string", "null"]},
     },
 }
 
@@ -3100,6 +3121,13 @@ _DRAFT_INSTRUCTIONS = (
     "or an OAuth state returned by a POST, extracted and then used by the probe. An effect "
     "that needs that handoff is expressible, and is not a reason to answer "
     "feasible=false.\n"
+    "  Whenever the spec declares inputs, put values that work against this lab in "
+    "lab_values_json, a JSON object string mapping each input name to a value -- the "
+    "account the lab seeds, the id of the object its validator uses, the credential its "
+    "setup calls. They are used to prove the script here and are never shipped: the "
+    "operator passes their own at run time. A value must be the kind of thing a real "
+    "target also has, an id or a credential, never a route only the lab serves. Declaring "
+    "an input and leaving its lab value out means the script cannot be proved at all.\n"
     "  A spec may carry more than one check: checks, a non-empty list, each entry holding "
     "the strategy's own keys plus label, a short name that identifies it in the output. The "
     "keys of a single check may instead sit at the top level of the spec, which is the short "
@@ -3302,7 +3330,29 @@ def _ask_for_spec(
         port = _port_hint(lab_dir) if lab_dir else None
     if not isinstance(port, int) or not 1 <= port <= 65535:
         return {"reason": "the answer gave no port the service listens on", "retry": True}
-    return {"spec": spec, "container_port": port}
+    return {"spec": spec, "container_port": port,
+            "lab_values": _lab_values(answered.get("lab_values_json"), spec["inputs"])}
+
+
+def _lab_values(offered: Any, declared: tuple[str, ...] | list[str]) -> dict[str, str]:
+    """The values that let a spec declaring inputs be proved against the lab.
+
+    Only the names the spec actually declares are kept, and only as text. A
+    name nothing declares would reach no request anyway, and anything else in
+    there is not an input value.
+    """
+    if not isinstance(offered, str) or not offered.strip():
+        return {}
+    try:
+        held = json.loads(offered)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(held, dict):
+        return {}
+    return {
+        name: str(held[name]) for name in declared
+        if isinstance(held.get(name), (str, int, float)) and str(held[name])
+    }
 
 
 def manual_poc_step(
@@ -3344,9 +3394,9 @@ def manual_poc_step(
             progress.step(f"no manual PoC: {drafted['reason']}")
             return {"shipped": False, **drafted}
         spec, port, outcome = _prove_drafted_spec(
-            cve, plan, drafted["spec"], drafted["container_port"], lab_dir,
-            compose, environment, assume_yes, inputs, api_key=api_key,
-            model=model, provider=provider, base_url=base_url,
+            cve, plan, drafted, lab_dir, compose, environment, assume_yes,
+            inputs, api_key=api_key, model=model, provider=provider,
+            base_url=base_url,
         )
         write_manual_poc(cve, lab_dir, plan, spec, port, outcome)
         if not outcome["shipped"]:
@@ -3374,7 +3424,12 @@ def write_manual_poc(
     artifacts = lab_dir / "artifacts"
     artifacts.mkdir(parents=True, exist_ok=True)
     script = str(outcome.pop("script", ""))
+    # Taken out for the same reason as the script: report.json is uploaded,
+    # and one of these is the lab's own credential.
+    values = outcome.pop("lab_values", None)
     record = {"cve": cve, **outcome}
+    if values:
+        record["lab_values"] = values
     # The spec goes down either way, under a key that says whether it earned
     # the handover. A proven one is read back, so asking again for the same
     # lab reuses the answer instead of sampling a new one: a drafted spec

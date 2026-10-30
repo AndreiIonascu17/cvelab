@@ -1093,8 +1093,9 @@ class SampledSpecGetsASecondAskTests(unittest.TestCase):
             field, "draft_manual_poc_spec", side_effect=drafts,
         ) as drafted:
             spec, port, outcome = field._prove_drafted_spec(
-                "CVE-2026-0001", {}, field.validate_spec(_spec()), 8000, lab_dir,
-                ["docker", "compose"], {}, True, None,
+                "CVE-2026-0001", {},
+                {"spec": field.validate_spec(_spec()), "container_port": 8000},
+                lab_dir, ["docker", "compose"], {}, True, None,
                 api_key="k", model="m", provider="anthropic", base_url=None,
             )
         return spec, port, outcome, proved, drafted
@@ -1301,3 +1302,76 @@ class PromptSaysWhatTheValidatorAcceptsTests(unittest.TestCase):
         absence as the effect being absent.
         """
         self.assertNotIn("fixture", field._DRAFT_INSTRUCTIONS)
+
+
+class LabValuesLetAnInputSpecBeProvedTests(unittest.TestCase):
+    """A spec that asks the operator for a value can still be proved here.
+
+    Three labs in one afternoon drafted a correct spec and shipped nothing:
+    "this spec needs values only you have: protected_id, target_id,
+    target_key". Declaring an input is the right answer whenever the effect
+    acts on an object or an account the operator owns -- and the lab knows
+    its own equivalents, because its validator uses them.
+    """
+
+    def _answer(self, values: Any) -> dict[str, Any]:
+        spec = _spec(inputs=["account"], probe=[{"method": "GET", "path": "/u/{{account}}"}])
+        with mock.patch.object(field, "structured_response", return_value={
+            "feasible": True, "reason": "", "container_port": 8000,
+            "spec_json": json.dumps(spec), "lab_values_json": values,
+        }):
+            return field.draft_manual_poc_spec(
+                "CVE-2026-0001", {}, api_key="k", model="m",
+                provider="anthropic", base_url=None,
+            )
+
+    def test_the_lab_s_own_values_come_back_with_the_spec(self) -> None:
+        out = self._answer(json.dumps({"account": "seeded-user"}))
+        self.assertEqual(out["lab_values"], {"account": "seeded-user"})
+
+    def test_only_declared_names_survive_and_only_as_text(self) -> None:
+        out = self._answer(json.dumps({
+            "account": 41, "tenant": "not-declared", "blank": "", "deep": {"a": 1},
+        }))
+        self.assertEqual(out["lab_values"], {"account": "41"})
+
+    def test_rubbish_is_no_reason_to_lose_the_spec(self) -> None:
+        for offered in (None, "", "not json", json.dumps(["account"])):
+            with self.subTest(offered=offered):
+                out = self._answer(offered)
+                self.assertIn("spec", out)
+                self.assertEqual(out["lab_values"], {})
+
+    def test_the_proof_uses_them_and_the_operator_still_wins(self) -> None:
+        seen: list[dict[str, str] | None] = []
+
+        def prove(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            seen.append(args[8])
+            return {"shipped": True, "proof_checks": {}, "runs": {},
+                    "script": "#!/usr/bin/env python3\n"}
+
+        with _lab() as lab_dir, mock.patch.object(field, "prove_manual_poc", prove):
+            field._prove_drafted_spec(
+                "CVE-2026-0001", {},
+                {"spec": field.validate_spec(_spec()), "container_port": 8000,
+                 "lab_values": {"account": "seeded-user", "token": "lab"}},
+                lab_dir, ["docker", "compose"], {}, True, {"token": "mine"},
+                api_key="k", model="m", provider="anthropic", base_url=None,
+            )
+        self.assertEqual(seen[0], {"account": "seeded-user", "token": "mine"})
+
+    def test_they_are_recorded_for_the_next_run_and_kept_out_of_the_report(self) -> None:
+        with _lab() as lab_dir:
+            spec = field.validate_spec(_spec(
+                inputs=["account"], probe=[{"method": "GET", "path": "/u/{{account}}"}]
+            ))
+            outcome = {"shipped": True, "container_port": 8000, "proof_checks": {},
+                       "runs": {}, "script": "#!/usr/bin/env python3\n",
+                       "lab_values": {"account": "seeded-user"}}
+            field.write_manual_poc("CVE-2026-0001", lab_dir, {}, spec, 8000, outcome)
+            # report.json takes this outcome verbatim, and one of these is a
+            # credential of the lab's.
+            self.assertNotIn("lab_values", outcome)
+            held = field._proven_spec(lab_dir)
+        self.assertIsNotNone(held)
+        self.assertEqual(held[2], {"account": "seeded-user"})
