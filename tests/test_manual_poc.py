@@ -1260,6 +1260,10 @@ class PromptSaysWhatTheValidatorAcceptsTests(unittest.TestCase):
     def test_every_name_the_validator_will_accept_is_offered(self) -> None:
         names = (
             field.STRATEGIES + field.TRANSPORTS + field.SMB_OPS + field.EXPECTATIONS
+            # Two refusals in one afternoon said a value could not be pulled
+            # out of HTML or out of a URL, because the instructions showed
+            # json_values where the validator takes any of the four.
+            + field.EXTRACTORS
             + tuple(sorted({f for fields in field.AUTH_FIELDS.values() for f in fields}))
         )
         for name in names:
