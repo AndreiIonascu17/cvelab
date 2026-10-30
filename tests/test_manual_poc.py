@@ -1094,7 +1094,8 @@ class SampledSpecGetsASecondAskTests(unittest.TestCase):
         ) as drafted:
             spec, port, outcome = field._prove_drafted_spec(
                 "CVE-2026-0001", {},
-                {"spec": field.validate_spec(_spec()), "container_port": 8000},
+                {"spec": field.validate_spec(_spec()), "container_port": 8000,
+                 "lab_values": {"account": "seeded-user"}},
                 lab_dir, ["docker", "compose"], {}, True, None,
                 api_key="k", model="m", provider="anthropic", base_url=None,
             )
@@ -1140,6 +1141,9 @@ class SampledSpecGetsASecondAskTests(unittest.TestCase):
         _, _, outcome, proved, drafted = self._prove(
             [first], [{"reason": "the effect is a worker crash"}],
         )
+        # The run that failed used the lab's values, so the record keeps them:
+        # without this a refusal came back saying inputs were never filled.
+        self.assertEqual(outcome.get("lab_values"), {"account": "seeded-user"})
         self.assertEqual(proved.call_count, 1)
         drafted.assert_called_once()
         # A judgement about the finding does not outrank a run against it.
