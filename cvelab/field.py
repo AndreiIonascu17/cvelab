@@ -2558,7 +2558,10 @@ def _prove_drafted_spec(
         )
         if "spec" not in again:
             # The second answer is a judgement about the finding, not a run
-            # against it. The failure that was measured is the better record.
+            # against it. The failure that was measured is the better record,
+            # and it was measured with these values.
+            if offered:
+                outcome["lab_values"] = dict(offered)
             return spec, port, outcome
         spec, port = again["spec"], again["container_port"]
         offered = again.get("lab_values") or {}
