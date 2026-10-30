@@ -496,11 +496,19 @@ def _validate_check(
     if not isinstance(check, dict):
         raise ValueError(f"{where} must be an object")
     discover, bound = _validate_discover(check.get("discover"), tuple(inputs or ()))
-    if discover and transport != "http":
+    if discover and transport not in ("http", *WS_TRANSPORTS):
         # Discovery enumerates a target by reading it and binding names. The
-        # steps are HTTP requests, so over a socket there is nothing to run
-        # them with -- better said plainly than silently ignored.
-        raise ValueError(f"{where}.discover works over http only, not {transport}")
+        # steps are HTTP requests, so over a plain socket or a negotiated
+        # session there is nothing to run them with -- better said plainly
+        # than silently ignored. A WebSocket target is not in that position:
+        # the upgrade route is served by an HTTP server on the same host and
+        # port, so a step runs against it with an ordinary request. Storybook
+        # reproduced and then had no script, because its channel token is
+        # read from served HTML and its effect is in the frames after the
+        # upgrade, and that pairing was refused here.
+        raise ValueError(
+            f"{where}.discover works over http, ws and wss, not {transport}"
+        )
     out: dict[str, Any] = {"label": str(check.get("label", where)), "discover": discover}
 
     def _allowed(sequence: list[dict[str, Any]], what: str) -> None:
@@ -822,7 +830,7 @@ class Target:
         if self.transport == "http":
             base = normalize_target(base)
             parsed = urllib.parse.urlsplit(base)
-            self.base = base.rstrip("/")
+            self.base = self.http_base = base.rstrip("/")
             if parsed.scheme == "https" and insecure:
                 self.ctx = ssl.create_default_context()
                 self.ctx.check_hostname = False
@@ -830,7 +838,12 @@ class Target:
             return
         self.host, self.port = normalize_target(base)
         self.base = "%s://%s:%s" % (self.transport, self.host, self.port)
-        if self.transport == "tls":
+        # A WebSocket service is an HTTP server that upgrades, on this same
+        # host and port, so a discovery step has somewhere to run.
+        self.http_base = "%s://%s:%s" % (
+            "https" if self.transport == "wss" else "http", self.host, self.port
+        )
+        if self.transport in ("tls", "wss"):
             self.ctx = ssl.create_default_context()
             if insecure:
                 self.ctx.check_hostname = False
@@ -858,6 +871,22 @@ class Target:
         JSON a report quotes.
         """
         return _subst(obj, dict(self.about_target(), **dict(self.inputs, **ctx)))
+
+    def discover_exchange(self, messages):
+        """Run a discovery step, which is HTTP whatever the probe speaks.
+
+        Over ws and wss the upgrade route and the pages are the same server,
+        so a value the probe needs -- a channel token in served HTML, an id
+        from a JSON route -- is read with an ordinary request first. Storybook
+        lost its script to exactly this: the token is in the HTML and the
+        effect is in the frames after the upgrade.
+        """
+        if self.transport in ("ws", "wss"):
+            last = (0, "", {})
+            for message in messages:
+                last = self.send(message)
+            return last
+        return self.exchange(messages)
 
     def exchange(self, messages):
         """Run one sequence and return (status, text, headers) for the proof.
@@ -1237,7 +1266,7 @@ class Target:
         headers = dict(spec.get("headers", {}))
         headers.setdefault("User-Agent", "CVELab-Field-PoC/1.0")
         req = urllib.request.Request(
-            self.base + path,
+            self.http_base + path,
             data=None if body is None else str(body).encode(),
             headers=headers,
             method=str(spec.get("method", "GET")).upper(),
@@ -1252,7 +1281,7 @@ class Target:
             return (e.code, e.read(8 * 1024 * 1024).decode("utf-8", "replace"),
                     dict(e.headers.items() if e.headers else []))
         except (urllib.error.URLError, TimeoutError, ssl.SSLError) as e:
-            raise SystemExit("cannot reach %s: %s" % (self.base, e))
+            raise SystemExit("cannot reach %s: %s" % (self.http_base, e))
 
 
 class Collector:
@@ -1372,7 +1401,7 @@ def discover(target, steps):
                     value = value.replace("{{" + key + "}}", str(bound))
                 nc = dict(ctx); nc[step["bind"]] = value; children.append(nc)
             else:
-                last = target.exchange(target.fill(step["query"], ctx))
+                last = target.discover_exchange(target.fill(step["query"], ctx))
                 for token in tokens(last, step["extract"]):
                     nc = dict(ctx); nc[step["bind"]] = token; children.append(nc)
             families.append(children)
@@ -2986,8 +3015,12 @@ _DRAFT_INSTRUCTIONS = (
     "needing a login or a handshake command first is expressed by putting it earlier in the "
     "same list, and what a sequence returns is everything read during it. Sending nothing and "
     "only reading is allowed, which is how a banner is taken.\n"
+    "  discover runs over http, and also over ws and wss, where its steps are ordinary "
+    "requests to the same host and port that serves the upgrade -- that is how a token "
+    "served in HTML is read first and then used in the frames. It is not available over "
+    "tcp, tls, ssh or smb.\n"
     "  Paths and messages name no host: the operator supplies the one target at run time, so "
-    "a hostname anywhere in the spec is wrong. Over tcp and tls there is no discover chain.\n"
+    "a hostname anywhere in the spec is wrong.\n"
     "  A request may also use {{target}}, the host and port the operator pointed the script "
     "at, and {{targetHost}}, that host alone. A spec names no host, but an effect can be "
     "about the target's own address -- an Origin or Referer the server is supposed to "
