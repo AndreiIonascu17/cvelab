@@ -215,8 +215,15 @@ def _validate_message(message: Any, where: str) -> dict[str, Any]:
     if not isinstance(message, dict):
         raise ValueError(f"{where} must be an object")
     text, raw = message.get("send"), message.get("send_hex")
-    if (text is None) == (raw is None):
-        raise ValueError(f"{where} needs exactly one of send or send_hex")
+    if text is not None and raw is not None:
+        raise ValueError(f"{where} takes send or send_hex, not both")
+    if text is None and raw is None:
+        # Sending nothing is a real exchange and this docstring has always
+        # said so, while the code demanded one of the two keys. It cost
+        # Storybook a script: an Origin check on a WebSocket upgrade sends no
+        # frame at all -- the finding is the handshake -- and the draft was
+        # refused with "needs exactly one of send or send_hex".
+        text = ""
     out: dict[str, Any] = {}
     if text is not None:
         if not isinstance(text, str):
@@ -3090,8 +3097,10 @@ _DRAFT_INSTRUCTIONS = (
     "\"read_until\": \"<the reply delimiter>\"}, or send_hex with an even-length hex string "
     "when the framing is not text; a whole sequence shares one connection, so a protocol "
     "needing a login or a handshake command first is expressed by putting it earlier in the "
-    "same list, and what a sequence returns is everything read during it. Sending nothing and "
-    "only reading is allowed, which is how a banner is taken.\n"
+    "same list, and what a sequence returns is everything read during it. A message that "
+    "sends nothing is {} with neither key, which is how a banner is taken and how an Origin "
+    "check on a WebSocket upgrade is written: no frame is sent at all, because the finding "
+    "is the handshake.\n"
     "  discover runs over http, and also over ws and wss, where its steps are ordinary "
     "requests to the same host and port that serves the upgrade -- that is how a token "
     "served in HTML is read first and then used in the frames. It is not available over "
