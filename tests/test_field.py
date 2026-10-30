@@ -1544,3 +1544,49 @@ class ReleaseTagPairTests(unittest.TestCase):
     def test_an_unreadable_repository_resolves_nothing(self) -> None:
         with mock.patch.object(releases.subprocess, "run", side_effect=OSError("no git")):
             self.assertEqual(releases.repo_tags("https://example.invalid/p.git"), {})
+
+
+class SendingNothingIsAnExchangeTests(unittest.TestCase):
+    """A message with neither key reads without writing.
+
+    The validator demanded one of send or send_hex while its own docstring
+    said sending nothing was allowed, and the instructions said so too. It
+    cost Storybook a script on the third attempt: an Origin check on a
+    WebSocket upgrade sends no frame at all, because the finding is the
+    handshake, and the draft came back "spec.probe[0] needs exactly one of
+    send or send_hex".
+    """
+
+    def _spec(self, transport: str, probe: list[dict[str, Any]]) -> dict[str, Any]:
+        spec: dict[str, Any] = {
+            "strategy": "direct_observation",
+            "transport": transport,
+            "observable_effect": "the upgrade is accepted from an origin it should refuse",
+            "probe": probe,
+            "expect": {"status": 101} if transport == "ws" else {"body_contains": "READY"},
+        }
+        if transport == "ws":
+            spec["ws_path"] = "/ws"
+            spec["ws_headers"] = {"Origin": "http://evil.invalid"}
+        return spec
+
+    def test_a_handshake_only_probe_validates(self) -> None:
+        spec = field.validate_spec(self._spec("ws", [{}]))
+        self.assertEqual(spec["checks"][0]["probe"], [{"send": "", "read_bytes": 1024 * 1024}])
+
+    def test_a_banner_read_validates(self) -> None:
+        spec = field.validate_spec(self._spec("tcp", [{"read_until": "\\n"}]))
+        message = spec["checks"][0]["probe"][0]
+        self.assertEqual(message["send"], "")
+        self.assertEqual(message["read_until"], "\\n")
+
+    def test_nothing_is_written_for_an_empty_send(self) -> None:
+        script = field.emit_field_poc(
+            "CVE-2026-1", field.validate_spec(self._spec("ws", [{}]))
+        )
+        self.assertIn("if payload:", script)
+
+    def test_both_keys_at_once_is_still_wrong(self) -> None:
+        with self.assertRaises(ValueError) as refused:
+            field.validate_spec(self._spec("tcp", [{"send": "x", "send_hex": "ff"}]))
+        self.assertIn("not both", str(refused.exception))
