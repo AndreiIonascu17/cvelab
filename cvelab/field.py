@@ -406,6 +406,18 @@ def _substitutions(text: str) -> set[str]:
     return set(re.findall(r"\{\{([A-Za-z][A-Za-z0-9_]*)\}\}", text))
 
 
+def _asserted_kind(expect: dict[str, Any]) -> str:
+    """What an expectation actually reads, through an extractor if need be.
+
+    {"status": 200} and {"extract": {"status": true}} both read the status
+    line, and a rule about where a status line exists has to see both.
+    """
+    kind = next(iter(expect), "")
+    if kind == "extract":
+        return next(iter(expect["extract"] or {}), "")
+    return kind
+
+
 def _validate_expectation(value: Any, where: str) -> dict[str, Any]:
     """What the one response has to show for the effect to count."""
     listed = ", ".join(EXPECTATIONS)
@@ -536,17 +548,19 @@ def _validate_check(
         # not have, and on a fixed build the same request does not.
         out["probe"] = _validate_sequence(check.get("probe"), f"{where}.probe", transport)
         out["expect"] = _validate_expectation(check.get("expect"), where)
-        asserted = next(iter(out["expect"]))
-        if transport != "http" and asserted in ("status", "header"):
+        asserted = _asserted_kind(out["expect"])
+        if transport not in ("http", *WS_TRANSPORTS) and asserted in ("status", "header"):
             # A socket exchange returns a transcript and no status line, so
             # this expectation could never fire: the script would run, read
             # the right bytes and report nothing, which is indistinguishable
             # from the effect being absent. Refused here instead, where the
-            # reason can be said and another spec asked for.
+            # reason can be said and another spec asked for. Over ws and wss
+            # it is not refused: the upgrade is an HTTP response, and for an
+            # Origin check it is the whole finding.
             raise ValueError(
-                f"{where}.expect.{asserted} needs transport http; over {transport} there "
-                "is no status line or header to read, so match on the bytes with "
-                "body_contains or extract"
+                f"{where}.expect.{asserted} needs transport http, ws or wss; over "
+                f"{transport} there is no status line or header to read, so match on the "
+                "bytes with body_contains or extract"
             )
         _allowed(out["probe"], "probe")
     elif strategy == "oob_callback":
@@ -712,6 +726,29 @@ def _collect(value, key, out):
     elif isinstance(value, list):
         for item in value:
             _collect(item, key, out)
+
+
+def _handshake_is_the_finding():
+    """Whether a refused upgrade is an observation rather than a dead end.
+
+    For an Origin check the upgrade itself is the evidence: accepted where a
+    fixed build refuses. Then a non-101 is data and must come back. Where the
+    evidence is in the frames, a server that did not upgrade has told us
+    nothing, and returning that as "no effect" is the mistake the accept-header
+    check was added to prevent -- so every check has to be reading the
+    handshake for this to hold.
+    """
+    checks = SPEC.get("checks") or []
+    return bool(checks) and all(
+        _reads_the_handshake(check.get("expect") or {}) for check in checks
+    )
+
+
+def _reads_the_handshake(expect):
+    kind = next(iter(expect), "")
+    if kind == "extract":
+        kind = next(iter(expect["extract"] or {}), "")
+    return kind in ("status", "header")
 
 
 def tokens(response, extractor):
@@ -903,7 +940,7 @@ class Target:
                 last = self.send(message)
             return last
         if self.transport in ("ws", "wss"):
-            return (0, self._ws_exchange(messages), {})
+            return self._ws_exchange(messages)
         if self.transport == "ssh":
             return (0, self._ssh_exchange(messages), {})
         if self.transport == "smb":
@@ -1044,6 +1081,13 @@ class Target:
         WebSocket would otherwise be read as a successful upgrade and every
         later read would return nothing, which looks exactly like an absent
         effect.
+
+        The upgrade's own status and headers come back with the frames,
+        because for an Origin check they are the finding: 101 to a request
+        carrying a foreign Origin, where a fixed build answers 403. When the
+        spec reads only those, a refused upgrade is that observation and is
+        returned; when the evidence is in the frames, a server that did not
+        upgrade has told us nothing and that stays an error.
         """
         key = base64.b64encode(uuid.uuid4().bytes).decode()
         try:
@@ -1080,10 +1124,19 @@ class Target:
                     break
                 reply += chunk
             head = reply.split(b"\r\n\r\n", 1)[0].decode("utf-8", "replace")
-            if " 101" not in head.split("\r\n")[0]:
+            lines = head.split("\r\n")
+            upgraded = {}
+            for line in lines[1:]:
+                name, _, value = line.partition(":")
+                if value:
+                    upgraded[name.strip()] = value.strip()
+            parts = lines[0].split(" ")
+            code = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+            if code != 101:
+                if _handshake_is_the_finding():
+                    return code, "", upgraded
                 raise SystemExit(
-                    "%s did not upgrade to WebSocket: %s"
-                    % (self.base, head.split("\r\n")[0][:120])
+                    "%s did not upgrade to WebSocket: %s" % (self.base, lines[0][:120])
                 )
             expected = base64.b64encode(
                 hashlib.sha1((key + self._WS_GUID).encode()).digest()
@@ -1115,7 +1168,7 @@ class Target:
                 sock.close()
             except OSError:
                 pass
-        return "".join(transcript)
+        return code, "".join(transcript), upgraded
 
     def _ws_write(self, sock, payload, opcode):
         """One masked frame. A client frame must be masked; a server's is not."""
@@ -2972,7 +3025,10 @@ _DRAFT_INSTRUCTIONS = (
     "header, {\"body_contains\": \"<text>\"} for a literal, or {\"extract\": {...}} "
     "when a value has to be pulled out. status and header are http only: every other "
     "transport returns what was read and no status line, so there match the bytes with "
-    "body_contains or extract. The effect is that this response came back at all; "
+    "body_contains or extract. Over ws and wss they read the upgrade response, which is "
+    "what an Origin check needs: {\"status\": 101} is the finding when the server accepts "
+    "an upgrade carrying an Origin it should refuse, and the fixed build's refusal is the "
+    "silence. The effect is that this response came back at all; "
     "CVELab checks that a fixed build does not produce it, so no second reading is needed. "
     "Do not use inband_differential for this shape: comparing an unauthenticated read "
     "against an authorized one finds nothing on the vulnerable build, because both see the "
