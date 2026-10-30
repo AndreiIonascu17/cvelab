@@ -137,6 +137,12 @@ class FakeHTTP:
             last = self.send(step)
         return last
 
+    def discover_exchange(
+        self, steps: list[dict[str, Any]]
+    ) -> tuple[int, str, dict[str, str]]:
+        """What a discovery step runs through, which here is the same thing."""
+        return self.exchange(steps)
+
 
 class DiscoveryTests(unittest.TestCase):
     def _with_discover(self, discover: list[dict[str, Any]]) -> dict[str, Any]:
@@ -616,7 +622,8 @@ class SocketTransportTests(unittest.TestCase):
                 {"bind": "k", "query": [{"method": "GET", "path": "/k"}],
                  "extract": {"json_values": "id"}},
             ]))
-        self.assertIn("http only", str(raised.exception))
+        self.assertIn("http, ws and wss", str(raised.exception))
+        self.assertIn("not tcp", str(raised.exception))
 
     def test_the_sidecar_passes_a_host_and_port_not_a_url(self) -> None:
         """The socket script refuses a URL, so the proof has to match it."""
@@ -1349,6 +1356,96 @@ class WebSocketTransportTests(unittest.TestCase):
         read = script.split("def _ws_read", 1)[1].split("\n    def _ws_frame", 1)[0]
         self.assertIn("if opcode == 9:", read)    # ping
         self.assertIn("if opcode == 8:", read)    # close ends the read
+
+
+class WebSocketDiscoveryTests(unittest.TestCase):
+    """A value read over HTTP, then used in the frames after the upgrade.
+
+    Storybook reproduced and had no manual script for two runs. Its channel
+    token is served in HTML and the effect is in the frames after the
+    upgrade, and the draft said so both times: "discover is not available for
+    ws, so the token cannot be obtained inside a ws check". A WebSocket
+    service is an HTTP server that upgrades on the same host and port, so
+    that pairing is the one case where discovery has somewhere to run.
+    """
+
+    def _ws(self, **extra: Any) -> dict[str, Any]:
+        spec = {
+            "strategy": "direct_observation",
+            "transport": "ws",
+            "ws_path": "/ws",
+            "observable_effect": "a channel token from the page is accepted from any origin",
+            "discover": [{
+                "bind": "token",
+                "query": [{"method": "GET", "path": "/iframe.html"}],
+                "extract": {"regex": "wsToken[\"']?\\s*[:=]\\s*[\"']([^\"']+)"},
+            }],
+            "probe": [{"send": '{"token":"{{token}}","type":"devices/list"}',
+                       "read_until": "}"}],
+            "expect": {"body_contains": "dev-"},
+        }
+        spec.update(extra)
+        return spec
+
+    def test_a_ws_spec_may_discover(self) -> None:
+        for transport in ("ws", "wss"):
+            with self.subTest(transport=transport):
+                spec = field.validate_spec(self._ws(transport=transport))
+                step = spec["checks"][0]["discover"][0]
+                self.assertEqual(step["bind"], "token")
+                self.assertIn("regex", step["extract"])
+
+    def test_a_socket_or_a_session_still_has_nowhere_to_run_one(self) -> None:
+        for transport in ("tcp", "tls", "ssh", "smb"):
+            spec = self._ws(transport=transport)
+            spec.pop("ws_path")
+            spec["probe"] = (
+                [{"exec": "id"}] if transport == "ssh"
+                else [{"op": "list_shares"}] if transport == "smb"
+                else [{"send": "PING\r\n", "read_until": "\n"}]
+            )
+            spec["expect"] = {"body_contains": "dev-"}
+            with self.subTest(transport=transport):
+                with self.assertRaises(ValueError) as refused:
+                    field.validate_spec(spec)
+                self.assertIn("http, ws and wss", str(refused.exception))
+
+    def _target(self, transport: str, where: str) -> Any:
+        script = field.emit_field_poc(
+            "CVE-2026-1", field.validate_spec(self._ws(transport=transport))
+        )
+        namespace: dict[str, Any] = {}
+        exec(compile(script, "<f>", "exec"), namespace)  # noqa: S102
+        return namespace["Target"](where, False, 5)
+
+    def test_the_http_address_is_the_same_host_and_port(self) -> None:
+        for transport, scheme in (("ws", "http"), ("wss", "https")):
+            with self.subTest(transport=transport):
+                target = self._target(transport, "10.0.0.5:6006")
+                self.assertEqual(target.base, f"{transport}://10.0.0.5:6006")
+                self.assertEqual(target.http_base, f"{scheme}://10.0.0.5:6006")
+
+    def test_a_step_is_an_ordinary_request_and_never_an_upgrade(self) -> None:
+        target = self._target("ws", "10.0.0.5:6006")
+        seen: list[dict[str, Any]] = []
+
+        def send(message: dict[str, Any]) -> tuple[int, str, dict[str, str]]:
+            seen.append(message)
+            return 200, '<script>window.wsToken = "tok-9"</script>', {}
+
+        target.send = send
+        target._ws_exchange = lambda messages: self.fail("a step must not upgrade")
+        status, body, _ = target.discover_exchange([{"method": "GET", "path": "/iframe.html"}])
+        self.assertEqual([m["path"] for m in seen], ["/iframe.html"])
+        self.assertEqual(status, 200)
+        self.assertIn("tok-9", body)
+
+    def test_the_probe_still_speaks_websocket(self) -> None:
+        """Only the discovery step is HTTP; the effect is in the frames."""
+        target = self._target("ws", "10.0.0.5:6006")
+        target.send = lambda message: self.fail("the probe must not go over http")
+        target._ws_exchange = lambda messages: "dev-1 dev-2"
+        self.assertEqual(target.exchange([{"send": "x"}]), (0, "dev-1 dev-2", {}))
 
 
 class ReleaseTagPairTests(unittest.TestCase):
