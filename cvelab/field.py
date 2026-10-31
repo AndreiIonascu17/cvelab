@@ -60,7 +60,7 @@ import re
 import shutil
 import subprocess
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -425,6 +425,32 @@ def _asserted_kind(expect: dict[str, Any]) -> str:
     return kind
 
 
+#: How many requests may put the lab in the state the proof needs. Small on
+#: purpose: this is seeding, and a spec that needs more than this is
+#: describing a workflow rather than a precondition.
+_MAX_SETUP_REQUESTS = 10
+
+
+def _validate_setup(value: Any, inputs: Sequence[str]) -> list[dict[str, Any]]:
+    """Requests that put this lab in the state the effect needs.
+
+    They are HTTP whatever the probe speaks, because a seeding route is: the
+    lab's own /lab/seed, an admin API, a sign-up. They may fill in the
+    operator's inputs and nothing else -- there is no discovery to bind from
+    and no marker, because this runs before the proof rather than as part of
+    it.
+    """
+    if not isinstance(value, list) or not value:
+        raise ValueError("setup must be a non-empty list of requests")
+    if len(value) > _MAX_SETUP_REQUESTS:
+        raise ValueError(f"setup may hold at most {_MAX_SETUP_REQUESTS} requests")
+    out = [_validate_request(item, f"setup[{index}]") for index, item in enumerate(value)]
+    unbound = _substitutions(json.dumps(out)) - set(inputs) - set(_TARGET_TOKENS)
+    if unbound:
+        raise ValueError(f"setup uses names nothing binds: {sorted(unbound)}")
+    return out
+
+
 def _validate_expectation(value: Any, where: str) -> dict[str, Any]:
     """What the one response has to show for the effect to count."""
     listed = ", ".join(EXPECTATIONS)
@@ -673,6 +699,13 @@ def validate_spec(spec: Any) -> dict[str, Any]:
     else:
         out["checks"] = [_validate_check(spec, strategy, "spec", transport, inputs)]
 
+    if spec.get("setup") is not None:
+        # Run against each build before the script, and never shipped. A lab
+        # starts empty, so the object a weakness acts on is put there by the
+        # lab's own seeding route -- which the lab's validator calls and the
+        # manual proof did not, so two correct specs found nothing on either
+        # build and were recorded as failures.
+        out["setup"] = _validate_setup(spec["setup"], inputs)
     if spec.get("fixture") is not None:
         out["fixture"] = _validate_fixture(spec["fixture"])
     out["health_timeout"] = _seconds(
@@ -1787,12 +1820,15 @@ def emit_field_poc(
 ) -> str:
     """The standalone deliverable, with the spec frozen into it.
 
-    The fixture is dropped: it seeds CVELab's own validation instance and has
-    no place in a script pointed at a server that already holds real data, and
-    it would otherwise ship the fixture's markers and object ids inside the
-    deliverable.
+    The fixture and the setup are dropped: they put CVELab's own validation
+    instance into the state the effect needs, and have no place in a script
+    pointed at a server that already holds real data -- which is the whole
+    reason the lab had to seed anything. They would also ship the seeding
+    route's own path and the ids it creates inside the deliverable.
     """
-    embedded = {key: value for key, value in spec.items() if key != "fixture"}
+    embedded = {
+        key: value for key, value in spec.items() if key not in ("fixture", "setup")
+    }
     text = json.dumps(embedded, indent=4)
     # The spec sits inside a triple-quoted raw string so a reviewer reads it
     # indented. JSON escapes every quote inside a string, so three in a row
@@ -1812,6 +1848,81 @@ def emit_field_poc(
         .replace("@@EFFECT@@", effect)
         .replace("@@CVE@@", cve)
     )
+
+
+_SETUP_RUNNER = (
+    "import json, os, sys, urllib.error, urllib.request\n"
+    "base = os.environ['CVELAB_BASE']\n"
+    "given = json.loads(os.environ.get('CVELAB_INPUTS') or '{}')\n"
+    "host = base.split('://', 1)[-1]\n"
+    "given = dict(given, target=host, targetHost=host.rsplit(':', 1)[0])\n"
+    "done = []\n"
+    "for request in json.loads(os.environ['CVELAB_SETUP']):\n"
+    "    text = json.dumps(request)\n"
+    "    for name, value in given.items():\n"
+    "        text = text.replace('{{%s}}' % name, json.dumps(str(value))[1:-1])\n"
+    "    request = json.loads(text)\n"
+    "    body = request.get('body')\n"
+    "    call = urllib.request.Request(\n"
+    "        base + request['path'],\n"
+    "        data=None if body is None else str(body).encode(),\n"
+    "        headers=request.get('headers') or {},\n"
+    "        method=request.get('method', 'GET'))\n"
+    "    try:\n"
+    "        with urllib.request.urlopen(call, timeout=60) as answer:\n"
+    "            status = answer.status\n"
+    "            answer.read(65536)\n"
+    "    except urllib.error.HTTPError as refused:\n"
+    "        status = refused.code\n"
+    "        refused.read(65536)\n"
+    "    except Exception as error:\n"
+    "        print(json.dumps({'path': request['path'], 'error': str(error)[:300]}))\n"
+    "        sys.exit(1)\n"
+    "    done.append({'method': request.get('method', 'GET'),\n"
+    "                 'path': request['path'], 'status': status})\n"
+    "print(json.dumps(done))\n"
+)
+
+
+def _run_setup(
+    container: str, port: int, requests: list[dict[str, Any]],
+    image: str = sidecar.BASE_IMAGE, inputs: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Put one build into the state the effect needs, before the script runs.
+
+    It runs from the same kind of sidecar as the script and over HTTP, which
+    is what a seeding route is, and it is deliberately not part of the script:
+    the deliverable CVELab proves has to stay byte for byte the one the
+    operator receives.
+
+    A request that cannot be reached at all stops the proof. An unseeded
+    instance answers the attack with nothing to show, which is
+    indistinguishable from a fixed one, so a silent failure here would report
+    the fixed build's own behaviour for both and call it a differential.
+    """
+    completed = subprocess.run(
+        [
+            "docker", "run", "--rm", "--network", f"container:{container}",
+            "--security-opt", "no-new-privileges:true",
+            *runtime_flags(),
+            "-e", f"CVELAB_BASE=http://127.0.0.1:{port}",
+            "-e", "CVELAB_SETUP=" + json.dumps(requests),
+            "-e", "CVELAB_INPUTS=" + json.dumps(inputs or {}),
+            image, "python", "-c", _SETUP_RUNNER,
+        ],
+        capture_output=True, text=True, timeout=300, check=False,
+    )
+    tail = completed.stdout.strip().splitlines()[-1:] or [""]
+    try:
+        reported = json.loads(tail[0])
+    except json.JSONDecodeError:
+        reported = None
+    if completed.returncode != 0:
+        detail = reported if reported is not None else (
+            completed.stderr or completed.stdout
+        ).strip()[-600:]
+        raise RuntimeError(f"setup did not run against this build: {detail}")
+    return {"requests": reported if isinstance(reported, list) else []}
 
 
 def _run_field_script(
@@ -2397,6 +2508,7 @@ def prove_manual_poc(
         # runs, and the proof reported "did not finish against both builds" --
         # true, and useless. A service that went away is named.
         runs = {}
+        seeded: dict[str, Any] = {}
         for name, cid in containers.items():
             if not _still_serving(cid, port):
                 return {
@@ -2405,6 +2517,8 @@ def prove_manual_poc(
                               "before the script ran, so nothing was observed against it",
                     "service_logs": {name: _container_logs(cid)},
                 }
+            if spec.get("setup"):
+                seeded[name] = _run_setup(cid, port, spec["setup"], image, inputs)
             runs[name] = _run_field_script(
                 cid, port, script, spec.get("transport", "http"), image, inputs
             )
@@ -2439,6 +2553,10 @@ def prove_manual_poc(
         "observable_effect": spec["observable_effect"],
         "container_port": port,
         "fixed_build_compared": patched is not None,
+        # Said out loud wherever the outcome is read: the script was proved
+        # against instances CVELab put into a state first, and the operator's
+        # target has to be in that state too.
+        **({"setup_applied": seeded} if seeded else {}),
         "proof_checks": checks,
         "runs": {
             name: {key: run[key] for key in ("observed", "ran", "verdict", "exit_code")}
@@ -2764,6 +2882,19 @@ def _manual_poc_guide(cve: str, spec: dict[str, Any], plan: dict[str, Any], port
             "before writing it here. It observed the effect on the vulnerable build and\n"
             "stayed silent on the fixed one. A script that fired on both would be watching\n"
             "normal behaviour rather than the bug, and would not have been written."
+        )
+    if spec.get("setup"):
+        # Said where the operator will read it. The lab was empty, so CVELab
+        # put the object there before proving the script; a target that holds
+        # no such object will report nothing, and that is not a clean bill.
+        trust += (
+            "\n\nThe lab started empty, so CVELab created what the weakness acts on "
+            "before\neach run, through the lab's own setup route, and on both builds "
+            "alike. That\nsetup is not in this script and does not need to be: an "
+            "instance in use\nalready holds objects of that kind. What it does mean is "
+            "that a target\nholding none will report NOT_OBSERVED whether or not it is "
+            "vulnerable, so\nread a silent run against an empty instance as nothing "
+            "learned."
         )
     return f"""# {cve} Manual PoC
 
@@ -3133,6 +3264,15 @@ _DRAFT_INSTRUCTIONS = (
     "or an OAuth state returned by a POST, extracted and then used by the probe. An effect "
     "that needs that handoff is expressible, and is not a reason to answer "
     "feasible=false.\n"
+    "  setup: a short list of requests, at most ten, run against each build before the "
+    "script and never shipped with it. This is how the effect gets something to act on: "
+    "the lab is empty, so where its validator seeded a document, an account, a file or a "
+    "setting -- usually through a route the lab added for itself, which you can see in the "
+    "validator source -- put those same calls here. They are HTTP whatever the probe "
+    "speaks, they may fill in inputs, and they run on the vulnerable and the fixed build "
+    "alike, so what they create cannot be what tells the two apart. Use setup for the "
+    "precondition and the spec's own probe for the attack; a spec whose setup performs the "
+    "attack proves nothing.\n"
     "  Whenever the spec declares inputs, put values that work against this lab in "
     "lab_values_json, a JSON object string mapping each input name to a value -- the "
     "account the lab seeds, the id of the object its validator uses, the credential its "
