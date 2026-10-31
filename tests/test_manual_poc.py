@@ -1485,6 +1485,29 @@ class SetupPutsTheLabInTheStateTheEffectNeedsTests(unittest.TestCase):
         self.assertIs(outcome["shipped"], False)
         self.assertIn("setup did not run", outcome["reason"])
 
+    def test_an_empty_discovery_tells_the_next_draft_what_it_means(self) -> None:
+        """Payload's spec was right twice and repeated unchanged twice.
+
+        "check spec: nothing to test on this target" was in front of the
+        model both times, and nothing said that it meant the lab was
+        unseeded.
+        """
+        said = field._spec_complaint({
+            "reason": "the script did not tell the two builds apart",
+            "output": {"vulnerable": {
+                "stderr": "check    spec: nothing to test on this target\n0 finding(s)",
+                "tail": "NOT_OBSERVED",
+            }},
+        })
+        self.assertIn("the lab is empty", said)
+        self.assertIn("setup", said)
+        self.assertIn("keep the discovery step", said)
+        # Nothing of the sort where the script did reach something.
+        plain = field._spec_complaint({
+            "reason": "x", "output": {"vulnerable": {"stderr": "0 finding(s)", "tail": ""}},
+        })
+        self.assertNotIn("the lab is empty", plain)
+
     def test_the_guide_says_a_silent_run_on_an_empty_target_proves_nothing(self) -> None:
         guide = field._manual_poc_guide(
             "CVE-2026-0001", field.validate_spec(self._spec()), {"repository": "r"}, 3000

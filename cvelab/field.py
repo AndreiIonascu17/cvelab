@@ -2607,6 +2607,18 @@ def _spec_complaint(outcome: dict[str, Any]) -> str:
             part.strip() for part in (run.get("stderr", ""), run.get("tail", "")) if part
         )
         lines.append(f"Against the {name} build it printed: {said[-600:]}")
+    if "nothing to test on this target" in json.dumps(outcome.get("output") or {}):
+        # The discovery chain came back empty, which on these builds means the
+        # instance holds nothing of the kind the spec went looking for. Said
+        # outright, because the first two specs that hit this were correct and
+        # the next draft repeated them unchanged.
+        lines.append(
+            "A discovery step found nothing, so this instance holds no object of the "
+            "kind the spec looked for: the lab is empty except for what its own "
+            "validator seeds before attacking. Put those same seeding calls in setup, "
+            "and keep the discovery step -- it is what makes the script work against a "
+            "real target, which does hold such objects."
+        )
     lines.append(
         "The effect is real -- the lab's own validator proves it -- so the spec was "
         "wrong, not the finding. Check the request path, the port, the protocol "
@@ -3290,6 +3302,10 @@ _DRAFT_INSTRUCTIONS = (
     "  health_timeout, in seconds, is how long to wait for the service to answer before the "
     "script runs. Leave it out unless the project is slow to start, such as something that "
     "boots a JVM or runs migrations first.\n\n"
+    "Read validator_that_proved_it for what the lab had to do before it attacked. Where it "
+    "calls a route to create a document, an account, a file or a setting first, those calls "
+    "belong in setup, or the proof runs against an empty instance and your spec finds "
+    "nothing on either build.\n\n"
     "Read what_the_lab_simulated before you answer. A harness that stands in for an "
     "application route is fine -- the weakness is still reached through it, and a real "
     "deployment has its own route of that shape. A harness that reports the effect is not: "
