@@ -1379,3 +1379,115 @@ class LabValuesLetAnInputSpecBeProvedTests(unittest.TestCase):
             held = field._proven_spec(lab_dir)
         self.assertIsNotNone(held)
         self.assertEqual(held[2], {"account": "seeded-user"})
+
+
+class SetupPutsTheLabInTheStateTheEffectNeedsTests(unittest.TestCase):
+    """The lab is empty, and a weakness needs something to act on.
+
+    Payload drafted a correct spec -- discover the document its access rule
+    protects, reorder it, expect 200 -- and found nothing on either build.
+    The document exists only after the lab's own /lab/seed route is called,
+    which its validator does and the manual proof did not. The same happened
+    to a file-transfer lab whose effect needs an admin filter and a denied
+    file. Both were recorded as "the script did not tell the two builds
+    apart", which was true and nobody's fault but ours.
+    """
+
+    def _spec(self, **extra: Any) -> dict[str, Any]:
+        spec = {
+            "strategy": "direct_observation",
+            "observable_effect": "an unauthenticated reorder of a protected document",
+            "setup": [{"method": "POST", "path": "/lab/seed",
+                       "body": {"title": "Fixed position"}}],
+            "probe": [{"method": "POST", "path": "/api/reorder"}],
+            "expect": {"status": 200},
+        }
+        spec.update(extra)
+        return spec
+
+    def test_it_validates_and_keeps_the_requests(self) -> None:
+        spec = field.validate_spec(self._spec())
+        self.assertEqual(spec["setup"][0]["path"], "/lab/seed")
+        # A JSON body is serialised the same way a probe's is.
+        self.assertEqual(spec["setup"][0]["body"], '{"title": "Fixed position"}')
+
+    def test_it_may_use_the_operator_s_inputs_and_nothing_else(self) -> None:
+        spec = field.validate_spec(self._spec(
+            inputs=["admin_auth"],
+            setup=[{"method": "POST", "path": "/lab/seed",
+                    "headers": {"Authorization": "{{admin_auth}}"}}],
+        ))
+        self.assertIn("{{admin_auth}}", json.dumps(spec["setup"]))
+        with self.assertRaises(ValueError) as refused:
+            field.validate_spec(self._spec(
+                setup=[{"method": "POST", "path": "/lab/seed/{{whatever}}"}]
+            ))
+        self.assertIn("nothing binds", str(refused.exception))
+
+    def test_a_long_list_is_a_workflow_and_not_a_precondition(self) -> None:
+        with self.assertRaises(ValueError):
+            field.validate_spec(self._spec(
+                setup=[{"method": "GET", "path": f"/s/{i}"} for i in range(11)]
+            ))
+        with self.assertRaises(ValueError):
+            field.validate_spec(self._spec(setup=[]))
+
+    def test_the_deliverable_never_carries_it(self) -> None:
+        """A script pointed at a real server must not call a seeding route."""
+        script = field.emit_field_poc("CVE-2026-0001", field.validate_spec(self._spec()))
+        self.assertNotIn("/lab/seed", script)
+        self.assertNotIn("setup", json.loads(
+            script.split('SPEC = json.loads(r"""', 1)[1].split('""")', 1)[0]
+        ))
+
+    def test_it_runs_against_both_builds_before_the_script(self) -> None:
+        order: list[str] = []
+        spec = field.validate_spec(self._spec())
+        with _lab() as lab_dir, mock.patch.object(
+            field, "_service_container", side_effect=lambda c, name, d, e: f"cid-{name}",
+        ), mock.patch.object(field, "_still_serving", return_value=True), \
+             mock.patch.object(field.sidecar, "ensure_image", return_value="img"), \
+             mock.patch.object(
+                 field, "_run_setup",
+                 side_effect=lambda cid, *a, **k: (
+                     order.append(f"setup:{cid}"), {"requests": [{"status": 201}]})[1],
+             ), mock.patch.object(
+                 field, "_run_field_script",
+                 side_effect=lambda cid, *a, **k: (
+                     order.append(f"script:{cid}"), _run(observed=cid.endswith("vulnerable"),
+                                                         ran=True))[1],
+             ):
+            outcome = field.prove_manual_poc(
+                "CVE-2026-0001", spec, 3000, lab_dir, ["docker", "compose"], {},
+                {}, True, None,
+            )
+        self.assertEqual(order, ["setup:cid-vulnerable", "script:cid-vulnerable",
+                                 "setup:cid-patched", "script:cid-patched"])
+        self.assertIs(outcome["shipped"], True)
+        # Readable in the record: the script was proved against seeded builds.
+        self.assertEqual(set(outcome["setup_applied"]), {"vulnerable", "patched"})
+
+    def test_a_setup_that_cannot_run_stops_the_proof(self) -> None:
+        """An unseeded instance answers like a fixed one, so silence here lies."""
+        with _lab() as lab_dir, mock.patch.object(
+            field, "_service_container", return_value="cid",
+        ), mock.patch.object(field, "_still_serving", return_value=True), \
+             mock.patch.object(field.sidecar, "ensure_image", return_value="img"), \
+             mock.patch.object(
+                 field, "_run_setup",
+                 side_effect=RuntimeError("setup did not run against this build: refused"),
+             ), mock.patch.object(field, "_run_field_script") as ran:
+            outcome = field.prove_manual_poc(
+                "CVE-2026-0001", field.validate_spec(self._spec()), 3000, lab_dir,
+                ["docker", "compose"], {}, {}, True, None,
+            )
+        ran.assert_not_called()
+        self.assertIs(outcome["shipped"], False)
+        self.assertIn("setup did not run", outcome["reason"])
+
+    def test_the_guide_says_a_silent_run_on_an_empty_target_proves_nothing(self) -> None:
+        guide = field._manual_poc_guide(
+            "CVE-2026-0001", field.validate_spec(self._spec()), {"repository": "r"}, 3000
+        )
+        self.assertIn("started empty", guide)
+        self.assertIn("nothing learned", guide)
