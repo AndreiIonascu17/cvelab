@@ -1514,3 +1514,59 @@ class SetupPutsTheLabInTheStateTheEffectNeedsTests(unittest.TestCase):
         )
         self.assertIn("started empty", guide)
         self.assertIn("nothing learned", guide)
+
+
+class SlowStartIsWaitedForAndNamedTests(unittest.TestCase):
+    """A lab that validated can still fail the proof's readiness probe.
+
+    A lab declaring no healthcheck says nothing about how long its
+    application takes, and its own validator does not need it to: PoC.py
+    retries in a loop of its own. Storybook took more than four minutes to
+    serve port 6006, and the proof gave up at 240s with "pass
+    --container-port for the port the service listens on" -- which was not
+    the problem and sent the next attempt looking in the wrong place.
+    """
+
+    def _bring_up(self, ready: bool, running: bool = True) -> str:
+        with mock.patch.object(field, "run_docker_stage"), \
+             mock.patch.object(field, "_service_container", return_value="cid"), \
+             mock.patch.object(field, "_wait_container_port", return_value=ready) as waited, \
+             mock.patch.object(field, "_is_running", return_value=running), \
+             mock.patch.object(field, "_container_logs", return_value="webpack built"):
+            try:
+                field._bring_up(
+                    ["vulnerable"], ["vulnerable"], 6006, 120, Path("/x"),
+                    ["docker", "compose"], "docker", {}, {"services": {"vulnerable": {}}},
+                )
+            except RuntimeError as refused:
+                self.waited = waited
+                return str(refused)
+        self.waited = waited
+        return ""
+
+    def test_a_service_with_no_healthcheck_gets_ten_minutes(self) -> None:
+        self._bring_up(ready=True)
+        self.assertEqual(self.waited.call_args.args[2], field._SLOW_START_TIMEOUT)
+        self.assertGreater(field._SLOW_START_TIMEOUT, 240)
+
+    def test_giving_up_names_the_cause_and_shows_the_output(self) -> None:
+        said = self._bring_up(ready=False)
+        self.assertIn("still running", said)
+        self.assertIn("listens on another port", said)
+        self.assertIn("webpack built", said)
+
+    def test_a_container_that_died_is_not_called_slow(self) -> None:
+        said = self._bring_up(ready=False, running=False)
+        self.assertIn("no longer running", said)
+        self.assertNotIn("slower than that", said)
+
+    def test_a_spec_may_still_ask_for_longer(self) -> None:
+        """health_timeout above the floor is the spec's own business."""
+        with mock.patch.object(field, "run_docker_stage"), \
+             mock.patch.object(field, "_service_container", return_value="cid"), \
+             mock.patch.object(field, "_wait_container_port", return_value=True) as waited:
+            field._bring_up(
+                ["vulnerable"], ["vulnerable"], 6006, 1200, Path("/x"),
+                ["docker", "compose"], "docker", {}, {"services": {"vulnerable": {}}},
+            )
+        self.assertEqual(waited.call_args.args[2], 1200)

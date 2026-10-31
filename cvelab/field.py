@@ -2332,6 +2332,21 @@ _PORT_READY = (
 )
 
 
+#: How long a service with no declared healthcheck is given to open its port.
+#: Measured against the thing that broke: a Storybook lab validated through
+#: its validator's own retry loop and then failed the manual proof's 240s
+#: probe, reported as "pass --container-port", which was not the problem.
+_SLOW_START_TIMEOUT = 600
+
+
+def _is_running(container: str) -> bool:
+    completed = subprocess.run(
+        ["docker", "inspect", "--format", "{{.State.Running}}", container],
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    return completed.stdout.strip() == "true"
+
+
 def _wait_container_port(container: str, port: int, timeout: int) -> bool:
     """Wait for a service to answer on its own port, from inside its namespace.
 
@@ -2420,14 +2435,25 @@ def _bring_up(
         )
     if waited:
         return
+    # A lab that declares no healthcheck says nothing about how long its
+    # application takes, and its own validator does not have to: it retries in
+    # a loop of its own, which is why a lab can validate and then fail here.
+    # Storybook took longer than four minutes to serve 6006, and the proof
+    # reported it as a wrong port. Waiting longer costs nothing when the
+    # service does come up, and the cause is named when it does not.
+    patience = max(timeout, _SLOW_START_TIMEOUT)
     for name in probe:
         container = _service_container(compose, name, lab_dir, environment)
         if not container:
             raise RuntimeError(f"{name} did not start")
-        if not _wait_container_port(container, port, timeout):
+        if not _wait_container_port(container, port, patience):
+            running = _is_running(container)
             raise RuntimeError(
-                f"{name} did not answer on port {port} within {timeout}s; "
-                "pass --container-port for the port the service listens on"
+                f"{name} did not answer on port {port} within {patience}s, and its "
+                + ("container is still running, so either the application is slower "
+                   "than that or it listens on another port"
+                   if running else "container is no longer running")
+                + f". Its last output was:\n{_container_logs(container)}"
             )
 
 
