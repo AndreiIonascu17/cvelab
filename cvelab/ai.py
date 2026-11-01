@@ -69,12 +69,37 @@ class ProviderDeclined(RuntimeError):
         self.provider = provider
         self.model = model
         self.detail = detail
+        # The policy area the provider named, kept apart from the prose: the
+        # explanation's text is documented as unstable, the category is not.
+        self.category = (
+            detail.get("category") if isinstance(detail, dict) else None
+        )
         # "refused structured generation" is kept in the text: older code and
         # logs search for it.
         super().__init__(
             f"{provider} refused structured generation: the provider declined the request "
             f"under its usage policy (model {model}): {detail}"
         )
+
+
+def fallback_model() -> str | None:
+    """The model a declined request is asked again on, if one is configured.
+
+    Anthropic's own guidance for integrators: a refusal arrives as a normal
+    answer with stop_reason "refusal" and a category, and the same request
+    sent to another model usually gets an answer. Every decline CVELab has
+    recorded -- seven of them -- came back under the category "cyber", which
+    the provider documents as one that "benign cybersecurity work can also
+    trigger". Claude Haiku has no server-side fallback, so this is the
+    client-side form the documentation points to.
+
+    It is off unless CVELAB_FALLBACK_MODEL names a model, because it changes
+    what a benchmark measures: a decline that a fallback answered is not the
+    same as a run that was never declined, and the usage record keeps both.
+    The request itself is never reworded.
+    """
+    named = os.getenv("CVELAB_FALLBACK_MODEL", "").strip()
+    return named or None
 
 
 class OutputBudgetExhausted(RuntimeError):
@@ -562,40 +587,60 @@ def structured_response(
 
     # Dispatch on the dialect, not the name: a provider that speaks one we
     # already handle needs no new request code.
-    def ask(budget: int, seconds: int) -> dict:
+    def ask(budget: int, seconds: int, which: str) -> dict:
         if provider.dialect == RESPONSES:
             return _openai_response(
-                api_key or "", model, instructions, input_text, schema, schema_name,
+                api_key or "", which, instructions, input_text, schema, schema_name,
                 budget, tools, include, seconds,
             )
         if provider.dialect == MESSAGES:
             return _anthropic_response(
-                api_key or "", model, instructions, input_text, schema,
+                api_key or "", which, instructions, input_text, schema,
                 budget, tools, seconds,
             )
         if provider.dialect == CHAT_COMPLETIONS:
             return _chat_completions_response(
-                selected, api_key, base_url, model, instructions, input_text,
+                selected, api_key, base_url, which, instructions, input_text,
                 schema, schema_name, budget, seconds,
             )
         raise RuntimeError(f"No handler for dialect {provider.dialect!r}")
 
-    for escalation in range(OUTPUT_ESCALATIONS + 1):
-        try:
-            result = ask(max_output_tokens, timeout)
-            break
-        except OutputBudgetExhausted:
-            if escalation == OUTPUT_ESCALATIONS or ceiling is None or max_output_tokens >= ceiling:
-                raise
-            larger = min(max_output_tokens * 2, ceiling)
-            # A non-streaming answer arrives whole, so twice the tokens can
-            # take twice the time.
-            timeout = timeout * larger // max_output_tokens
-            progress.step(
-                f"{get_provider(selected).label} ran out of output at {max_output_tokens} tokens; "
-                f"asking again with {larger}"
-            )
-            max_output_tokens = larger
+    def attempt(which: str) -> dict:
+        nonlocal max_output_tokens, timeout
+        for escalation in range(OUTPUT_ESCALATIONS + 1):
+            try:
+                return ask(max_output_tokens, timeout, which)
+            except OutputBudgetExhausted:
+                if (escalation == OUTPUT_ESCALATIONS or ceiling is None
+                        or max_output_tokens >= ceiling):
+                    raise
+                larger = min(max_output_tokens * 2, ceiling)
+                # A non-streaming answer arrives whole, so twice the tokens
+                # can take twice the time.
+                timeout = timeout * larger // max_output_tokens
+                progress.step(
+                    f"{get_provider(selected).label} ran out of output at "
+                    f"{max_output_tokens} tokens; asking again with {larger}"
+                )
+                max_output_tokens = larger
+        raise RuntimeError("unreachable: the escalation loop returns or raises")
+
+    try:
+        result = attempt(model)
+    except ProviderDeclined as declined:
+        usage.note_decline(getattr(declined, "category", None))
+        other = fallback_model()
+        if not other or other == model:
+            raise
+        # The same request, on another model, which is what the provider's
+        # own documentation tells integrators to do with a refusal. Not a
+        # reword: the instructions and the input are byte for byte the ones
+        # that were declined.
+        progress.step(
+            f"{get_provider(selected).label} declined the request on {model}; asking "
+            f"{other}, which CVELAB_FALLBACK_MODEL names"
+        )
+        result = attempt(other)
     _validate_schema(result, schema)
     return result
 

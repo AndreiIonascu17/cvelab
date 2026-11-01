@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import upload
-from .ai import _local_base_url, _provider_key, resolve_provider
+from .ai import _local_base_url, _provider_key, fallback_model, resolve_provider
 from .core import docker_environment
 from .providers import auth_headers_for, base_url_for, require_private_transport
 from .providers import get as get_provider
@@ -227,7 +227,14 @@ def check_provider_config(provider: str | None, model: str | None,
         return Check("ai provider", FAIL, f"{selected}: no API key",
                      f"Pass --key, or set {variable}.")
     # The key itself is never echoed, here or anywhere else.
-    return Check("ai provider", OK, f"{selected} {selected_model}, key present")
+    detail = f"{selected} {selected_model}, key present"
+    other = fallback_model()
+    if other:
+        detail += (
+            f"; a request this one declines is asked again on {other} "
+            "(CVELAB_FALLBACK_MODEL)"
+        )
+    return Check("ai provider", OK, detail)
 
 
 def check_provider_reachable(provider: str | None, api_key: str | None,

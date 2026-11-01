@@ -15,12 +15,14 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
-from cvelab import upload
+from cvelab import ai, upload, usage
 from cvelab.ai import ProviderDeclined, structured_response
 from cvelab.autoflow import run_auto_workflow
 
@@ -111,3 +113,88 @@ class OutcomeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FallbackModelTests(unittest.TestCase):
+    """A declined request may be asked again on another model, never reworded.
+
+    Every decline CVELab has recorded -- seven -- came back under the
+    category "cyber", which the provider documents as one that "benign
+    cybersecurity work can also trigger". Its guidance for integrators is
+    that the same request sent to another model usually gets an answer, and
+    Claude Haiku has no server-side fallback, so the retry is the client's
+    to make. It stays off unless a model is named, because a decline a
+    fallback answered is not the same measurement as a run never declined.
+    """
+
+    def setUp(self) -> None:
+        usage.reset()
+
+    def _ask(self, answers: list[object], fallback: str | None) -> tuple[Any, list[str]]:
+        asked: list[str] = []
+
+        def anthropic(key, model, instructions, text, schema, budget, tools, seconds):
+            asked.append(model)
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        environment = {"CVELAB_FALLBACK_MODEL": fallback} if fallback else {}
+        with mock.patch.dict(os.environ, environment, clear=False), \
+             mock.patch.object(ai, "_anthropic_response", anthropic):
+            if not fallback:
+                os.environ.pop("CVELAB_FALLBACK_MODEL", None)
+            try:
+                return ai.structured_response(
+                    api_key="k", model="claude-haiku-5-5", provider="anthropic",
+                    instructions="i", input_text="t",
+                    schema={"type": "object", "properties": {}, "required": []},
+                    schema_name="s", max_output_tokens=100,
+                ), asked
+            except ai.ProviderDeclined:
+                return None, asked
+
+    def _declined(self) -> ai.ProviderDeclined:
+        return ai.ProviderDeclined(
+            "Anthropic", "claude-haiku-5-5",
+            {"type": "refusal", "category": "cyber", "explanation": "..."},
+        )
+
+    def test_without_one_configured_the_decline_stands(self) -> None:
+        answered, asked = self._ask([self._declined()], fallback=None)
+        self.assertIsNone(answered)
+        self.assertEqual(asked, ["claude-haiku-5-5"])
+
+    def test_with_one_configured_the_same_request_goes_to_it(self) -> None:
+        answered, asked = self._ask(
+            [self._declined(), {}], fallback="claude-sonnet-5-5"
+        )
+        self.assertEqual(answered, {})
+        self.assertEqual(asked, ["claude-haiku-5-5", "claude-sonnet-5-5"])
+
+    def test_a_fallback_that_also_declines_is_the_answer(self) -> None:
+        answered, asked = self._ask(
+            [self._declined(), self._declined()], fallback="claude-sonnet-5-5"
+        )
+        self.assertIsNone(answered)
+        self.assertEqual(len(asked), 2)
+
+    def test_the_same_model_is_not_asked_twice(self) -> None:
+        answered, asked = self._ask([self._declined()], fallback="claude-haiku-5-5")
+        self.assertIsNone(answered)
+        self.assertEqual(asked, ["claude-haiku-5-5"])
+
+    def test_the_decline_is_counted_whether_or_not_it_was_answered(self) -> None:
+        self._ask([self._declined(), {}], fallback="claude-sonnet-5-5")
+        self.assertEqual(usage.as_dict()["declines"], ["cyber"])
+
+    def test_the_category_travels_with_the_refusal(self) -> None:
+        self.assertEqual(self._declined().category, "cyber")
+        self.assertIsNone(
+            ai.ProviderDeclined("Anthropic", "m", "a string instead").category
+        )
+
+    def test_a_run_with_no_decline_says_nothing_about_declines(self) -> None:
+        self._ask([{}], fallback=None)
+        self.assertNotIn("declines", usage.as_dict())
