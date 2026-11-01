@@ -699,6 +699,20 @@ def validate_spec(spec: Any) -> dict[str, Any]:
     else:
         out["checks"] = [_validate_check(spec, strategy, "spec", transport, inputs)]
 
+    if transport in WS_TRANSPORTS:
+        # The handshake is filled from what a check binds, so a name it uses
+        # has to be bound by every check -- otherwise the upgrade goes out
+        # with the literal {{name}} in it, which is what Storybook refused.
+        wanted = _substitutions(json.dumps([out["ws_path"], out["ws_headers"]]))
+        for index, check in enumerate(out["checks"]):
+            available = set(inputs) | {step["bind"] for step in check["discover"]}
+            missing = wanted - available - set(_TARGET_TOKENS)
+            if missing:
+                raise ValueError(
+                    f"ws_path and ws_headers use names checks[{index}] does not bind: "
+                    f"{sorted(missing)}; bind them in that check's discover or declare "
+                    "them in inputs"
+                )
     if spec.get("setup") is not None:
         # Run against each build before the script, and never shipped. A lab
         # starts empty, so the object a weakness acts on is put there by the
@@ -965,7 +979,7 @@ class Target:
             return last
         return self.exchange(messages)
 
-    def exchange(self, messages):
+    def exchange(self, messages, ctx=None):
         """Run one sequence and return (status, text, headers) for the proof.
 
         Over HTTP each request stands alone and the last response is what is
@@ -980,7 +994,7 @@ class Target:
                 last = self.send(message)
             return last
         if self.transport in ("ws", "wss"):
-            return self._ws_exchange(messages)
+            return self._ws_exchange(messages, ctx)
         if self.transport == "ssh":
             return (0, self._ssh_exchange(messages), {})
         if self.transport == "smb":
@@ -1112,7 +1126,7 @@ class Target:
     #: What RFC 6455 says a server must echo back, hashed with the key.
     _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-    def _ws_exchange(self, messages):
+    def _ws_exchange(self, messages, ctx=None):
         """Upgrade, then talk in frames, over one connection.
 
         The handshake is ordinary HTTP and the framing is a documented wire
@@ -1150,9 +1164,14 @@ class Target:
                 "Sec-WebSocket-Version": "13",
                 "User-Agent": "CVELab-Field-PoC/1.0",
             }
-            headers.update(_subst(SPEC.get("ws_headers") or {}, self.inputs))
+            # Filled like a request, because that is what it is: the token a
+            # discovery step read has to reach the upgrade, and an Origin the
+            # server should reject is often the target's own address. Sent
+            # literally, {{token}} went on the wire as six characters and
+            # Storybook refused the upgrade on both builds.
+            headers.update(self.fill(SPEC.get("ws_headers") or {}, ctx or {}))
             request = "GET %s HTTP/1.1\r\n%s\r\n\r\n" % (
-                SPEC.get("ws_path", "/"),
+                self.fill(SPEC.get("ws_path", "/"), ctx or {}),
                 "\r\n".join("%s: %s" % kv for kv in headers.items()),
             )
             sock.settimeout(self.timeout)
@@ -1516,8 +1535,8 @@ def discover(target, steps):
 
 
 def _run_inband(target, check, ctx, show_bodies, findings):
-    probe = target.exchange(target.fill(check["probe"], ctx))
-    control = target.exchange(target.fill(check["control"], ctx))
+    probe = target.exchange(target.fill(check["probe"], ctx), ctx)
+    control = target.exchange(target.fill(check["control"], ctx), ctx)
     probe_tokens = tokens(probe, check["extract"])
     control_tokens = set(tokens(control, check["extract"]))
     seen = set()
@@ -1535,8 +1554,8 @@ def _run_inband(target, check, ctx, show_bodies, findings):
 def _run_marker(target, check, ctx, show_bodies, findings):
     marker = "cvelab-" + uuid.uuid4().hex[:16]
     local = dict(ctx); local["marker"] = marker
-    target.exchange(target.fill(check["probe"], local))
-    obs_status, obs_body, _ = target.exchange(target.fill(check["observe"], local))
+    target.exchange(target.fill(check["probe"], local), local)
+    obs_status, obs_body, _ = target.exchange(target.fill(check["observe"], local), local)
     needle = str(check["match"].get("body_contains", "{{marker}}")).replace("{{marker}}", marker)
     if needle in obs_body:
         print("  [REFLECTED] marker %s surfaced via %s (status=%s)" % (marker, check["label"], obs_status))
@@ -1554,7 +1573,7 @@ def _run_direct(target, check, ctx, show_bodies, findings):
     something is that this response came back at all, and that the same
     request against a fixed build does not produce it.
     """
-    response = target.exchange(target.fill(check["probe"], ctx))
+    response = target.exchange(target.fill(check["probe"], ctx), ctx)
     status, body, _ = response
     expect = check["expect"]
     found = []
@@ -1590,7 +1609,7 @@ def _run_oob(target, check, ctx, show_bodies, findings):
     local["callback"] = target.callback
     target.collector.clear()
     try:
-        target.exchange(target.fill(check["probe"], local))
+        target.exchange(target.fill(check["probe"], local), local)
     except SystemExit as stopped:
         # The probe itself failing is not a negative result: nothing was
         # asked of the target, so say so rather than report silence.
