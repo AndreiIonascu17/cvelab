@@ -1887,6 +1887,7 @@ _SETUP_RUNNER = (
 def _run_setup(
     container: str, port: int, requests: list[dict[str, Any]],
     image: str = sidecar.BASE_IMAGE, inputs: dict[str, str] | None = None,
+    host: str = "127.0.0.1",
 ) -> dict[str, Any]:
     """Put one build into the state the effect needs, before the script runs.
 
@@ -1905,7 +1906,7 @@ def _run_setup(
             "docker", "run", "--rm", "--network", f"container:{container}",
             "--security-opt", "no-new-privileges:true",
             *runtime_flags(),
-            "-e", f"CVELAB_BASE=http://127.0.0.1:{port}",
+            "-e", f"CVELAB_BASE=http://{host}:{port}",
             "-e", "CVELAB_SETUP=" + json.dumps(requests),
             "-e", "CVELAB_INPUTS=" + json.dumps(inputs or {}),
             image, "python", "-c", _SETUP_RUNNER,
@@ -1928,6 +1929,7 @@ def _run_setup(
 def _run_field_script(
     container: str, port: int, script: str, transport: str = "http",
     image: str = sidecar.BASE_IMAGE, inputs: dict[str, str] | None = None,
+    host: str = "127.0.0.1",
 ) -> dict[str, Any]:
     """Run the emitted field PoC from a sidecar sharing the lab's network.
 
@@ -1958,7 +1960,7 @@ def _run_field_script(
             # A socket PoC takes a host and a port and refuses a URL, so the
         # form the sidecar passes has to follow the spec's transport.
         "-e", "CVELAB_BASE=" + (
-            f"http://127.0.0.1:{port}" if transport == "http" else f"127.0.0.1:{port}"
+            f"http://{host}:{port}" if transport == "http" else f"{host}:{port}"
         ),
             "-e", f"CVELAB_FIELD={script}",
             "-e", "CVELAB_INPUTS=" + json.dumps(inputs or {}),
@@ -2322,12 +2324,16 @@ def _service_container(
 _PORT_READY = (
     "import socket, sys, time\n"
     "port, deadline = int(sys.argv[1]), time.monotonic() + float(sys.argv[2])\n"
+    "hosts = sys.argv[3:] or ['127.0.0.1']\n"
     "while time.monotonic() < deadline:\n"
-    "    try:\n"
-    "        socket.create_connection(('127.0.0.1', port), timeout=3).close()\n"
-    "        raise SystemExit(0)\n"
-    "    except OSError:\n"
-    "        time.sleep(2)\n"
+    "    for host in hosts:\n"
+    "        try:\n"
+    "            socket.create_connection((host, port), timeout=3).close()\n"
+    "            print(host)\n"
+    "            raise SystemExit(0)\n"
+    "        except OSError:\n"
+    "            pass\n"
+    "    time.sleep(2)\n"
     "raise SystemExit(1)\n"
 )
 
@@ -2347,36 +2353,50 @@ def _is_running(container: str) -> bool:
     return completed.stdout.strip() == "true"
 
 
-def _wait_container_port(container: str, port: int, timeout: int) -> bool:
-    """Wait for a service to answer on its own port, from inside its namespace.
+def _reachable_address(container: str, port: int, timeout: int) -> str:
+    """Where this container answers, as the sidecar beside it reaches it.
 
     For a lab that declares no healthcheck, where `up --wait` returns as soon
     as the container is running and a probe would then race the application's
     own startup.
+
+    Loopback is tried first and is what nearly everything answers on. A
+    service that binds its own interface address instead is reached at that
+    address, which the sidecar shares the namespace for: Storybook 10.6.1
+    listens on 172.18.0.2:6006 and refuses 127.0.0.1, so a probe that only
+    knew loopback waited ten minutes and then called a running, listening
+    service dead. Returns the address, or "" when nothing answered.
     """
+    hosts = ["127.0.0.1", *(a for a in _container_address(container).split() if a)]
     completed = subprocess.run(
         [
             "docker", "run", "--rm", "--network", f"container:{container}",
             "--security-opt", "no-new-privileges:true",
             *runtime_flags(),
-            "python:3.13-alpine", "python", "-c", _PORT_READY, str(port), str(timeout),
+            "python:3.13-alpine", "python", "-c", _PORT_READY,
+            str(port), str(timeout), *hosts,
         ],
         capture_output=True, text=True, timeout=timeout + 60, check=False,
     )
-    return completed.returncode == 0
+    if completed.returncode != 0:
+        return ""
+    answered = completed.stdout.strip().splitlines()[-1:] or [""]
+    return answered[0].strip() or "127.0.0.1"
 
 
-def _still_serving(container: str, port: int) -> bool:
-    """Is this container still up and still answering on its port.
+def _still_serving(container: str, port: int) -> str:
+    """Where this container is still answering, or "" if it is not.
 
     Two questions, because they fail differently: a container that exited and
     one that is running but no longer listening both ruin a proof, and both
-    used to arrive as an unreachable target minutes later.
+    used to arrive as an unreachable target minutes later. The address comes
+    back with the answer, because the script and the setup have to be pointed
+    at whatever the service actually bound.
     """
     state = _docker("inspect", "--format", "{{.State.Running}}", container, check=False)
     if state.strip().lower() != "true":
-        return False
-    return _wait_container_port(container, port, 15)
+        return ""
+    return _reachable_address(container, port, 15)
 
 
 #: Terminal colour and cursor control. A dev server writes plenty of it, and
@@ -2446,7 +2466,7 @@ def _bring_up(
         container = _service_container(compose, name, lab_dir, environment)
         if not container:
             raise RuntimeError(f"{name} did not start")
-        if not _wait_container_port(container, port, patience):
+        if not _reachable_address(container, port, patience):
             running = _is_running(container)
             raise RuntimeError(
                 f"{name} did not answer on port {port} within {patience}s, and its "
@@ -2536,7 +2556,8 @@ def prove_manual_poc(
         runs = {}
         seeded: dict[str, Any] = {}
         for name, cid in containers.items():
-            if not _still_serving(cid, port):
+            where = _still_serving(cid, port)
+            if not where:
                 return {
                     "shipped": False,
                     "reason": f"the {name} service stopped answering on port {port} "
@@ -2544,9 +2565,9 @@ def prove_manual_poc(
                     "service_logs": {name: _container_logs(cid)},
                 }
             if spec.get("setup"):
-                seeded[name] = _run_setup(cid, port, spec["setup"], image, inputs)
+                seeded[name] = _run_setup(cid, port, spec["setup"], image, inputs, where)
             runs[name] = _run_field_script(
-                cid, port, script, spec.get("transport", "http"), image, inputs
+                cid, port, script, spec.get("transport", "http"), image, inputs, where
             )
     except Exception as error:  # noqa: BLE001 - the outcome is the report
         return {"shipped": False, "reason": f"{type(error).__name__}: {error}"[:600]}
@@ -3028,16 +3049,13 @@ def _demo_override(networks: list[str]) -> str:
 
 
 def _container_address(container: str) -> str:
-    """The container's own address on its first network, as the host reaches it."""
+    """The container's own addresses, space separated, nearest network first."""
     shown = _docker(
         "inspect", "--format",
         "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
         container, check=False,
     )
-    for candidate in shown.split():
-        if candidate:
-            return candidate
-    return ""
+    return " ".join(candidate for candidate in shown.split() if candidate)
 
 
 def run_demo_target(
@@ -3098,7 +3116,7 @@ def run_demo_target(
             lab_dir, compose, docker, environment, resolved,
         )
         container = _service_container(compose, "vulnerable", lab_dir, environment)
-        address = _container_address(container) if container else ""
+        address = _container_address(container).split(" ")[0] if container else ""
         if not address:
             raise RuntimeError("the vulnerable build started but has no address to reach")
     finally:
