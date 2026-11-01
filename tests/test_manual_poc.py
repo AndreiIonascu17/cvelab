@@ -1280,6 +1280,10 @@ class PromptSaysWhatTheValidatorAcceptsTests(unittest.TestCase):
             "derive", "query", "extract", "probe", "control", "observe",
             "match", "expect", "health_timeout", "send", "send_hex",
             "read_until", "container_port", "body_contains", "json_values",
+            # A crafted upload was the one thing a spec could not say, and
+            # three labs were refused over it.
+            "setup", "upload", "filename", "content_type", "tar_gz", "zip",
+            "base64", "lab_values_json",
         ):
             with self.subTest(key=key):
                 self.assertIn(key, field._DRAFT_INSTRUCTIONS)

@@ -53,6 +53,8 @@ it never observed.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import contextlib
 import json
 import os
@@ -196,12 +198,93 @@ def _validate_request(request: Any, where: str) -> dict[str, Any]:
         body = json.dumps(body)
     elif body is not None and not isinstance(body, str):
         raise ValueError(f"{where} body must be a string or a JSON object")
-    return {
+    out: dict[str, Any] = {
         "method": method,
         "path": path,
         "headers": {str(k): str(v) for k, v in headers.items()},
         "body": body,
     }
+    if request.get("upload") is not None:
+        if body is not None:
+            raise ValueError(f"{where} takes body or upload, not both")
+        out["upload"] = _validate_upload(request["upload"], f"{where}.upload")
+    return out
+
+
+#: Parts in one upload. A few: this is a form, not a filesystem.
+_MAX_UPLOAD_PARTS = 6
+
+#: What one part's content may be built from, besides a plain form field.
+_PART_CONTENT = ("text", "base64", "tar_gz", "zip")
+
+
+def _validate_upload(value: Any, where: str) -> list[dict[str, Any]]:
+    """A multipart/form-data body, with its file parts built at run time.
+
+    Three labs that reproduced were refused a manual PoC over this, the last
+    of them naming it outright: "the precondition needs a denied report.dat
+    uploaded through the user files API as multipart", and before it, "the
+    effect is a write of a gzip-compressed tar bundle ... a binary gzip
+    archive cannot be expressed faithfully". A crafted upload is a whole
+    class of weakness -- an archive that escapes its extraction root, a file
+    whose name or type a filter should have refused -- and it was the one
+    thing a spec could not say.
+    """
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{where} must be a non-empty list of parts")
+    if len(value) > _MAX_UPLOAD_PARTS:
+        raise ValueError(f"{where} may hold at most {_MAX_UPLOAD_PARTS} parts")
+    parts = []
+    for index, part in enumerate(value):
+        at = f"{where}[{index}]"
+        if not isinstance(part, dict):
+            raise ValueError(f"{at} must be an object")
+        name = str(part.get("name", "")).strip()
+        if not name:
+            raise ValueError(f"{at}.name must be the form field's name")
+        kinds = [kind for kind in _PART_CONTENT if part.get(kind) is not None]
+        if "value" in part and not kinds:
+            parts.append({"name": name, "value": str(part["value"])})
+            continue
+        if len(kinds) != 1:
+            raise ValueError(
+                f"{at} needs value for a form field, or exactly one of "
+                f"{', '.join(_PART_CONTENT)} for a file part"
+            )
+        kind = kinds[0]
+        built: dict[str, Any] = {
+            "name": name,
+            "filename": str(part.get("filename") or name),
+            "content_type": str(part.get("content_type") or "application/octet-stream"),
+            "kind": kind,
+        }
+        if kind == "text":
+            built["text"] = str(part["text"])
+        elif kind == "base64":
+            raw = str(part["base64"])
+            # Checked before the encoding is, because a marker here is the
+            # mistake worth naming: it would be sent as six literal
+            # characters inside the bytes, or refused as bad base64, and
+            # neither says what to do instead.
+            if _MARKER_TOKEN in raw:
+                raise ValueError(
+                    f"{at}.base64 cannot carry {_MARKER_TOKEN}; put the marker in a "
+                    "text, tar_gz or zip part, which are built at run time"
+                )
+            try:
+                base64.b64decode(raw, validate=True)
+            except (ValueError, binascii.Error) as error:
+                raise ValueError(f"{at}.base64 is not valid base64: {error}") from error
+            built["base64"] = raw
+        else:
+            files = part[kind]
+            if not isinstance(files, dict) or not files:
+                raise ValueError(f"{at}.{kind} must map a file name to its text")
+            if any(not str(n).strip() or not isinstance(t, str) for n, t in files.items()):
+                raise ValueError(f"{at}.{kind} names must be text and so must their contents")
+            built[kind] = {str(n): t for n, t in files.items()}
+        parts.append(built)
+    return parts
 
 
 def _validate_message(message: Any, where: str) -> dict[str, Any]:
@@ -761,8 +844,8 @@ Requests carry User-Agent: CVELab-Field-PoC/1.0, so the target's own logs can
 be matched to this run.
 """
 from __future__ import annotations
-import argparse, base64, hashlib, json, re, socket, socketserver, ssl, sys, threading, time
-import urllib.error, urllib.parse, urllib.request, uuid
+import argparse, base64, hashlib, io, json, re, socket, socketserver, ssl, sys, tarfile
+import threading, time, urllib.error, urllib.parse, urllib.request, uuid, zipfile
 
 # The spec travels as JSON text rather than as a Python literal. A bodyless
 # request carries "body": null, and null, true and false are not Python names:
@@ -803,6 +886,57 @@ def _reads_the_handshake(expect):
     if kind == "extract":
         kind = next(iter(expect["extract"] or {}), "")
     return kind in ("status", "header")
+
+
+def _archive(files, zipped):
+    """One archive built in memory from names and text.
+
+    A crafted archive is the attack itself for a whole class of weakness --
+    one that escapes its extraction root, overwrites a config it should not
+    reach, or carries a name a filter was supposed to refuse -- so the spec
+    says what goes in it and this builds it on the spot. Nothing is written
+    to disk, and the contents are filled in like any other request text, so
+    {{marker}} inside a file works.
+    """
+    raw = io.BytesIO()
+    if zipped:
+        with zipfile.ZipFile(raw, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, text in files.items():
+                archive.writestr(name, text)
+        return raw.getvalue()
+    with tarfile.open(fileobj=raw, mode="w:gz") as archive:
+        for name, text in files.items():
+            data = text.encode("utf-8")
+            entry = tarfile.TarInfo(name)
+            entry.size = len(data)
+            archive.addfile(entry, io.BytesIO(data))
+    return raw.getvalue()
+
+
+def _part_bytes(part):
+    kind = part["kind"]
+    if kind == "text":
+        return part["text"].encode("utf-8")
+    if kind == "base64":
+        return base64.b64decode(part["base64"])
+    return _archive(part[kind], kind == "zip")
+
+
+def multipart(parts):
+    """Encode one form, and say what Content-Type it needs."""
+    boundary = "cvelab" + uuid.uuid4().hex
+    chunks = []
+    for part in parts:
+        head = '--%s\r\nContent-Disposition: form-data; name="%s"' % (boundary, part["name"])
+        if "value" in part:
+            chunks.append((head + '\r\n\r\n' + part["value"] + '\r\n').encode("utf-8"))
+            continue
+        head += '; filename="%s"\r\nContent-Type: %s\r\n\r\n' % (
+            part["filename"], part["content_type"]
+        )
+        chunks.append(head.encode("utf-8") + _part_bytes(part) + b"\r\n")
+    chunks.append(("--%s--\r\n" % boundary).encode("utf-8"))
+    return b"".join(chunks), "multipart/form-data; boundary=" + boundary
 
 
 def tokens(response, extractor):
@@ -1377,9 +1511,14 @@ class Target:
         body = spec.get("body")
         headers = dict(spec.get("headers", {}))
         headers.setdefault("User-Agent", "CVELab-Field-PoC/1.0")
+        data = None if body is None else str(body).encode()
+        if spec.get("upload"):
+            data, content_type = multipart(spec["upload"])
+            if not any(name.lower() == "content-type" for name in headers):
+                headers["Content-Type"] = content_type
         req = urllib.request.Request(
             self.http_base + path,
-            data=None if body is None else str(body).encode(),
+            data=data,
             headers=headers,
             method=str(spec.get("method", "GET")).upper(),
         )
@@ -1826,11 +1965,35 @@ _SESSION_FOOTPRINT = (
 )
 
 
+#: Said when any request in the spec uploads something. "This run only
+#: reads" would otherwise be printed above a request that writes a file to
+#: the target, which is the opposite of what the operator needs to know.
+_UPLOAD_FOOTPRINT = (
+    "This run uploads a file the weakness is about. Where the target keeps what it is\n"
+    "given, that file stays until someone removes it; this script does not remove it,\n"
+    "so tell the owner what it is called and have it cleaned up.\n"
+)
+
+
 def _poc_footprint(spec: dict[str, Any]) -> str:
     text = _FOOTPRINTS[spec["strategy"]]
+    if _uploads(spec):
+        text += "\n" + _UPLOAD_FOOTPRINT
     if spec.get("transport") in HANDSHAKE_TRANSPORTS:
         text += "\n" + _SESSION_FOOTPRINT
     return text
+
+
+def _uploads(spec: dict[str, Any]) -> bool:
+    """Whether any request the script sends carries an upload."""
+    for check in spec.get("checks") or []:
+        for key in ("probe", "control", "observe"):
+            if any(request.get("upload") for request in check.get(key) or []):
+                return True
+        for step in check.get("discover") or []:
+            if any(request.get("upload") for request in step.get("query") or []):
+                return True
+    return False
 
 
 def emit_field_poc(
@@ -1870,7 +2033,8 @@ def emit_field_poc(
 
 
 _SETUP_RUNNER = (
-    "import json, os, sys, urllib.error, urllib.request\n"
+    "import base64, io, json, os, sys, tarfile, urllib.error, urllib.request, uuid\n"
+    "import zipfile\n"
     "base = os.environ['CVELAB_BASE']\n"
     "given = json.loads(os.environ.get('CVELAB_INPUTS') or '{}')\n"
     "host = base.split('://', 1)[-1]\n"
@@ -1882,10 +2046,47 @@ _SETUP_RUNNER = (
     "        text = text.replace('{{%s}}' % name, json.dumps(str(value))[1:-1])\n"
     "    request = json.loads(text)\n"
     "    body = request.get('body')\n"
+    "    headers = dict(request.get('headers') or {})\n"
+    "    data = None if body is None else str(body).encode()\n"
+    "    if request.get('upload'):\n"
+    "        boundary = 'cvelab' + uuid.uuid4().hex\n"
+    "        chunks = []\n"
+    "        for part in request['upload']:\n"
+    "            head = '--%s\\r\\nContent-Disposition: form-data; name=\"%s\"' % (\n"
+    "                boundary, part['name'])\n"
+    "            if 'value' in part:\n"
+    "                chunks.append((head + '\\r\\n\\r\\n' + part['value'] +\n"
+    "                               '\\r\\n').encode())\n"
+    "                continue\n"
+    "            head += '; filename=\"%s\"\\r\\nContent-Type: %s\\r\\n\\r\\n' % (\n"
+    "                part['filename'], part['content_type'])\n"
+    "            kind = part['kind']\n"
+    "            if kind == 'text':\n"
+    "                raw = part['text'].encode()\n"
+    "            elif kind == 'base64':\n"
+    "                raw = base64.b64decode(part['base64'])\n"
+    "            else:\n"
+    "                held = io.BytesIO()\n"
+    "                if kind == 'zip':\n"
+    "                    with zipfile.ZipFile(held, 'w', zipfile.ZIP_DEFLATED) as archive:\n"
+    "                        for name, text in part['zip'].items():\n"
+    "                            archive.writestr(name, text)\n"
+    "                else:\n"
+    "                    with tarfile.open(fileobj=held, mode='w:gz') as archive:\n"
+    "                        for name, text in part['tar_gz'].items():\n"
+    "                            entry = tarfile.TarInfo(name)\n"
+    "                            entry.size = len(text.encode())\n"
+    "                            archive.addfile(entry, io.BytesIO(text.encode()))\n"
+    "                raw = held.getvalue()\n"
+    "            chunks.append(head.encode() + raw + b'\\r\\n')\n"
+    "        chunks.append(('--%s--\\r\\n' % boundary).encode())\n"
+    "        data = b''.join(chunks)\n"
+    "        if not any(n.lower() == 'content-type' for n in headers):\n"
+    "            headers['Content-Type'] = 'multipart/form-data; boundary=' + boundary\n"
     "    call = urllib.request.Request(\n"
     "        base + request['path'],\n"
-    "        data=None if body is None else str(body).encode(),\n"
-    "        headers=request.get('headers') or {},\n"
+    "        data=data,\n"
+    "        headers=headers,\n"
     "        method=request.get('method', 'GET'))\n"
     "    try:\n"
     "        with urllib.request.urlopen(call, timeout=60) as answer:\n"
@@ -3297,11 +3498,9 @@ _DRAFT_INSTRUCTIONS = (
     "observe.\n"
     "  Over http a request is {\"method\": \"GET\", \"path\": \"/x\", \"headers\": {}, "
     "\"body\": null}, and each one stands alone. A body is text, or a JSON object or array "
-    "written as itself and serialised for you -- do not escape it into a string. What a body "
-    "cannot be is binary or a multipart upload: there is no way to express a crafted archive, "
-    "an image or a file part, so a finding whose attack is an upload of one belongs in "
-    "feasible=false, with the reason saying that is what it needs. Over tcp or tls a message "
-    "is instead "
+    "written as itself and serialised for you -- do not escape it into a string. A body is "
+    "not how a file is sent, though: an upload has its own key, below. Over tcp or tls a "
+    "message is instead "
     "{\"send\": \"<text, with \\r\\n where the protocol needs it>\", "
     "\"read_until\": \"<the reply delimiter>\"}, or send_hex with an even-length hex string "
     "when the framing is not text; a whole sequence shares one connection, so a protocol "
@@ -3355,6 +3554,18 @@ _DRAFT_INSTRUCTIONS = (
     "operator passes their own at run time. A value must be the kind of thing a real "
     "target also has, an id or a credential, never a route only the lab serves. Declaring "
     "an input and leaving its lab value out means the script cannot be proved at all.\n"
+    "  A request may upload instead of carrying a body, which is how a crafted file or "
+    "archive is sent: upload, a list of at most six parts. A form field is {\"name\": "
+    "\"<field>\", \"value\": \"<text>\"}. A file part is {\"name\": \"<field>\", "
+    "\"filename\": \"<name>\", \"content_type\": \"<type>\"} plus exactly one of: "
+    "text, for a file whose content is text; base64, for bytes you already have; tar_gz "
+    "or zip, each an object mapping a name inside the archive to its text, which the "
+    "script builds at run time. An archive that escapes its extraction root, a bundle "
+    "whose config the caller may not replace, a file whose name or type a filter should "
+    "have refused -- all of those are expressible this way, and {{marker}} works inside a "
+    "text, tar_gz or zip part because those are built per run. It cannot go in base64, "
+    "which is sent as it is. A setup request may upload too, which is how a precondition "
+    "that needs a file in place is met.\n"
     "  A spec may carry more than one check: checks, a non-empty list, each entry holding "
     "the strategy's own keys plus label, a short name that identifies it in the output. The "
     "keys of a single check may instead sit at the top level of the spec, which is the short "
