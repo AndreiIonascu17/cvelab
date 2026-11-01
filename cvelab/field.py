@@ -2838,6 +2838,18 @@ def prove_manual_poc(
             "the script did not observe the effect on the vulnerable build"
             if both_ran else "the script did not finish"
         )
+    elif both_ran and spec["strategy"] == "oob_callback" and not (
+        vulnerable["observed"] or patched["observed"]
+    ):
+        # Said in its own words, because for this strategy "did not tell them
+        # apart" means one specific thing: the script listened and nothing
+        # ever knocked. On the lab that prompted this, nothing could have --
+        # it recorded outbound HTTP in process instead of sending it.
+        outcome["reason"] = (
+            "nothing reached the script's own listener from either build, so the target "
+            "never made the outbound request the payload asked for -- check whether this "
+            "lab sends outbound traffic at all"
+        )
     else:
         outcome["reason"] = (
             "the script did not tell the two builds apart"
@@ -3587,7 +3599,15 @@ _DRAFT_INSTRUCTIONS = (
     "renders to observe a browser, does not exist on a stock instance, so a spec aimed at "
     "it would pass against the lab and mean nothing against a real server. When the only "
     "evidence is of that kind, or the project ships no listener of its own at all, answer "
-    "feasible=false and say which.\n\n"
+    "feasible=false and say which.\n"
+    "  That list also decides which strategies can work here at all, so read it against "
+    "the one you are about to choose. A lab that records outbound HTTP in process "
+    "instead of sending it -- one disclosed exactly that, a 'global fetch in-process "
+    "outbound recorder (no network)' -- can never make anything arrive at a listener, "
+    "so oob_callback cannot be proved against it however real the request forgery is. A "
+    "lab that simulated the browser renders nothing, so an effect only a page shows is "
+    "out of reach there. Say that in the reason instead of proposing a strategy whose "
+    "channel the lab replaced.\n\n"
     "What the lab had to seed is a different matter, and not a reason to answer "
     "feasible=false. A lab starts empty; an instance someone uses does not. So the lab "
     "created whatever the weakness acts on -- a project, a document and its id, an "

@@ -1643,3 +1643,52 @@ class ServiceOnItsOwnInterfaceIsReachedTests(unittest.TestCase):
             field._run_setup("cid", 6006, [{"method": "POST", "path": "/s"}],
                              "img", None, "172.18.0.2")
         self.assertEqual(sent, ["CVELAB_BASE=http://172.18.0.2:6006"] * 2)
+
+
+class BlindRunThatHeardNothingSaysSoTests(unittest.TestCase):
+    """For a callback strategy, "did not tell them apart" means one thing.
+
+    9router's SSRF was real and the drafted spec was right in principle: a
+    region value pointing at the script's listener, with the marker in the
+    path. Nothing arrived, because the lab replaced global fetch with an
+    in-process recorder and sent no traffic at all -- which it disclosed in
+    its own fidelity record. The proof said the script did not tell the two
+    builds apart, which was true and told nobody that the lab had no network
+    for the callback to come back over.
+    """
+
+    def _prove(self, strategy: str, observed: tuple[bool, bool]) -> dict[str, Any]:
+        spec = field.validate_spec({
+            "strategy": strategy,
+            "observable_effect": "the target fetches a URL the caller chose",
+            "probe": [{"method": "POST", "path": "/r",
+                       "body": {"region": "{{callback}}/{{marker}}"}}],
+        } if strategy == "oob_callback" else _spec())
+        with _lab() as lab_dir, mock.patch.object(
+            field, "_service_container", side_effect=lambda c, name, d, e: f"cid-{name}",
+        ), mock.patch.object(field, "_still_serving", return_value="127.0.0.1"), \
+             mock.patch.object(field.sidecar, "ensure_image", return_value="img"), \
+             mock.patch.object(
+                 field, "_run_field_script",
+                 side_effect=lambda cid, *a, **k: _run(
+                     observed=observed[0] if cid.endswith("vulnerable") else observed[1],
+                     ran=True,
+                 ),
+             ):
+            return field.prove_manual_poc(
+                "CVE-2026-0001", spec, 3000, lab_dir, ["docker", "compose"], {},
+                {}, True, None,
+            )
+
+    def test_a_blind_run_with_no_hit_names_the_listener(self) -> None:
+        outcome = self._prove("oob_callback", (False, False))
+        self.assertIn("nothing reached the script's own listener", outcome["reason"])
+        self.assertIn("outbound request", outcome["reason"])
+
+    def test_a_hit_on_both_builds_is_still_ordinary_behaviour(self) -> None:
+        outcome = self._prove("oob_callback", (True, True))
+        self.assertIn("did not tell the two builds apart", outcome["reason"])
+
+    def test_another_strategy_keeps_the_general_wording(self) -> None:
+        outcome = self._prove("inband_differential", (False, False))
+        self.assertIn("did not tell the two builds apart", outcome["reason"])
