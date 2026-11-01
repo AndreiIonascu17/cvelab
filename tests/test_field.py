@@ -17,14 +17,18 @@
 from __future__ import annotations
 
 import ast
+import base64
 import contextlib
+import io
 import json
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 import urllib.request
+import zipfile
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -1679,3 +1683,137 @@ class HandshakeIsFilledLikeARequestTests(unittest.TestCase):
         field.validate_spec(self._spec(
             discover=[], ws_path="/channel", ws_headers={"Origin": "http://{{targetHost}}"}
         ))
+
+
+class UploadIsExpressibleTests(unittest.TestCase):
+    """A crafted upload is the attack for a whole class of weakness.
+
+    Three labs that reproduced were refused a manual PoC over this, the last
+    of them outright: "the precondition needs a denied report.dat uploaded
+    through the user files API as multipart", and before it "the effect is a
+    write of a gzip-compressed tar bundle ... a binary gzip archive cannot be
+    expressed faithfully, and the {{marker}} cannot be placed inside the
+    bundle's config".
+    """
+
+    def _spec(self, upload: list[dict[str, Any]], **extra: Any) -> dict[str, Any]:
+        spec: dict[str, Any] = {
+            "strategy": "direct_observation",
+            "observable_effect": "a bundle the caller may not replace is replaced",
+            "probe": [{"method": "PUT", "path": "/v1/agent", "upload": upload}],
+            "expect": {"status": 200},
+        }
+        spec.update(extra)
+        return spec
+
+    def _marker_spec(self, upload: list[dict[str, Any]]) -> dict[str, Any]:
+        """The shape omnigent needed: the marker goes inside the archive."""
+        return {
+            "strategy": "marker_roundtrip",
+            "observable_effect": "a bundle the caller may not replace is replaced",
+            "probe": [{"method": "PUT", "path": "/v1/agent", "upload": upload}],
+            "observe": [{"method": "GET", "path": "/v1/agent"}],
+            "match": {"body_contains": "{{marker}}"},
+        }
+
+    def _parts(self, spec: dict[str, Any]) -> list[dict[str, Any]]:
+        return field.validate_spec(spec)["checks"][0]["probe"][0]["upload"]
+
+    def test_a_form_field_and_a_text_file_both_validate(self) -> None:
+        parts = self._parts(self._spec([
+            {"name": "path", "value": "/etc"},
+            {"name": "file", "filename": "report.dat", "text": "{{marker}}",
+             "content_type": "application/x-dat"},
+        ]))
+        self.assertEqual(parts[0], {"name": "path", "value": "/etc"})
+        self.assertEqual(parts[1]["kind"], "text")
+        self.assertEqual(parts[1]["content_type"], "application/x-dat")
+
+    def test_an_archive_is_described_rather_than_pasted(self) -> None:
+        parts = self._parts(self._marker_spec([
+            {"name": "bundle", "filename": "b.tar.gz",
+             "tar_gz": {"config.yaml": "mcpServers:\n  x: {{marker}}"}},
+        ]))
+        self.assertEqual(parts[0]["kind"], "tar_gz")
+        self.assertIn("config.yaml", parts[0]["tar_gz"])
+
+    def test_the_marker_belongs_where_it_can_be_substituted(self) -> None:
+        with self.assertRaises(ValueError) as refused:
+            self._parts(self._spec([
+                {"name": "f", "base64": base64.b64encode(b"{{marker}}").decode()},
+                {"name": "g", "base64": "{{marker}}"},
+            ]))
+        self.assertIn("cannot carry", str(refused.exception))
+
+    def test_rubbish_is_refused_with_the_reason(self) -> None:
+        for upload, said in (
+            ([], "non-empty"),
+            ([{"filename": "x"}], "name must be"),
+            ([{"name": "f"}], "exactly one of"),
+            ([{"name": "f", "text": "a", "base64": "YQ=="}], "exactly one of"),
+            ([{"name": "f", "base64": "not base64!"}], "valid base64"),
+            ([{"name": "f", "tar_gz": {}}], "map a file name"),
+            ([{"name": "f", "zip": {"a": 1}}], "must be text"),
+            ([{"name": f"f{i}"} for i in range(7)], "at most"),
+        ):
+            with self.subTest(upload=upload):
+                with self.assertRaises(ValueError) as refused:
+                    self._parts(self._spec(upload))
+                self.assertIn(said, str(refused.exception))
+
+    def test_a_body_and_an_upload_are_two_ways_to_say_one_thing(self) -> None:
+        with self.assertRaises(ValueError) as refused:
+            field.validate_spec(self._spec(
+                [{"name": "f", "text": "x"}],
+                probe=[{"method": "PUT", "path": "/v1/agent", "body": "{}",
+                        "upload": [{"name": "f", "text": "x"}]}],
+            ))
+        self.assertIn("not both", str(refused.exception))
+
+    def test_the_form_is_encoded_with_the_archive_inside_it(self) -> None:
+        spec = field.validate_spec(self._spec([
+            {"name": "bundle", "filename": "b.tar.gz",
+             "tar_gz": {"config.yaml": "token: cvelab-abc"}},
+            {"name": "path", "value": "/opt"},
+        ]))
+        script = field.emit_field_poc("CVE-2026-1", spec)
+        namespace: dict[str, Any] = {}
+        exec(compile(script, "<f>", "exec"), namespace)  # noqa: S102
+        body, content_type = namespace["multipart"](spec["checks"][0]["probe"][0]["upload"])
+        self.assertTrue(content_type.startswith("multipart/form-data; boundary=cvelab"))
+        boundary = content_type.split("boundary=", 1)[1]
+        self.assertIn(b'filename="b.tar.gz"', body)
+        self.assertIn(b'name="path"', body)
+        self.assertIn(b"/opt", body)
+        self.assertTrue(body.endswith(f"--{boundary}--\r\n".encode()))
+        # The archive in the body is a real one, and holds what the spec said.
+        start = body.index(b"application/octet-stream\r\n\r\n") + len(
+            b"application/octet-stream\r\n\r\n"
+        )
+        held = body[start:body.index(f"\r\n--{boundary}".encode(), start)]
+        with tarfile.open(fileobj=io.BytesIO(held), mode="r:gz") as archive:
+            self.assertEqual(archive.getnames(), ["config.yaml"])
+            member = archive.extractfile("config.yaml")
+            assert member is not None
+            self.assertEqual(member.read(), b"token: cvelab-abc")
+
+    def test_a_zip_is_a_real_zip(self) -> None:
+        spec = field.validate_spec(self._spec([
+            {"name": "f", "filename": "a.zip", "zip": {"../escape.txt": "out"}},
+        ]))
+        script = field.emit_field_poc("CVE-2026-1", spec)
+        namespace: dict[str, Any] = {}
+        exec(compile(script, "<f>", "exec"), namespace)  # noqa: S102
+        raw = namespace["_part_bytes"](spec["checks"][0]["probe"][0]["upload"][0])
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            self.assertEqual(archive.namelist(), ["../escape.txt"])
+
+    def test_the_run_says_it_leaves_a_file_behind(self) -> None:
+        """"This run only reads" over a request that writes one would lie."""
+        spec = field.validate_spec(self._spec([{"name": "f", "text": "x"}]))
+        self.assertIn("uploads a file", field._poc_footprint(spec))
+        plain = field.validate_spec({
+            "strategy": "direct_observation", "observable_effect": "x",
+            "probe": [{"method": "GET", "path": "/"}], "expect": {"status": 200},
+        })
+        self.assertNotIn("uploads a file", field._poc_footprint(plain))
