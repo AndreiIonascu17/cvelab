@@ -147,10 +147,11 @@ class ProofTests(unittest.TestCase):
             field, "_service_container",
             side_effect=lambda c, name, d, e: ids.get(name, ""),
         ), mock.patch.object(
-            field, "_still_serving", return_value=True
+            field, "_still_serving", return_value="127.0.0.1"
         ), mock.patch.object(
             field, "_run_field_script",
-            side_effect=lambda cid, port, script, transport, image, given: outcomes[cid],
+            side_effect=lambda cid, port, script, transport, image, given, host=None:
+                outcomes[cid],
         ):
             return field.prove_manual_poc(
                 "CVE-2026-0001", field.validate_spec(_spec()), 8000,
@@ -717,10 +718,11 @@ class NoFixedBuildTests(unittest.TestCase):
         with mock.patch.object(
             field, "_service_container", side_effect=lambda c, n, d, e: f"cid-{n}"
         ), mock.patch.object(
-            field, "_still_serving", return_value=True
+            field, "_still_serving", return_value="127.0.0.1"
         ), mock.patch.object(
             field, "_run_field_script",
-            side_effect=lambda cid, port, script, transport, image, given: _run(observed, True),
+            side_effect=lambda cid, port, script, transport, image, given, host=None:
+                _run(observed, True),
         ):
             return field.prove_manual_poc(
                 "CVE-2026-0001", field.validate_spec(spec), 8000, Path("/lab"),
@@ -757,10 +759,11 @@ class NoFixedBuildTests(unittest.TestCase):
             field, "_service_container",
             side_effect=lambda c, n, d, e: (seen.append(n), f"cid-{n}")[1],
         ), mock.patch.object(
-            field, "_still_serving", return_value=True
+            field, "_still_serving", return_value="127.0.0.1"
         ), mock.patch.object(
             field, "_run_field_script",
-            side_effect=lambda cid, port, script, transport, image, given: _run(True, True),
+            side_effect=lambda cid, port, script, transport, image, given, host=None:
+                _run(True, True),
         ):
             field.prove_manual_poc(
                 "CVE-2026-0001", field.validate_spec(_spec()), 8000, Path("/lab"),
@@ -981,12 +984,14 @@ class ServiceWentAwayTests(unittest.TestCase):
         with mock.patch.object(
             field, "_service_container", side_effect=lambda c, n, d, e: f"cid-{n}"
         ), mock.patch.object(
-            field, "_still_serving", side_effect=lambda cid, port: serving[cid]
+            field, "_still_serving",
+            side_effect=lambda cid, port: "127.0.0.1" if serving[cid] else ""
         ), mock.patch.object(
             field, "_container_logs", return_value="killed: out of memory"
         ), mock.patch.object(
             field, "_run_field_script",
-            side_effect=lambda cid, port, script, transport, image, given: _run(True, True),
+            side_effect=lambda cid, port, script, transport, image, given, host=None:
+                _run(True, True),
         ):
             return field.prove_manual_poc(
                 "CVE-2026-0001", field.validate_spec(_spec()), 8000, Path("/lab"),
@@ -1014,7 +1019,8 @@ class ServiceWentAwayTests(unittest.TestCase):
         with mock.patch.object(
             field, "_service_container", side_effect=lambda c, n, d, e: f"cid-{n}"
         ), mock.patch.object(
-            field, "_still_serving", side_effect=lambda cid, port: cid != "cid-vulnerable"
+            field, "_still_serving",
+            side_effect=lambda cid, port: "" if cid == "cid-vulnerable" else "127.0.0.1"
         ), mock.patch.object(field, "_container_logs", return_value=""), \
              mock.patch.object(
                  field, "_run_field_script",
@@ -1173,7 +1179,7 @@ class SampledSpecGetsASecondAskTests(unittest.TestCase):
         """The marker _prove_drafted_spec reads is set where the proof is run."""
         with _lab() as lab_dir, mock.patch.object(
             field, "_service_container", return_value="cid",
-        ), mock.patch.object(field, "_still_serving", return_value=True), \
+        ), mock.patch.object(field, "_still_serving", return_value="127.0.0.1"), \
              mock.patch.object(field.sidecar, "ensure_image", return_value="img"), \
              mock.patch.object(
                  field, "_run_field_script",
@@ -1445,7 +1451,7 @@ class SetupPutsTheLabInTheStateTheEffectNeedsTests(unittest.TestCase):
         spec = field.validate_spec(self._spec())
         with _lab() as lab_dir, mock.patch.object(
             field, "_service_container", side_effect=lambda c, name, d, e: f"cid-{name}",
-        ), mock.patch.object(field, "_still_serving", return_value=True), \
+        ), mock.patch.object(field, "_still_serving", return_value="127.0.0.1"), \
              mock.patch.object(field.sidecar, "ensure_image", return_value="img"), \
              mock.patch.object(
                  field, "_run_setup",
@@ -1471,7 +1477,7 @@ class SetupPutsTheLabInTheStateTheEffectNeedsTests(unittest.TestCase):
         """An unseeded instance answers like a fixed one, so silence here lies."""
         with _lab() as lab_dir, mock.patch.object(
             field, "_service_container", return_value="cid",
-        ), mock.patch.object(field, "_still_serving", return_value=True), \
+        ), mock.patch.object(field, "_still_serving", return_value="127.0.0.1"), \
              mock.patch.object(field.sidecar, "ensure_image", return_value="img"), \
              mock.patch.object(
                  field, "_run_setup",
@@ -1530,7 +1536,9 @@ class SlowStartIsWaitedForAndNamedTests(unittest.TestCase):
     def _bring_up(self, ready: bool, running: bool = True) -> str:
         with mock.patch.object(field, "run_docker_stage"), \
              mock.patch.object(field, "_service_container", return_value="cid"), \
-             mock.patch.object(field, "_wait_container_port", return_value=ready) as waited, \
+             mock.patch.object(
+                 field, "_reachable_address",
+                 return_value="127.0.0.1" if ready else "") as waited, \
              mock.patch.object(field, "_is_running", return_value=running), \
              mock.patch.object(field, "_container_logs", return_value="webpack built"):
             try:
@@ -1564,9 +1572,70 @@ class SlowStartIsWaitedForAndNamedTests(unittest.TestCase):
         """health_timeout above the floor is the spec's own business."""
         with mock.patch.object(field, "run_docker_stage"), \
              mock.patch.object(field, "_service_container", return_value="cid"), \
-             mock.patch.object(field, "_wait_container_port", return_value=True) as waited:
+             mock.patch.object(
+                 field, "_reachable_address", return_value="127.0.0.1") as waited:
             field._bring_up(
                 ["vulnerable"], ["vulnerable"], 6006, 1200, Path("/x"),
                 ["docker", "compose"], "docker", {}, {"services": {"vulnerable": {}}},
             )
         self.assertEqual(waited.call_args.args[2], 1200)
+
+
+class ServiceOnItsOwnInterfaceIsReachedTests(unittest.TestCase):
+    """Not every service binds loopback, and the sidecar has to find it.
+
+    Storybook 10.6.1 printed "Storybook ready! - Local:
+    http://localhost:6006/" and listened on 172.18.0.2:6006 only. The probe
+    knew one address, waited ten minutes, and reported a running, listening
+    service as one that never came up -- then, on the attempt before that, as
+    a wrong --container-port.
+    """
+
+    def _probe(self, answers: dict[str, bool], addresses: str) -> tuple[str, list[str]]:
+        asked: list[str] = []
+
+        def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            hosts = argv[argv.index(field._PORT_READY) + 3:]
+            asked.extend(hosts)
+            found = [host for host in hosts if answers.get(host)]
+            return subprocess.CompletedProcess(
+                argv, 0 if found else 1, (found[0] + "\n") if found else "", ""
+            )
+
+        with mock.patch.object(field, "_container_address", return_value=addresses), \
+             mock.patch.object(field, "runtime_flags", return_value=[]), \
+             mock.patch.object(field.subprocess, "run", side_effect=run):
+            return field._reachable_address("cid", 6006, 30), asked
+
+    def test_loopback_is_tried_first_and_wins_when_it_answers(self) -> None:
+        where, asked = self._probe({"127.0.0.1": True, "172.18.0.2": True}, "172.18.0.2")
+        self.assertEqual(where, "127.0.0.1")
+        self.assertEqual(asked[0], "127.0.0.1")
+
+    def test_the_container_s_own_address_is_tried_too(self) -> None:
+        where, asked = self._probe({"172.18.0.2": True}, "172.18.0.2")
+        self.assertEqual(where, "172.18.0.2")
+        self.assertIn("172.18.0.2", asked)
+
+    def test_every_network_the_container_is_on_is_offered(self) -> None:
+        where, asked = self._probe({"10.1.0.9": True}, "172.18.0.2 10.1.0.9")
+        self.assertEqual(where, "10.1.0.9")
+        self.assertEqual(asked, ["127.0.0.1", "172.18.0.2", "10.1.0.9"])
+
+    def test_nothing_answering_is_an_empty_address(self) -> None:
+        where, _ = self._probe({}, "172.18.0.2")
+        self.assertEqual(where, "")
+
+    def test_the_script_is_pointed_at_what_answered(self) -> None:
+        sent: list[str] = []
+
+        def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            sent.extend(a for a in argv if a.startswith("CVELAB_BASE="))
+            return subprocess.CompletedProcess(argv, 0, "OBSERVED", "")
+
+        with mock.patch.object(field, "runtime_flags", return_value=[]), \
+             mock.patch.object(field.subprocess, "run", side_effect=run):
+            field._run_field_script("cid", 6006, "x", "http", "img", None, "172.18.0.2")
+            field._run_setup("cid", 6006, [{"method": "POST", "path": "/s"}],
+                             "img", None, "172.18.0.2")
+        self.assertEqual(sent, ["CVELAB_BASE=http://172.18.0.2:6006"] * 2)
