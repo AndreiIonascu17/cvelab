@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import socket
 import subprocess
@@ -131,7 +132,9 @@ class FakeHTTP:
     def fill(self, obj: Any, ctx: dict[str, Any]) -> Any:
         return self.subst(obj, dict(self.inputs, **ctx))
 
-    def exchange(self, steps: list[dict[str, Any]]) -> tuple[int, str, dict[str, str]]:
+    def exchange(
+        self, steps: list[dict[str, Any]], ctx: dict[str, Any] | None = None
+    ) -> tuple[int, str, dict[str, str]]:
         last = (0, "", {})
         for step in steps:
             last = self.send(step)
@@ -800,7 +803,9 @@ class DirectObservationTests(unittest.TestCase):
         exec(compile(script, "<f>", "exec"), namespace)
 
         class One(FakeHTTP):
-            def exchange(self, steps: list[dict[str, Any]]) -> tuple[int, str, dict[str, str]]:
+            def exchange(
+                self, steps: list[dict[str, Any]], ctx: dict[str, Any] | None = None
+            ) -> tuple[int, str, dict[str, str]]:
                 return response
 
         findings: list[dict[str, Any]] = []
@@ -1453,7 +1458,8 @@ class WebSocketDiscoveryTests(unittest.TestCase):
             return 200, '<script>window.wsToken = "tok-9"</script>', {}
 
         target.send = send
-        target._ws_exchange = lambda messages: self.fail("a step must not upgrade")
+        target._ws_exchange = lambda messages, ctx=None: self.fail(
+            "a step must not upgrade")
         status, body, _ = target.discover_exchange([{"method": "GET", "path": "/iframe.html"}])
         self.assertEqual([m["path"] for m in seen], ["/iframe.html"])
         self.assertEqual(status, 200)
@@ -1463,7 +1469,8 @@ class WebSocketDiscoveryTests(unittest.TestCase):
         """Only the discovery step is HTTP; the effect is in the frames."""
         target = self._target("ws", "10.0.0.5:6006")
         target.send = lambda message: self.fail("the probe must not go over http")
-        target._ws_exchange = lambda messages: (101, "dev-1 dev-2", {"Upgrade": "websocket"})
+        target._ws_exchange = lambda messages, ctx=None: (
+            101, "dev-1 dev-2", {"Upgrade": "websocket"})
         self.assertEqual(
             target.exchange([{"send": "x"}]),
             (101, "dev-1 dev-2", {"Upgrade": "websocket"}),
@@ -1590,3 +1597,85 @@ class SendingNothingIsAnExchangeTests(unittest.TestCase):
         with self.assertRaises(ValueError) as refused:
             field.validate_spec(self._spec("tcp", [{"send": "x", "send_hex": "ff"}]))
         self.assertIn("not both", str(refused.exception))
+
+
+class HandshakeIsFilledLikeARequestTests(unittest.TestCase):
+    """A token read over HTTP has to reach the upgrade that uses it.
+
+    Storybook's spec was right in every part: discover the channel token
+    from served HTML with a regex, upgrade on
+    /storybook-server-channel?token={{token}}&page=preview carrying a
+    foreign Origin, expect 101. ws_path was never substituted, so six
+    literal characters went on the wire, both builds refused the upgrade,
+    and the proof said the script did not tell them apart.
+    """
+
+    def _spec(self, **extra: Any) -> dict[str, Any]:
+        spec: dict[str, Any] = {
+            "strategy": "direct_observation",
+            "transport": "ws",
+            "observable_effect": "the channel accepts a foreign Origin",
+            "ws_path": "/channel?token={{token}}",
+            "ws_headers": {"Origin": "http://evil.invalid"},
+            "discover": [{
+                "bind": "token",
+                "query": [{"method": "GET", "path": "/iframe.html"}],
+                "extract": {"regex": "wsToken=([a-f0-9-]+)"},
+            }],
+            "probe": [{}],
+            "expect": {"status": 101},
+        }
+        spec.update(extra)
+        return spec
+
+    def _target(self, spec: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+        script = field.emit_field_poc("CVE-2026-1", field.validate_spec(spec))
+        namespace: dict[str, Any] = {}
+        exec(compile(script, "<f>", "exec"), namespace)  # noqa: S102
+        return namespace["Target"]("10.0.0.5:6006", False, 5), namespace
+
+    def test_the_upgrade_carries_the_discovered_value(self) -> None:
+        target, namespace = self._target(self._spec())
+        target.inputs = {}
+        sent: list[bytes] = []
+
+        class Sock:
+            def sendall(self, data: bytes) -> None:
+                sent.append(data)
+
+            def settimeout(self, _seconds: float) -> None:
+                pass
+
+            def recv(self, _size: int) -> bytes:
+                return (b"HTTP/1.1 101 Switching Protocols\r\n"
+                        b"Sec-WebSocket-Accept: x\r\n\r\n")
+
+            def close(self) -> None:
+                pass
+
+        with mock.patch.object(namespace["socket"], "create_connection",
+                               return_value=Sock()):
+            # The accept header is wrong on purpose: the handshake line is
+            # what this is about, and the refusal proves it got that far.
+            with contextlib.suppress(SystemExit):
+                target._ws_exchange([{"send": ""}], {"token": "abc-123"})
+        request = sent[0].decode()
+        self.assertIn("GET /channel?token=abc-123 HTTP/1.1", request)
+        self.assertNotIn("{{token}}", request)
+
+    def test_the_target_s_own_address_reaches_the_origin_header(self) -> None:
+        target, _ = self._target(self._spec(ws_headers={"Origin": "http://{{target}}"}))
+        filled = target.fill({"Origin": "http://{{target}}"}, {})
+        self.assertEqual(filled, {"Origin": "http://10.0.0.5:6006"})
+
+    def test_a_name_no_check_binds_is_refused(self) -> None:
+        with self.assertRaises(ValueError) as refused:
+            field.validate_spec(self._spec(discover=[]))
+        self.assertIn("does not bind", str(refused.exception))
+        self.assertIn("token", str(refused.exception))
+
+    def test_an_input_or_the_target_is_enough(self) -> None:
+        field.validate_spec(self._spec(discover=[], inputs=["token"]))
+        field.validate_spec(self._spec(
+            discover=[], ws_path="/channel", ws_headers={"Origin": "http://{{targetHost}}"}
+        ))
