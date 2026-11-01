@@ -52,6 +52,12 @@ class Totals:
     output_tokens: int = 0
     cached_input_tokens: int = 0
     models: set[str] = field(default_factory=set)
+    #: Requests the provider declined under its usage policy, by the category
+    #: it named. Counted because a benchmark has to tell a run that was
+    #: answered by a fallback model from one that was never declined at all:
+    #: without this, turning a fallback on makes declines vanish from the
+    #: numbers instead of being accounted for.
+    declines: list[str] = field(default_factory=list)
 
     @property
     def total_tokens(self) -> int:
@@ -66,6 +72,12 @@ def reset() -> None:
     global _totals
     with _lock:
         _totals = Totals()
+
+
+def note_decline(category: object) -> None:
+    """Record that the provider declined one request, and under what category."""
+    with _lock:
+        _totals.declines.append(str(category or "unnamed"))
 
 
 def _extract(provider: str, payload: dict) -> tuple[int, int, int]:
@@ -144,6 +156,7 @@ def snapshot() -> Totals:
             output_tokens=_totals.output_tokens,
             cached_input_tokens=_totals.cached_input_tokens,
             models=set(_totals.models),
+            declines=list(_totals.declines),
         )
 
 
@@ -158,6 +171,8 @@ def as_dict() -> dict:
         "total_tokens": totals.total_tokens,
         "models": sorted(totals.models),
     }
+    if totals.declines:
+        report["declines"] = list(totals.declines)
     if cost is None:
         report["estimated_cost_usd"] = None
         report["cost_note"] = (
