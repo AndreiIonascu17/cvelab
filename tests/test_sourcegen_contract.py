@@ -18,6 +18,7 @@ import re
 import unittest
 from pathlib import Path
 
+from cvelab import core
 from cvelab.sourcegen import (
     _canonicalize_validator_dockerfile,
     _validate_fidelity,
@@ -435,3 +436,55 @@ class GitRevisionTests(unittest.TestCase):
                     "CVE-2026-0001", Path("/nonexistent"), None, None, None, "k", "m", "openai"
                 )
         git.assert_not_called()
+
+
+class ValidatorVerdictInEitherShapeTests(unittest.TestCase):
+    """A confirmed differential is not thrown away over the shape of its JSON.
+
+    The contract asks for nested evidence and most validators write it. Two
+    in one batch of ten wrote the same answers flat, djust and nuclei, and
+    both were recorded as "Not reproduced" after fourteen repair attempts:
+
+        "vulnerable": true,
+        "vulnerable_confirmed": true,
+        "vulnerable_detail": {"effect_observed": true, "http_status": 200, ...},
+        "patched": {"blocked": true, ...},
+        "differential_confirmed": true
+
+    The generator's pre-flight check passed them, because it looks for the
+    word "confirmed" and "vulnerable_confirmed" contains it.
+    """
+
+    def test_the_nested_shape_the_contract_asks_for(self) -> None:
+        held = {"vulnerable": {"confirmed": True}, "patched": {"confirmed": False,
+                                                               "blocked": True}}
+        self.assertIs(core._validator_said(held, "vulnerable", "confirmed"), True)
+        self.assertIs(core._validator_said(held, "patched", "confirmed"), False)
+        self.assertIs(core._validator_said(held, "patched", "blocked"), True)
+
+    def test_djust_s_flat_shape_says_the_same_thing(self) -> None:
+        held = {
+            "vulnerable": True, "vulnerable_confirmed": True,
+            "vulnerable_detail": {"effect_observed": True},
+            "patched": {"blocked": True}, "patched_blocked": True,
+            "differential_confirmed": True,
+        }
+        self.assertIs(core._validator_said(held, "vulnerable", "confirmed"), True)
+        self.assertIs(core._validator_said(held, "patched", "blocked"), True)
+        self.assertIs(core._validator_said(held, "patched", "confirmed"), False)
+
+    def test_a_flat_false_is_still_a_no(self) -> None:
+        held = {"vulnerable": False, "vulnerable_confirmed": False}
+        self.assertIs(core._validator_said(held, "vulnerable", "confirmed"), False)
+
+    def test_a_bare_true_is_not_read_as_a_verdict_about_the_fixed_build(self) -> None:
+        """There it could as easily mean the build was tested."""
+        held = {"patched": True}
+        self.assertIs(core._validator_said(held, "patched", "confirmed"), False)
+        self.assertIs(core._validator_said(held, "patched", "blocked"), False)
+
+    def test_nothing_said_is_a_no(self) -> None:
+        for held in ({}, {"vulnerable": "yes"}, {"vulnerable": {"confirmed": "yes"}},
+                     {"vulnerable_confirmed": 1}):
+            with self.subTest(held=held):
+                self.assertIs(core._validator_said(held, "vulnerable", "confirmed"), False)

@@ -928,6 +928,35 @@ AfterValidation = Callable[
 ]
 
 
+def _validator_said(validation: dict[str, object], build: str, answer: str) -> bool:
+    """One of the validator's own verdicts, in either shape it writes them.
+
+    The contract asks for nested evidence -- {"vulnerable": {"confirmed":
+    true}} -- and most validators write that. Some write the same answer
+    flat, as "vulnerable_confirmed": true beside "vulnerable": true, and
+    reading only the nested form threw away two confirmed differentials in
+    one batch of ten. Both djust and nuclei reproduced, both reported
+    differential_confirmed, both had their effect on the vulnerable build
+    and a refusal on the fixed one in the record -- and both were written
+    down as "Not reproduced" after fourteen repair attempts chasing a check
+    whose content had never been the problem. The generator's own pre-flight
+    check passed them, because it looks for the word "confirmed" and
+    "vulnerable_confirmed" contains it.
+
+    A bare `"vulnerable": true` counts for confirmed, because it says the
+    same thing with nothing left out. It is not read that way for the fixed
+    build: there `true` could as easily mean the build was tested, and
+    treating it as "the effect fired there too" would fail a sound lab.
+    """
+    held = validation.get(build)
+    if isinstance(held, dict):
+        return held.get(answer) is True
+    flat = validation.get(f"{build}_{answer}")
+    if isinstance(flat, bool):
+        return flat
+    return held is True and build == "vulnerable" and answer == "confirmed"
+
+
 def run_lab(
     cve_value: str,
     output_root: Path,
@@ -1019,23 +1048,9 @@ def run_lab(
             validation = json.loads(logged.stdout)
         except json.JSONDecodeError:
             validation = {"error": logged.stderr or logged.stdout or "validator produced no JSON"}
-        vulnerable_result = validation.get("vulnerable", {})
-        patched_result = validation.get("patched", {})
-        vulnerable_confirmed = (
-            vulnerable_result.get("confirmed") is True
-            if isinstance(vulnerable_result, dict)
-            else False
-        )
-        patched_confirmed = (
-            patched_result.get("confirmed") is True
-            if isinstance(patched_result, dict)
-            else False
-        )
-        patched_blocked = (
-            patched_result.get("blocked") is True
-            if isinstance(patched_result, dict)
-            else False
-        )
+        vulnerable_confirmed = _validator_said(validation, "vulnerable", "confirmed")
+        patched_confirmed = _validator_said(validation, "patched", "confirmed")
+        patched_blocked = _validator_said(validation, "patched", "blocked")
         proof_contract = plan.get("exploit_contract", {})
         vulnerable_only = plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION"
         proof_checks = {
