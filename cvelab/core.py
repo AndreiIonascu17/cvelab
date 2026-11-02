@@ -928,6 +928,62 @@ AfterValidation = Callable[
 ]
 
 
+def run_validator(
+    compose: list[str],
+    docker: str,
+    environment: dict[str, str],
+    lab_dir: Path,
+    extra: dict[str, str] | None = None,
+) -> tuple[int, str, str]:
+    """Run the validator to completion and return its exit code and output.
+
+    Started with `up`, not `run`, because a one-off `compose run` container
+    does not get the aliases its service declares on the network. A validator
+    that reaches its own canary by name -- an HTTPS endpoint standing in for
+    the upstream the product calls, which is how a request-forgery finding is
+    observed without leaving the lab -- then cannot resolve it.
+
+    Measured: 9router's lab declared the alias codewhisperer.canary.local on
+    the validator and recorded "gaierror: Temporary failure in name
+    resolution" and "Not reproduced", three runs running. The same lab
+    started with `up` reports differential_confirmed, with the canary
+    receiving Authorization: Bearer and the injected Host. Every lab built
+    around a named stand-in was failing this way.
+    """
+    launched = subprocess.run(
+        compose + [
+            "--profile", "tools", "up", "-d", "--force-recreate", "--no-deps",
+            "validator",
+        ],
+        cwd=lab_dir,
+        capture_output=True,
+        text=True,
+        env={**environment, **(extra or {})},
+    )
+    if launched.returncode != 0:
+        detail = (launched.stderr or launched.stdout).strip()
+        raise RuntimeError(f"Validator startup failed: {detail}")
+    found = subprocess.run(
+        compose + ["--profile", "tools", "ps", "-aq", "validator"],
+        cwd=lab_dir, capture_output=True, text=True, env=environment,
+    )
+    container_id = (found.stdout or "").strip().splitlines()[-1:] or [""]
+    if not container_id[0]:
+        raise RuntimeError("The validator started but no container id came back")
+    waited = subprocess.run(
+        [docker, "wait", container_id[0]],
+        capture_output=True, text=True, env=environment, check=True,
+    )
+    logged = subprocess.run(
+        [docker, "logs", container_id[0]],
+        capture_output=True, text=True, env=environment, check=True,
+    )
+    subprocess.run(
+        [docker, "rm", "-f", container_id[0]], capture_output=True, env=environment,
+    )
+    return int(waited.stdout.strip() or 1), logged.stdout, logged.stderr.strip()
+
+
 def _validator_said(validation: dict[str, object], build: str, answer: str) -> bool:
     """One of the validator's own verdicts, in either shape it writes them.
 
@@ -1013,41 +1069,11 @@ def run_lab(
                 cwd=lab_dir,
             )
         progress.step("running the validator")
-        started = subprocess.run(
-            compose + ["--profile", "tools", "run", "-d", "validator"],
-            cwd=lab_dir,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
-        if started.returncode != 0:
-            detail = (started.stderr or started.stdout).strip()
-            raise RuntimeError(f"Validator startup failed: {detail}")
-        container_id = started.stdout.strip().splitlines()[-1]
-        waited = subprocess.run(
-            [docker, "wait", container_id],
-            capture_output=True,
-            text=True,
-            env=environment,
-            check=True,
-        )
-        validator_exit = int(waited.stdout.strip())
-        logged = subprocess.run(
-            [docker, "logs", container_id],
-            capture_output=True,
-            text=True,
-            env=environment,
-            check=True,
-        )
-        subprocess.run(
-            [docker, "rm", container_id],
-            capture_output=True,
-            env=environment,
-        )
+        validator_exit, out, err = run_validator(compose, docker, environment, lab_dir)
         try:
-            validation = json.loads(logged.stdout)
+            validation = json.loads(out)
         except json.JSONDecodeError:
-            validation = {"error": logged.stderr or logged.stdout or "validator produced no JSON"}
+            validation = {"error": err or out or "validator produced no JSON"}
         vulnerable_confirmed = _validator_said(validation, "vulnerable", "confirmed")
         patched_confirmed = _validator_said(validation, "patched", "confirmed")
         patched_blocked = _validator_said(validation, "patched", "blocked")
@@ -1091,17 +1117,15 @@ def run_lab(
             targets = ["vulnerable"] if vulnerable_only else ["vulnerable", "patched"]
             for target in targets:
                 for action in ("exploit", "verify"):
-                    checked = subprocess.run(
-                        compose + [
-                            "--profile", "tools", "run", "--rm", "--no-deps",
-                            "-e", f"CVELAB_MANUAL_ACTION={action}",
-                            "-e", f"CVELAB_TARGET={target}",
-                            "validator",
-                        ],
-                        cwd=lab_dir,
-                        capture_output=True,
-                        text=True,
-                        env=environment,
+                    code, said, complained = run_validator(
+                        compose, docker, environment, lab_dir,
+                        # The compose file declares both as ${...}, so they
+                        # travel in the environment rather than as -e flags,
+                        # which `up` has no equivalent of.
+                        {"CVELAB_MANUAL_ACTION": action, "CVELAB_TARGET": target},
+                    )
+                    checked = subprocess.CompletedProcess(
+                        ["validator", action, target], code, said, complained
                     )
                     output = checked.stdout.strip()
                     expected_verdict = (

@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from cvelab import core, policy
@@ -130,3 +132,84 @@ class StartupRepairTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ValidatorKeepsItsNetworkAliasesTests(unittest.TestCase):
+    """A one-off `compose run` container has no service aliases.
+
+    9router's lab put an HTTPS canary in the validator and gave it the alias
+    codewhisperer.canary.local, so the product's forged outbound request
+    could be received without leaving the internal network. Run as a one-off
+    container the name did not resolve -- "gaierror: Temporary failure in
+    name resolution" -- and the lab was recorded Not reproduced three runs
+    running. The same lab started with `up` reports
+    differential_confirmed. Every lab built around a named stand-in was
+    failing this way.
+    """
+
+    def _calls(self, extra: dict[str, str] | None = None) -> list[list[str]]:
+        seen: list[list[str]] = []
+
+        def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            seen.append(argv)
+            if "wait" in argv:
+                return subprocess.CompletedProcess(argv, 0, "0\n", "")
+            if "logs" in argv:
+                return subprocess.CompletedProcess(argv, 0, '{"ok": true}', "noise")
+            if "ps" in argv:
+                return subprocess.CompletedProcess(argv, 0, "cid123\n", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(core.subprocess, "run", side_effect=run):
+            self.outcome = core.run_validator(
+                ["docker", "compose"], "docker", {"PATH": "/usr/bin"},
+                Path("/lab"), extra,
+            )
+        return seen
+
+    def test_it_is_started_with_up_and_recreated(self) -> None:
+        argv = self._calls()[0]
+        self.assertIn("up", argv)
+        self.assertNotIn("run", argv)
+        self.assertIn("--force-recreate", argv)
+        self.assertIn("--no-deps", argv)
+        self.assertIn("--profile", argv)
+
+    def test_the_exit_code_and_both_streams_come_back(self) -> None:
+        self._calls()
+        self.assertEqual(self.outcome, (0, '{"ok": true}', "noise"))
+
+    def test_the_manual_interface_travels_in_the_environment(self) -> None:
+        """`up` has no -e, and the compose file declares both as ${...}."""
+        passed: list[dict[str, str]] = []
+
+        def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            if "up" in argv:
+                passed.append(dict(kwargs.get("env") or {}))
+            if "wait" in argv:
+                return subprocess.CompletedProcess(argv, 0, "0", "")
+            if "ps" in argv:
+                return subprocess.CompletedProcess(argv, 0, "cid123", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(core.subprocess, "run", side_effect=run):
+            core.run_validator(
+                ["docker", "compose"], "docker", {"PATH": "/usr/bin"}, Path("/lab"),
+                {"CVELAB_MANUAL_ACTION": "verify", "CVELAB_TARGET": "patched"},
+            )
+        self.assertEqual(passed[0]["CVELAB_MANUAL_ACTION"], "verify")
+        self.assertEqual(passed[0]["CVELAB_TARGET"], "patched")
+        self.assertEqual(passed[0]["PATH"], "/usr/bin")
+
+    def test_no_container_id_is_an_error_rather_than_a_silent_pass(self) -> None:
+        def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            if "ps" in argv:
+                return subprocess.CompletedProcess(argv, 0, "\n", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(core.subprocess, "run", side_effect=run):
+            with self.assertRaises(RuntimeError) as refused:
+                core.run_validator(
+                    ["docker", "compose"], "docker", {}, Path("/lab"), None
+                )
+        self.assertIn("no container id", str(refused.exception))
