@@ -213,3 +213,46 @@ class ValidatorKeepsItsNetworkAliasesTests(unittest.TestCase):
                     ["docker", "compose"], "docker", {}, Path("/lab"), None
                 )
         self.assertIn("no container id", str(refused.exception))
+
+
+class HarnessIsVisibleInTheLabelTests(unittest.TestCase):
+    """Whether the product's own server ran is the reader's business.
+
+    Measured over 62 reproduced labs: of the 27 that started the product, 3
+    handed over a manual PoC; of the 35 that stood in for it with an
+    adapter, 1 did. A lab that reaches the weakness through a harness proves
+    the CVE through a route the product does not serve, so the finding
+    cannot be shown on anyone's deployment -- and the differential passes
+    all the same, which is why the label has to say it.
+    """
+
+    def test_a_harness_lab_says_so(self) -> None:
+        said = core.evidence_label(
+            "SOURCE_REPRODUCTION", True, False, through_harness=True
+        )
+        self.assertIn("through a lab harness", said)
+        self.assertIn("product's own server", said)
+
+    def test_the_product_s_own_server_adds_nothing_to_read(self) -> None:
+        said = core.evidence_label("SOURCE_REPRODUCTION", True, False)
+        self.assertEqual(said, "Reproduced, differential against the fixed build")
+
+    def test_it_sits_before_the_manual_poc_clause(self) -> None:
+        said = core.evidence_label(
+            "SOURCE_REPRODUCTION", True, True, through_harness=True
+        )
+        self.assertTrue(said.endswith("manual PoC proven"))
+        self.assertIn("through a lab harness", said)
+
+    def test_a_run_that_did_not_reproduce_says_only_that(self) -> None:
+        self.assertEqual(
+            core.evidence_label("SOURCE_REPRODUCTION", False, False, True),
+            "Not reproduced",
+        )
+
+    def test_a_lab_with_no_fixed_build_keeps_both_clauses(self) -> None:
+        said = core.evidence_label(
+            "VULNERABLE_ONLY_REPRODUCTION", True, False, through_harness=True
+        )
+        self.assertIn("no fixed build available", said)
+        self.assertIn("through a lab harness", said)
