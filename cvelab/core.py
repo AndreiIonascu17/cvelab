@@ -860,7 +860,10 @@ def _service_logs(
 
 
 
-def evidence_label(lab_type: str, reproduced: bool, manual_poc: bool) -> str:
+def evidence_label(
+    lab_type: str, reproduced: bool, manual_poc: bool,
+    through_harness: bool = False,
+) -> str:
     """One line saying what this run established, for a listing or a report.
 
     A fixed build is what you want, because it answers the question a single
@@ -878,6 +881,15 @@ def evidence_label(lab_type: str, reproduced: bool, manual_poc: bool) -> str:
     on the vulnerable build and, where there was one, stayed silent on the
     fixed one -- which is the whole difference between it and a script found
     in the wild.
+
+    Whether the product's own server was started belongs here too, because
+    it is the difference a reader cannot otherwise see. Measured over 62
+    reproduced labs: of the 27 that started the product, 3 went on to hand
+    over a manual PoC; of the 35 that stood in for it, 1 did. A lab that
+    reaches the weakness through a harness it wrote proves the CVE through a
+    route the product does not serve, so the finding cannot be shown on
+    anyone's server -- and the differential still passes, which is exactly
+    why it has to be said out loud rather than left in plan.json.
     """
     if not reproduced:
         return "Not reproduced"
@@ -886,6 +898,8 @@ def evidence_label(lab_type: str, reproduced: bool, manual_poc: bool) -> str:
         if lab_type == "VULNERABLE_ONLY_REPRODUCTION"
         else "Reproduced, differential against the fixed build"
     )
+    if through_harness:
+        base += ", through a lab harness rather than the product's own server"
     return base + ", manual PoC proven" if manual_poc else base
 
 
@@ -1195,6 +1209,7 @@ def run_lab(
             "evidence_label": evidence_label(
                 str(plan.get("lab_type") or ""), real_source_proof,
                 bool(manual_poc_field.get("shipped")),
+                not (plan.get("fidelity") or {}).get("vendor_product_started"),
             ),
             "product_e2e_verified": product_e2e_verified,
             "fix_status": plan.get("fix_status", "PUBLIC_FIX_AVAILABLE"),
