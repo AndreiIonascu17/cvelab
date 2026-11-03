@@ -1,0 +1,50 @@
+name: cvelab-e2e-fixture
+services:
+  vulnerable:
+    build:
+      context: .
+      dockerfile: vulnerable/Dockerfile
+    networks:
+      lab:
+        aliases:
+          - product.canary.local
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz').read()"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+  patched:
+    build:
+      context: .
+      dockerfile: patched/Dockerfile
+    networks: [lab]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz').read()"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+  validator:
+    build:
+      context: ./validator
+      dockerfile: Dockerfile
+    environment:
+      CVELAB_MANUAL_ACTION: ${CVELAB_MANUAL_ACTION:-}
+      CVELAB_TARGET: ${CVELAB_TARGET:-}
+    depends_on:
+      vulnerable:
+        condition: service_healthy
+      patched:
+        condition: service_healthy
+    networks: [lab]
+    profiles: [tools]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+networks:
+  lab:
+    internal: true

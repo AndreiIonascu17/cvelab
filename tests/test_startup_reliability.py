@@ -172,8 +172,32 @@ class ValidatorKeepsItsNetworkAliasesTests(unittest.TestCase):
         self.assertIn("up", argv)
         self.assertNotIn("run", argv)
         self.assertIn("--force-recreate", argv)
-        self.assertIn("--no-deps", argv)
         self.assertIn("--profile", argv)
+
+    def test_the_services_it_depends_on_are_waited_for(self) -> None:
+        """A validator declares depends_on service_healthy, and that wait is
+        the only thing between it and a product still booting. Skipping it
+        cost a batch: "targets not ready", which reads as a lab that failed
+        to reproduce."""
+        self.assertNotIn("--no-deps", self._calls()[0])
+
+    def test_the_wait_is_skipped_only_when_the_caller_knows_better(self) -> None:
+        seen: list[list[str]] = []
+
+        def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            seen.append(argv)
+            if "wait" in argv:
+                return subprocess.CompletedProcess(argv, 0, "0", "")
+            if "ps" in argv:
+                return subprocess.CompletedProcess(argv, 0, "cid123", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(core.subprocess, "run", side_effect=run):
+            core.run_validator(
+                ["docker", "compose"], "docker", {}, Path("/lab"), None,
+                wait_for_services=False,
+            )
+        self.assertIn("--no-deps", seen[0])
 
     def test_the_exit_code_and_both_streams_come_back(self) -> None:
         self._calls()
