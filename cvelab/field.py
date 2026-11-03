@@ -515,22 +515,51 @@ _MAX_SETUP_REQUESTS = 10
 
 
 def _validate_setup(value: Any, inputs: Sequence[str]) -> list[dict[str, Any]]:
-    """Requests that put this lab in the state the effect needs.
+    """Steps that put this lab in the state the effect needs.
 
     They are HTTP whatever the probe speaks, because a seeding route is: the
-    lab's own /lab/seed, an admin API, a sign-up. They may fill in the
-    operator's inputs and nothing else -- there is no discovery to bind from
-    and no marker, because this runs before the proof rather than as part of
-    it.
+    lab's own /lab/seed, an admin API, a sign-up. An entry is a request, or
+    {"bind": name, "query": [requests], "extract": {...}} to read a value out
+    of one and fill it in for what follows.
+
+    That reading is what a fixed lab value cannot replace. A nebula-mesh lab
+    reproduced end to end and was refused a script because the effect needs a
+    non-admin API key, and "that admin key is generated fresh on each run, so
+    no fixed lab value can be recorded for it". A name bound here has to be
+    declared in inputs as well: the shipped script asks the operator for
+    their own, and this only supplies the lab's for the proof.
     """
     if not isinstance(value, list) or not value:
-        raise ValueError("setup must be a non-empty list of requests")
+        raise ValueError("setup must be a non-empty list of steps")
     if len(value) > _MAX_SETUP_REQUESTS:
-        raise ValueError(f"setup may hold at most {_MAX_SETUP_REQUESTS} requests")
-    out = [_validate_request(item, f"setup[{index}]") for index, item in enumerate(value)]
-    unbound = _substitutions(json.dumps(out)) - set(inputs) - set(_TARGET_TOKENS)
-    if unbound:
-        raise ValueError(f"setup uses names nothing binds: {sorted(unbound)}")
+        raise ValueError(f"setup may hold at most {_MAX_SETUP_REQUESTS} steps")
+    out: list[dict[str, Any]] = []
+    known = set(inputs) | set(_TARGET_TOKENS)
+    for index, item in enumerate(value):
+        at = f"setup[{index}]"
+        if isinstance(item, dict) and "bind" in item:
+            name = str(item.get("bind") or "")
+            if not _BIND_NAME.fullmatch(name):
+                raise ValueError(f"{at}.bind {name!r} must match {_BIND_NAME.pattern}")
+            if name not in set(inputs):
+                raise ValueError(
+                    f"{at}.bind {name!r} must also be declared in inputs, so the script "
+                    "the operator receives asks them for their own value"
+                )
+            query = _validate_sequence(item.get("query"), f"{at}.query")
+            missing = _substitutions(json.dumps(query)) - known
+            if missing:
+                raise ValueError(f"{at}.query uses names nothing binds: {sorted(missing)}")
+            out.append({
+                "bind": name, "query": query,
+                "extract": _validate_extractor(item.get("extract")),
+            })
+            continue
+        request = _validate_request(item, at)
+        missing = _substitutions(json.dumps(request)) - known
+        if missing:
+            raise ValueError(f"{at} uses names nothing binds: {sorted(missing)}")
+        out.append(request)
     return out
 
 
@@ -2071,20 +2100,25 @@ def emit_field_poc(
 
 
 _SETUP_RUNNER = (
-    "import base64, io, json, os, sys, tarfile, urllib.error, urllib.request, uuid\n"
-    "import zipfile\n"
+    "import base64, io, json, os, re, sys, tarfile, urllib.error, urllib.request\n"
+    "import uuid, zipfile\n"
     "base = os.environ['CVELAB_BASE']\n"
     "given = json.loads(os.environ.get('CVELAB_INPUTS') or '{}')\n"
     "host = base.split('://', 1)[-1]\n"
     "given = dict(given, target=host, targetHost=host.rsplit(':', 1)[0])\n"
-    "done = []\n"
-    "for request in json.loads(os.environ['CVELAB_SETUP']):\n"
+    "done, bound, cookies = [], {}, {}\n"
+    "steps = json.loads(os.environ['CVELAB_SETUP'])\n"
+    "for step in steps:\n"
+    "  for request in (step['query'] if 'bind' in step else [step]):\n"
     "    text = json.dumps(request)\n"
-    "    for name, value in given.items():\n"
+    "    for name, value in dict(given, **bound).items():\n"
     "        text = text.replace('{{%s}}' % name, json.dumps(str(value))[1:-1])\n"
     "    request = json.loads(text)\n"
     "    body = request.get('body')\n"
     "    headers = dict(request.get('headers') or {})\n"
+    "    if cookies:\n"
+    "        headers.setdefault('Cookie', '; '.join(\n"
+    "            '%s=%s' % pair for pair in sorted(cookies.items())))\n"
     "    data = None if body is None else str(body).encode()\n"
     "    if request.get('upload'):\n"
     "        boundary = 'cvelab' + uuid.uuid4().hex\n"
@@ -2129,16 +2163,50 @@ _SETUP_RUNNER = (
     "    try:\n"
     "        with urllib.request.urlopen(call, timeout=60) as answer:\n"
     "            status = answer.status\n"
-    "            answer.read(65536)\n"
+    "            body_back = answer.read(1048576).decode('utf-8', 'replace')\n"
+    "            for header in answer.headers.get_all('Set-Cookie') or []:\n"
+    "                pair = str(header).split(';', 1)[0].strip()\n"
+    "                if '=' in pair:\n"
+    "                    k, _, v = pair.partition('=')\n"
+    "                    cookies[k.strip()] = v.strip()\n"
     "    except urllib.error.HTTPError as refused:\n"
     "        status = refused.code\n"
-    "        refused.read(65536)\n"
+    "        body_back = refused.read(1048576).decode('utf-8', 'replace')\n"
     "    except Exception as error:\n"
     "        print(json.dumps({'path': request['path'], 'error': str(error)[:300]}))\n"
     "        sys.exit(1)\n"
     "    done.append({'method': request.get('method', 'GET'),\n"
     "                 'path': request['path'], 'status': status})\n"
-    "print(json.dumps(done))\n"
+    "  if 'bind' in step:\n"
+    "    taken = step['extract']\n"
+    "    found = None\n"
+    "    if 'regex' in taken:\n"
+    "        hit = re.search(taken['regex'], body_back)\n"
+    "        found = (hit.group(1) if hit and hit.groups() else\n"
+    "                 hit.group(0) if hit else None)\n"
+    "    elif 'json_values' in taken:\n"
+    "        try:\n"
+    "            held = json.loads(body_back)\n"
+    "        except ValueError:\n"
+    "            held = None\n"
+    "        stack = [held]\n"
+    "        while stack:\n"
+    "            node = stack.pop(0)\n"
+    "            if isinstance(node, dict):\n"
+    "                if taken['json_values'] in node:\n"
+    "                    found = node[taken['json_values']]\n"
+    "                    break\n"
+    "                stack.extend(node.values())\n"
+    "            elif isinstance(node, list):\n"
+    "                stack.extend(node)\n"
+    "    elif 'status' in taken:\n"
+    "        found = status\n"
+    "    if found in (None, ''):\n"
+    "        print(json.dumps({'bind': step['bind'],\n"
+    "                          'error': 'nothing to bind from the response'}))\n"
+    "        sys.exit(1)\n"
+    "    bound[step['bind']] = str(found)\n"
+    "print(json.dumps({'requests': done, 'bound': bound}))\n"
 )
 
 
@@ -2181,7 +2249,17 @@ def _run_setup(
             completed.stderr or completed.stdout
         ).strip()[-600:]
         raise RuntimeError(f"setup did not run against this build: {detail}")
-    return {"requests": reported if isinstance(reported, list) else []}
+    if not isinstance(reported, dict):
+        return {"requests": [], "bound": {}}
+    return {
+        "requests": reported.get("requests") or [],
+        # Read from this build during this run, for this proof only: the
+        # shipped script asks the operator for their own.
+        "bound": {
+            str(name): str(value)
+            for name, value in (reported.get("bound") or {}).items()
+        },
+    }
 
 
 def _run_field_script(
@@ -2777,7 +2855,13 @@ def prove_manual_poc(
         # Before anything is probed: a handshake transport needs a library in
         # the sidecar, which cannot be fetched once it is in the lab's
         # internal network, and building it is the operator's to agree to.
-        missing = [name for name in spec.get("inputs") or () if name not in (inputs or {})]
+        will_bind = {
+            str(step["bind"]) for step in spec.get("setup") or [] if "bind" in step
+        }
+        missing = [
+            name for name in spec.get("inputs") or ()
+            if name not in (inputs or {}) and name not in will_bind
+        ]
         if missing:
             # Said before anything is built: without these the script refuses
             # to start, and the proof would read that as the effect being absent.
@@ -2822,10 +2906,17 @@ def prove_manual_poc(
                               "before the script ran, so nothing was observed against it",
                     "service_logs": {name: _container_logs(cid)},
                 }
+            filled = dict(inputs or {})
             if spec.get("setup"):
-                seeded[name] = _run_setup(cid, port, spec["setup"], image, inputs, where)
+                applied = _run_setup(cid, port, spec["setup"], image, filled, where)
+                # A value setup read from this build fills an input the
+                # operator would supply themselves, for this proof only. Their
+                # own --input still wins, because a lab secret is no reason to
+                # ignore what they passed.
+                filled = dict(applied.pop("bound", {}), **filled)
+                seeded[name] = applied
             runs[name] = _run_field_script(
-                cid, port, script, spec.get("transport", "http"), image, inputs, where
+                cid, port, script, spec.get("transport", "http"), image, filled, where
             )
     except Exception as error:  # noqa: BLE001 - the outcome is the report
         return {"shipped": False, "reason": f"{type(error).__name__}: {error}"[:600]}
@@ -3651,8 +3742,16 @@ _DRAFT_INSTRUCTIONS = (
     "or an OAuth state returned by a POST, extracted and then used by the probe. An effect "
     "that needs that handoff is expressible, and is not a reason to answer "
     "feasible=false.\n"
-    "  setup: a short list of requests, at most ten, run against each build before the "
-    "script and never shipped with it. This is how the effect gets something to act on: "
+    "  setup: a short list of steps, at most ten, run against each build before the "
+    "script and never shipped with it. An entry is a request, or {\"bind\": \"<name>\", "
+    "\"query\": [<requests>], \"extract\": {<one of the four>}} to read a value out of a "
+    "response and fill it into what follows, the probe included. That is how a secret the "
+    "lab generates at boot is reached: a key printed at startup and served by the lab, an "
+    "id handed back by a sign-up. A name bound this way must also be declared in inputs, "
+    "because the script the operator receives asks them for their own value -- this only "
+    "supplies the lab's, for the proof. Where the value is stable, lab_values_json is "
+    "simpler; where it is fresh on every run, no fixed value can work and this is the only "
+    "way. This is how the effect gets something to act on: "
     "the lab is empty, so where its validator seeded a document, an account, a file or a "
     "setting -- usually through a route the lab added for itself, which you can see in the "
     "validator source -- put those same calls here. They are HTTP whatever the probe "

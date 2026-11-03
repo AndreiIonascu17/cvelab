@@ -1897,3 +1897,116 @@ class WhatTheValidatorObservedTests(unittest.TestCase):
         """So the differential survives without completing the action."""
         self.assertIn("accepted at all", field._DRAFT_INSTRUCTIONS)
         self.assertIn("damage you do not need", field._DRAFT_INSTRUCTIONS)
+
+
+class SetupCanBindWhatItReadsTests(unittest.TestCase):
+    """A secret the lab makes at boot cannot be a fixed lab value.
+
+    A nebula-mesh lab reproduced end to end and was refused a script for
+    exactly this: the effect needs a non-admin API key, the lab could only
+    get one using the admin key printed at startup, and "that admin key is
+    generated fresh on each run, so no fixed lab value can be recorded for
+    it". lab_values answers a stable value; this answers a fresh one.
+    """
+
+    def _spec(self, **extra: Any) -> dict[str, Any]:
+        spec = {
+            "strategy": "direct_observation",
+            "observable_effect": "a non-admin key creates a subscription it may not",
+            "inputs": ["admin_key"],
+            "setup": [{
+                "bind": "admin_key",
+                "query": [{"method": "GET", "path": "/lab/admin-key"}],
+                "extract": {"json_values": "key"},
+            }],
+            "probe": [{"method": "POST", "path": "/v1/subs",
+                       "headers": {"Authorization": "Bearer {{admin_key}}"}}],
+            "expect": {"status": 200},
+        }
+        spec.update(extra)
+        return spec
+
+    def test_a_binding_step_validates_beside_plain_requests(self) -> None:
+        spec = field.validate_spec(self._spec(setup=[
+            {"method": "POST", "path": "/lab/seed"},
+            {"bind": "admin_key", "query": [{"method": "GET", "path": "/lab/admin-key"}],
+             "extract": {"json_values": "key"}},
+        ]))
+        self.assertEqual(spec["setup"][0]["path"], "/lab/seed")
+        self.assertEqual(spec["setup"][1]["bind"], "admin_key")
+
+    def test_a_bound_name_has_to_be_an_input_too(self) -> None:
+        """The shipped script still asks the operator for their own."""
+        with self.assertRaises(ValueError) as refused:
+            field.validate_spec(self._spec(
+                inputs=[], probe=[{"method": "POST", "path": "/v1/subs"}]
+            ))
+        self.assertIn("also be declared in inputs", str(refused.exception))
+
+    def test_a_query_may_use_what_an_earlier_step_bound(self) -> None:
+        field.validate_spec(self._spec(
+            inputs=["admin_key", "user_key"],
+            setup=[
+                {"bind": "admin_key", "query": [{"method": "GET", "path": "/lab/admin"}],
+                 "extract": {"json_values": "key"}},
+                {"bind": "user_key",
+                 "query": [{"method": "POST", "path": "/v1/keys",
+                            "headers": {"Authorization": "Bearer {{admin_key}}"}}],
+                 "extract": {"json_values": "key"}},
+            ],
+            probe=[{"method": "POST", "path": "/v1/subs",
+                    "headers": {"Authorization": "Bearer {{user_key}}"}}],
+        ))
+
+    def test_an_unbound_name_in_a_query_is_refused(self) -> None:
+        with self.assertRaises(ValueError) as refused:
+            field.validate_spec(self._spec(setup=[
+                {"bind": "admin_key",
+                 "query": [{"method": "GET", "path": "/k/{{nothing}}"}],
+                 "extract": {"json_values": "key"}},
+            ]))
+        self.assertIn("nothing binds", str(refused.exception))
+
+    def test_the_proof_is_not_refused_for_a_value_setup_will_read(self) -> None:
+        """Without this the spec stops at "needs values only you have"."""
+        spec = field.validate_spec(self._spec())
+        with _lab() as lab_dir, mock.patch.object(
+            field, "_service_container", return_value="cid",
+        ), mock.patch.object(field, "_still_serving", return_value="127.0.0.1"), \
+             mock.patch.object(field.sidecar, "ensure_image", return_value="img"), \
+             mock.patch.object(
+                 field, "_run_setup",
+                 return_value={"requests": [], "bound": {"admin_key": "fresh-at-boot"}},
+             ), mock.patch.object(
+                 field, "_run_field_script",
+                 side_effect=lambda cid, port, script, transport, image, given, host=None:
+                     (seen.append(given), _run(observed=True, ran=True))[1],
+             ):
+            seen: list[Any] = []
+            outcome = field.prove_manual_poc(
+                "CVE-2026-0001", spec, 8000, lab_dir, ["docker", "compose"], {},
+                {}, True, None,
+            )
+        self.assertNotIn("values only you have", str(outcome.get("reason") or ""))
+        self.assertEqual(seen[0]["admin_key"], "fresh-at-boot")
+
+    def test_the_operator_s_own_value_still_wins(self) -> None:
+        spec = field.validate_spec(self._spec())
+        with _lab() as lab_dir, mock.patch.object(
+            field, "_service_container", return_value="cid",
+        ), mock.patch.object(field, "_still_serving", return_value="127.0.0.1"), \
+             mock.patch.object(field.sidecar, "ensure_image", return_value="img"), \
+             mock.patch.object(
+                 field, "_run_setup",
+                 return_value={"requests": [], "bound": {"admin_key": "from-the-lab"}},
+             ), mock.patch.object(
+                 field, "_run_field_script",
+                 side_effect=lambda cid, port, script, transport, image, given, host=None:
+                     (seen.append(given), _run(observed=True, ran=True))[1],
+             ):
+            seen: list[Any] = []
+            field.prove_manual_poc(
+                "CVE-2026-0001", spec, 8000, lab_dir, ["docker", "compose"], {},
+                {}, True, {"admin_key": "mine"},
+            )
+        self.assertEqual(seen[0]["admin_key"], "mine")
