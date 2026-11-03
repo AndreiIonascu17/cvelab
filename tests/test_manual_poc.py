@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import json
 import subprocess
@@ -1799,3 +1800,43 @@ class PortHintReadsTheValidatorTooTests(unittest.TestCase):
 
     def test_a_nonsense_port_is_not_taken(self) -> None:
         self.assertIsNone(self._hint({"validator/validator.py": "PORT = 99999\n"}))
+
+
+class RecordedSpecsKeepValidatingTests(unittest.TestCase):
+    """Every spec the model has actually written stays valid input.
+
+    A fixture of real answers, not invented ones: validate_spec is the gate
+    the drafts have to pass, and a change to it that quietly refuses a shape
+    the model already writes costs a demonstration with nothing failing in
+    the suite. Twice now a normalised spec stopped being valid input to the
+    same function -- auth: {} once, ws_path: "/" the next time -- and only a
+    round trip caught it.
+    """
+
+    def _recorded(self) -> list[tuple[str, dict[str, Any]]]:
+        held = Path(__file__).parent / "fixtures" / "recorded-specs.json"
+        return [(row["from"], row["spec"]) for row in json.loads(held.read_text())]
+
+    def test_the_fixture_holds_what_was_actually_written(self) -> None:
+        rows = self._recorded()
+        self.assertGreaterEqual(len(rows), 8)
+        self.assertEqual(
+            {spec["strategy"] for _, spec in rows} - set(field.STRATEGIES), set()
+        )
+
+    def test_each_one_still_validates(self) -> None:
+        for where, spec in self._recorded():
+            with self.subTest(spec=where):
+                field.validate_spec(spec)
+
+    def test_each_one_survives_a_round_trip(self) -> None:
+        for where, spec in self._recorded():
+            with self.subTest(spec=where):
+                once = field.validate_spec(spec)
+                self.assertEqual(field.validate_spec(once), once)
+
+    def test_each_one_emits_a_script_that_parses(self) -> None:
+        for where, spec in self._recorded():
+            with self.subTest(spec=where):
+                script = field.emit_field_poc("CVE-2026-0001", field.validate_spec(spec))
+                ast.parse(script)

