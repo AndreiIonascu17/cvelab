@@ -3034,7 +3034,8 @@ def draft_only(
         raise RuntimeError("Configure a model to ask for a spec: see `cvelab doctor`")
     progress.step("asking whether the effect can be shown on one instance")
     drafted = draft_manual_poc_spec(
-        cve, plan, api_key=api_key, model=model, provider=provider, base_url=base_url,
+        cve, plan, api_key=api_key, model=model, provider=provider,
+        base_url=base_url, lab_dir=lab_dir,
     )
     answer: dict[str, Any] = {
         "ok": "spec" in drafted,
