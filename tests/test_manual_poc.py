@@ -1707,10 +1707,15 @@ class DraftOnlyTests(unittest.TestCase):
     def _draft(self, answer: dict[str, Any]) -> dict[str, Any]:
         with _lab() as lab_dir, mock.patch.object(
             field, "draft_manual_poc_spec", return_value=answer,
-        ), mock.patch.object(field, "ai_is_configured", return_value=True), \
+        ) as asked, mock.patch.object(field, "ai_is_configured", return_value=True), \
              mock.patch.object(field, "prepare_compose") as prepared, \
              mock.patch.object(field, "prove_manual_poc") as proved:
             out = field.draft_only(lab_dir, api_key="k", model="m", provider="anthropic")
+            # Without the lab, the draft is asked with no validator source and
+            # no port: the single most informative thing it is ever given, and
+            # the first sweep taken with this command ran blind for want of
+            # one keyword.
+            self.assertEqual(asked.call_args.kwargs["lab_dir"], lab_dir.resolve())
             self.assertEqual(out["lab_dir"], str(lab_dir.resolve()))
             # Nothing is built, started or proved.
             prepared.assert_not_called()
