@@ -3518,7 +3518,15 @@ _DRAFT_INSTRUCTIONS = (
     "not change it -- performing it is how it is shown, and marker_roundtrip is the strategy "
     "for it. What is not allowed is damage past what the demonstration needs: deleting what "
     "is there, taking the service down, or touching anything the demonstration does not need "
-    "to touch.\n\n"
+    "to touch.\n"
+    "  Where the finding is that a request is accepted at all, you often need not "
+    "complete the action to show it. A check the fixed build makes before the request "
+    "reaches the code -- a CSRF token, an Origin, a signature, an authorization header "
+    "-- answers with its own refusal, and answers that way whatever the rest of the "
+    "request says. So a forged request carrying deliberately unusable values still "
+    "separates the two builds: the fixed one refuses it before looking, the affected one "
+    "lets it reach a view that then rejects the values. Changing a victim's password to "
+    "show that the change was allowed is damage you do not need.\n\n"
     "When it can, answer feasible=true, give container_port, the port the service listens on "
     "inside its container, and put the spec in spec_json as a JSON string with these keys.\n"
     "  transport: http when the service speaks HTTP, which is the default and may be left "
@@ -3681,6 +3689,11 @@ _DRAFT_INSTRUCTIONS = (
     "  health_timeout, in seconds, is how long to wait for the service to answer before the "
     "script runs. Leave it out unless the project is slow to start, such as something that "
     "boots a JVM or runs migrations first.\n\n"
+    "Read what_the_validator_observed before you choose an expectation. It holds what "
+    "the lab's own run found on each build -- the status, where it was redirected, the "
+    "fields it read back -- so the status your probe should expect is written down rather "
+    "than guessed. A draft that guessed 302 for a forged request had it right, and the "
+    "observation had said 302 against 403 all along.\n"
     "Read validator_that_proved_it for what the lab had to do before it attacked. Where it "
     "calls a route to create a document, an account, a file or a setting first, those calls "
     "belong in setup, or the proof runs against an empty instance and your spec finds "
@@ -3762,6 +3775,40 @@ def _port_hint(lab_dir: Path) -> int | None:
 #: recognised, which is what a spec needs and what a prose contract leaves
 #: out. Drafts were declining for want of a response shape to extract from.
 _MAX_VALIDATOR_CHARS = 20_000
+
+
+#: What the validator recorded, trimmed per build. Small on purpose: this is
+#: the status, the location and the fields it read, not a page of HTML.
+_MAX_OBSERVATION_CHARS = 1200
+
+
+def _observation(lab_dir: Path) -> dict[str, Any]:
+    """What the lab's validator actually saw on each build.
+
+    The source says how it looked; this says what it found, and the two
+    answer different questions. MobSF's draft had to guess the status its
+    forged request would get and guessed 302 -- which was right, and which
+    the validator had already written down as attack_status 302 against 403
+    on the fixed build. Guessing was never necessary.
+    """
+    try:
+        report = json.loads((lab_dir / "report.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    validation = report.get("validation")
+    if not isinstance(validation, dict):
+        return {}
+    seen: dict[str, Any] = {}
+    for build in ("vulnerable", "patched"):
+        held = validation.get(build)
+        if isinstance(held, dict):
+            # Trimmed rather than summarised: a 403 page is 2 KB of styling
+            # and the status beside it is the whole point.
+            seen[build] = json.loads(
+                json.dumps(held, ensure_ascii=True)[:_MAX_OBSERVATION_CHARS]
+                .rsplit(",", 1)[0] + "}"
+            ) if len(json.dumps(held)) > _MAX_OBSERVATION_CHARS else held
+    return seen
 
 
 def _validator_source(lab_dir: Path) -> str:
@@ -3848,6 +3895,7 @@ def _ask_for_spec(
                 "confirmed_attack": plan.get("exploit_contract") or {},
                 "container_port": _port_hint(lab_dir) if lab_dir else None,
                 "validator_that_proved_it": _validator_source(lab_dir) if lab_dir else "",
+                "what_the_validator_observed": _observation(lab_dir) if lab_dir else {},
                 # What the lab says it stood in for. Measured: four of five
                 # labs that reproduced but shipped nothing had proved their
                 # CVE through an endpoint the product does not serve, and this
