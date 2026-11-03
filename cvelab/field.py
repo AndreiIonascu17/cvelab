@@ -3694,13 +3694,23 @@ def _port_hint(lab_dir: Path) -> int | None:
     for name, pattern in (
         ("docker-compose.yml", r"(?:127\.0\.0\.1|localhost|0\.0\.0\.0)[:/](\d{2,5})"),
         ("vulnerable/Dockerfile", r"(?mi)^\s*EXPOSE\s+(\d{2,5})"),
+        # The validator reaches the service by name and port, so it states the
+        # port whether or not anything else does: a lab with no healthcheck
+        # and no EXPOSE left the draft to guess, and a spec with no port is
+        # thrown away. Measured on an sftpgo lab whose only mention of 8080
+        # was SERVICES = {'vulnerable': 'http://vulnerable:8080', ...}.
+        ("validator/validator.py",
+         r"(?mi)^\s*PORT\s*=\s*(\d{2,5})\s*$|"
+         r"(?:vulnerable|patched|localhost|127\.0\.0\.1):(\d{2,5})"),
     ):
         path = lab_dir / name
         if not path.is_file():
             continue
         found = re.search(pattern, path.read_text(encoding="utf-8", errors="replace"))
-        if found and 1 <= int(found.group(1)) <= 65535:
-            return int(found.group(1))
+        if found:
+            for group in found.groups():
+                if group and 1 <= int(group) <= 65535:
+                    return int(group)
     return None
 
 
@@ -3802,6 +3812,13 @@ def _ask_for_spec(
                 "what_the_lab_simulated": (plan.get("fidelity") or {}).get(
                     "simulated_components"
                 ) or [],
+                # Without this an empty simulated list is ambiguous: it can
+                # mean nothing was simulated, which is the best case, or that
+                # the lab said nothing. One draft read the empty list as "the
+                # simulation record is empty" and refused partly on that.
+                "the_product_itself_was_started": bool(
+                    (plan.get("fidelity") or {}).get("vendor_product_started")
+                ),
                 **({"your_previous_answer_was_rejected": complaint} if complaint else {}),
             }, indent=2, ensure_ascii=True)[:_MAX_DRAFT_INPUT],
             schema=MANUAL_POC_DRAFT_SCHEMA,
