@@ -948,6 +948,7 @@ def run_validator(
     environment: dict[str, str],
     lab_dir: Path,
     extra: dict[str, str] | None = None,
+    wait_for_services: bool = True,
 ) -> tuple[int, str, str]:
     """Run the validator to completion and return its exit code and output.
 
@@ -963,10 +964,18 @@ def run_validator(
     started with `up` reports differential_confirmed, with the canary
     receiving Authorization: Bearer and the injected Host. Every lab built
     around a named stand-in was failing this way.
+
+    The dependencies are waited for unless the caller says they are already
+    up. A validator declares `depends_on: {vulnerable: {condition:
+    service_healthy}}`, and that wait is the only thing standing between it
+    and a product that has not finished booting. Skipping it cost a batch:
+    the validator started first and reported "targets not ready", which
+    reads as a lab that failed to reproduce.
     """
     launched = subprocess.run(
         compose + [
-            "--profile", "tools", "up", "-d", "--force-recreate", "--no-deps",
+            "--profile", "tools", "up", "-d", "--force-recreate",
+            *([] if wait_for_services else ["--no-deps"]),
             "validator",
         ],
         cwd=lab_dir,
@@ -1137,6 +1146,8 @@ def run_lab(
                         # travel in the environment rather than as -e flags,
                         # which `up` has no equivalent of.
                         {"CVELAB_MANUAL_ACTION": action, "CVELAB_TARGET": target},
+                        # The services are up and were just proved against.
+                        wait_for_services=False,
                     )
                     checked = subprocess.CompletedProcess(
                         ["validator", action, target], code, said, complained

@@ -75,6 +75,9 @@ packages = ["cvelab"]
 line-length = 120
 target-version = "py311"
 src = ["cvelab", "tests"]
+# The end-to-end fixture is a stand-in for a generated lab, so its files are
+# written the way one arrives rather than the way this project writes Python.
+extend-exclude = ["tests/fixtures/e2e-lab"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4"]

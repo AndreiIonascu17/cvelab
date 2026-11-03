@@ -67,6 +67,14 @@ jobs:
         run: pytest
       - name: CLI smoke test
         run: cvelab --help
+      # The Docker tests build and run a real lab: two services, a validator
+      # and an internal network. They are excluded from the default run and
+      # kept to one Linux job, because the two regressions they exist for
+      # were both in what a Docker command means, which no mocked test can
+      # tell apart from what the code intended.
+      - name: pytest (Docker, end to end)
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13'
+        run: pytest -m docker
 
   build:
     name: Build distribution
