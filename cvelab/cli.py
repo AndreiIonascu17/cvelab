@@ -37,7 +37,13 @@ from .core import (
 )
 from .deliverables import create_deliverables
 from .doctor import doctor_command
-from .field import manual_poc_step, run_demo_target, run_field_lab, run_manual_poc
+from .field import (
+    draft_only,
+    manual_poc_step,
+    run_demo_target,
+    run_field_lab,
+    run_manual_poc,
+)
 from .providers import SELECTABLE
 from .providers import get as get_provider
 from .sourcegen import generate_source_lab
@@ -331,6 +337,12 @@ def parser() -> argparse.ArgumentParser:
         help="Agree in advance to building the prepared sidecar image a protocol "
              "transport needs, instead of being asked",
     )
+    manual_poc.add_argument(
+        "--draft-only", action="store_true",
+        help="Ask for the spec, check it, print it, and stop. One model call, no "
+             "containers and no proof: the cheap way to see what the instructions "
+             "produce for a lab before spending a run on it",
+    )
 
     demo_target = sub.add_parser(
         "demo-target",
@@ -591,12 +603,19 @@ def _run_command(args: argparse.Namespace) -> int:
                 args.repo, args.fixed_ref,
             )
         elif args.command == "manual":
-            result = run_manual_poc(
-                _locate_lab(args.cve, args.poc or args.output_root),
-                args.spec, args.container_port, args.keep, args.yes,
-                _named_values(args.input), args.redraft,
-                api_key=api_key, model=model, provider=provider, base_url=base_url,
-            )
+            located = _locate_lab(args.cve, args.poc or args.output_root)
+            if args.draft_only:
+                result = draft_only(
+                    located, api_key=api_key, model=model, provider=provider,
+                    base_url=base_url,
+                )
+            else:
+                result = run_manual_poc(
+                    located,
+                    args.spec, args.container_port, args.keep, args.yes,
+                    _named_values(args.input), args.redraft,
+                    api_key=api_key, model=model, provider=provider, base_url=base_url,
+                )
         elif args.command == "demo-target":
             result = run_demo_target(args.action, args.lab_dir, args.container_port)
         elif args.command == "field":

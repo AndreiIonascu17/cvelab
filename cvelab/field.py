@@ -3005,6 +3005,56 @@ def _proven_spec(lab_dir: Path) -> tuple[dict[str, Any], int, dict[str, str]] | 
     )
 
 
+def draft_only(
+    lab_dir: Path,
+    *,
+    api_key: str | None = None,
+    model: str | None = None,
+    provider: str | None = None,
+    base_url: str | None = None,
+) -> dict[str, Any]:
+    """Ask for a spec, check it, and hand it back without proving anything.
+
+    One model call against a lab already on disk: no images built, no
+    containers started, no sidecar. It exists because the loop for working on
+    the instructions was a whole `auto` run -- clone, research, build, repair,
+    validate, twenty minutes and a dollar -- to see what one sentence changed
+    about one answer. Most of what went wrong with the instructions was
+    visible in the spec alone: a name nothing bound, a probe with no send, a
+    strategy whose channel the lab had replaced.
+
+    What comes back is the drafted spec as validate_spec normalised it, or
+    the reason there is none. Nothing is written to the lab, so a draft taken
+    this way cannot be mistaken later for one that was proved.
+    """
+    lab_dir = lab_dir.resolve()
+    plan = _lab_plan(lab_dir)
+    cve = str(plan.get("cve") or lab_dir.name).upper()
+    if not ai_is_configured(api_key, model, provider):
+        raise RuntimeError("Configure a model to ask for a spec: see `cvelab doctor`")
+    progress.step("asking whether the effect can be shown on one instance")
+    drafted = draft_manual_poc_spec(
+        cve, plan, api_key=api_key, model=model, provider=provider, base_url=base_url,
+    )
+    answer: dict[str, Any] = {
+        "ok": "spec" in drafted,
+        "cve": cve,
+        "lab_dir": str(lab_dir),
+        "proved": False,
+        "note": "a draft only: nothing was run against the lab",
+    }
+    if "spec" not in drafted:
+        return {**answer, **drafted}
+    return {
+        **answer,
+        "container_port": drafted["container_port"],
+        "strategy": drafted["spec"]["strategy"],
+        "transport": drafted["spec"]["transport"],
+        "spec": drafted["spec"],
+        **({"lab_values": drafted["lab_values"]} if drafted.get("lab_values") else {}),
+    }
+
+
 def run_manual_poc(
     lab_dir: Path,
     spec_path: Path | None = None,

@@ -1692,3 +1692,59 @@ class BlindRunThatHeardNothingSaysSoTests(unittest.TestCase):
     def test_another_strategy_keeps_the_general_wording(self) -> None:
         outcome = self._prove("inband_differential", (False, False))
         self.assertIn("did not tell the two builds apart", outcome["reason"])
+
+
+class DraftOnlyTests(unittest.TestCase):
+    """One model call against a lab on disk, and nothing else.
+
+    The loop for working on the instructions was a whole `auto` run -- clone,
+    research, build, repair, validate, twenty minutes and a dollar -- to see
+    what one sentence changed about one answer. Most of what went wrong was
+    visible in the drafted spec alone: a name nothing bound, a probe with no
+    send, a strategy whose channel the lab had replaced.
+    """
+
+    def _draft(self, answer: dict[str, Any]) -> dict[str, Any]:
+        with _lab() as lab_dir, mock.patch.object(
+            field, "draft_manual_poc_spec", return_value=answer,
+        ), mock.patch.object(field, "ai_is_configured", return_value=True), \
+             mock.patch.object(field, "prepare_compose") as prepared, \
+             mock.patch.object(field, "prove_manual_poc") as proved:
+            out = field.draft_only(lab_dir, api_key="k", model="m", provider="anthropic")
+            self.assertEqual(out["lab_dir"], str(lab_dir.resolve()))
+            # Nothing is built, started or proved.
+            prepared.assert_not_called()
+            proved.assert_not_called()
+            self.assertFalse((lab_dir / "artifacts" / field.MANUAL_POC_RECORD_NAME).exists())
+        return out
+
+    def test_a_usable_answer_comes_back_normalised(self) -> None:
+        out = self._draft({
+            "spec": field.validate_spec(_spec()), "container_port": 8000,
+            "lab_values": {"account": "seeded"},
+        })
+        self.assertIs(out["ok"], True)
+        self.assertIs(out["proved"], False)
+        self.assertEqual(out["strategy"], "inband_differential")
+        self.assertEqual(out["transport"], "http")
+        self.assertEqual(out["container_port"], 8000)
+        self.assertEqual(out["lab_values"], {"account": "seeded"})
+        self.assertEqual(len(out["spec"]["checks"]), 1)
+
+    def test_a_refusal_comes_back_with_its_reason(self) -> None:
+        out = self._draft({"reason": "the effect is a worker crash"})
+        self.assertIs(out["ok"], False)
+        self.assertIn("worker crash", out["reason"])
+
+    def test_it_says_nothing_was_proved(self) -> None:
+        """So a draft taken this way is never mistaken for one that held up."""
+        out = self._draft({"spec": field.validate_spec(_spec()), "container_port": 8000})
+        self.assertIn("nothing was run against the lab", out["note"])
+
+    def test_no_model_is_an_error_rather_than_an_empty_answer(self) -> None:
+        with _lab() as lab_dir, mock.patch.object(
+            field, "ai_is_configured", return_value=False,
+        ):
+            with self.assertRaises(RuntimeError) as refused:
+                field.draft_only(lab_dir)
+        self.assertIn("Configure a model", str(refused.exception))
