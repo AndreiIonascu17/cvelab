@@ -1748,3 +1748,49 @@ class DraftOnlyTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as refused:
                 field.draft_only(lab_dir)
         self.assertIn("Configure a model", str(refused.exception))
+
+
+class PortHintReadsTheValidatorTooTests(unittest.TestCase):
+    """The validator always states the port, whatever else the lab omits.
+
+    An sftpgo lab declared no healthcheck and no EXPOSE, so the hint was
+    None and the draft had to guess a port -- and a spec with no port is
+    thrown away. The only mention of 8080 in the whole lab was the
+    validator's own SERVICES = {'vulnerable': 'http://vulnerable:8080', ...},
+    which is unavoidable: the validator has to reach the service to prove
+    anything.
+    """
+
+    def _hint(self, files: dict[str, str]) -> int | None:
+        with _lab() as lab_dir:
+            for name, text in files.items():
+                path = lab_dir / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text)
+            return field._port_hint(lab_dir)
+
+    def test_a_service_url_in_the_validator_is_enough(self) -> None:
+        self.assertEqual(self._hint({
+            "validator/validator.py":
+                "SERVICES = {'vulnerable': 'http://vulnerable:8080', "
+                "'patched': 'http://patched:8080'}\n",
+        }), 8080)
+
+    def test_a_port_constant_is_enough(self) -> None:
+        self.assertEqual(
+            self._hint({"validator/validator.py": "PORT = 6006\nX = 1\n"}), 6006
+        )
+
+    def test_the_healthcheck_still_comes_first(self) -> None:
+        """It is the lab's own statement of where to reach the application."""
+        self.assertEqual(self._hint({
+            "docker-compose.yml": "    test: curl http://127.0.0.1:9000/health\n",
+            "validator/validator.py": "PORT = 6006\n",
+        }), 9000)
+
+    def test_nothing_anywhere_is_still_nothing(self) -> None:
+        self.assertIsNone(self._hint({"validator/validator.py": "X = 1\n"}))
+        self.assertIsNone(self._hint({}))
+
+    def test_a_nonsense_port_is_not_taken(self) -> None:
+        self.assertIsNone(self._hint({"validator/validator.py": "PORT = 99999\n"}))
