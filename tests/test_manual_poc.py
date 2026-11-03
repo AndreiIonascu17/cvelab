@@ -1840,3 +1840,60 @@ class RecordedSpecsKeepValidatingTests(unittest.TestCase):
             with self.subTest(spec=where):
                 script = field.emit_field_poc("CVE-2026-0001", field.validate_spec(spec))
                 ast.parse(script)
+
+
+class WhatTheValidatorObservedTests(unittest.TestCase):
+    """The lab wrote down the statuses the draft was guessing.
+
+    MobSF's draft had to pick the status its forged request would get. It
+    guessed 302, which was right, and set the new password to the current
+    one to avoid changing anything -- and that variant answers 200, so the
+    expectation never matched and the proof reported that the script did not
+    tell the two builds apart. The validator had recorded attack_status 302
+    against 403 before any of it.
+    """
+
+    def _lab_with(self, validation: Any) -> dict[str, Any]:
+        with _lab() as lab_dir:
+            (lab_dir / "report.json").write_text(json.dumps({
+                "real_poc_verified": True, "validation": validation,
+            }))
+            return field._observation(lab_dir)
+
+    def test_each_build_s_observation_comes_through(self) -> None:
+        seen = self._lab_with({
+            "vulnerable": {"attack_status": 302, "confirmed": True},
+            "patched": {"attack_status": 403, "blocked": True},
+            "differential_confirmed": True,
+        })
+        self.assertEqual(seen["vulnerable"]["attack_status"], 302)
+        self.assertEqual(seen["patched"]["attack_status"], 403)
+
+    def test_a_page_of_html_is_trimmed_rather_than_carried(self) -> None:
+        """A 403 page is two kilobytes of styling; the status beside it is
+        the whole point."""
+        seen = self._lab_with({
+            "vulnerable": {"attack_status": 302},
+            "patched": {"attack_status": 403, "attack_body": "<html>" + "x" * 4000},
+        })
+        self.assertLess(len(json.dumps(seen["patched"])), 1400)
+        self.assertEqual(seen["patched"]["attack_status"], 403)
+
+    def test_nothing_recorded_is_an_empty_answer(self) -> None:
+        for validation in (None, "not a dict", {}, {"vulnerable": True}):
+            with self.subTest(validation=validation):
+                self.assertEqual(self._lab_with(validation).get("vulnerable"), None)
+
+    def test_a_lab_with_no_report_is_not_an_error(self) -> None:
+        with _lab() as lab_dir:
+            (lab_dir / "report.json").unlink()
+            self.assertEqual(field._observation(lab_dir), {})
+
+    def test_the_draft_is_told_to_read_it(self) -> None:
+        self.assertIn("what_the_validator_observed", field._DRAFT_INSTRUCTIONS)
+        self.assertIn("rather than guessed", field._DRAFT_INSTRUCTIONS)
+
+    def test_the_draft_is_told_a_refusal_comes_before_the_view(self) -> None:
+        """So the differential survives without completing the action."""
+        self.assertIn("accepted at all", field._DRAFT_INSTRUCTIONS)
+        self.assertIn("damage you do not need", field._DRAFT_INSTRUCTIONS)
