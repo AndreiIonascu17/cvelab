@@ -1052,6 +1052,12 @@ class Target:
         self.inputs = {}
         self.insecure = insecure
         self.ctx = None
+        # What the target has set so far. Every HTTP request used to stand
+        # alone, so a login handshake could not be expressed at all: MobSF's
+        # CSRF finding needs a csrftoken read from the login page, a sessionid
+        # from the POST that follows, and both carried into the forged
+        # request. A client keeps cookies; so does this.
+        self.cookies = {}
         if self.transport == "http":
             base = normalize_target(base)
             parsed = urllib.parse.urlsplit(base)
@@ -1073,6 +1079,28 @@ class Target:
             if insecure:
                 self.ctx.check_hostname = False
                 self.ctx.verify_mode = ssl.CERT_NONE
+
+    def keep_cookies(self, set_cookie_headers):
+        """Remember what the target set, by name, for the requests that follow.
+
+        Only the name and the value: no domain, path or expiry, because this
+        script talks to exactly one host for the length of one run and a
+        cookie that was set during it is one the server wants back. A cookie
+        the spec writes itself in a header wins, so an operator's own session
+        is never overwritten by one picked up on the way.
+        """
+        for header in set_cookie_headers:
+            pair = str(header).split(";", 1)[0].strip()
+            if "=" not in pair:
+                continue
+            name, _, value = pair.partition("=")
+            name, value = name.strip(), value.strip()
+            if not name:
+                continue
+            if value in ("", '""', "deleted"):
+                self.cookies.pop(name, None)
+            else:
+                self.cookies[name] = value
 
     def about_target(self):
         """What the spec may say about the host it was pointed at.
@@ -1511,6 +1539,10 @@ class Target:
         body = spec.get("body")
         headers = dict(spec.get("headers", {}))
         headers.setdefault("User-Agent", "CVELab-Field-PoC/1.0")
+        if self.cookies and not any(name.lower() == "cookie" for name in headers):
+            headers["Cookie"] = "; ".join(
+                "%s=%s" % pair for pair in sorted(self.cookies.items())
+            )
         data = None if body is None else str(body).encode()
         if spec.get("upload"):
             data, content_type = multipart(spec["upload"])
@@ -1524,11 +1556,17 @@ class Target:
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout, context=self.ctx) as r:
+                headers_back = dict(r.headers.items())
+                self.keep_cookies(r.headers.get_all("Set-Cookie") or [])
                 return (r.status, r.read(8 * 1024 * 1024).decode("utf-8", "replace"),
-                        dict(r.headers.items()))
+                        headers_back)
         except urllib.error.HTTPError as e:
             # A refusal is a response, and for a status differential it is the
-            # whole point: 401 here against 200 there is the finding.
+            # whole point: 401 here against 200 there is the finding. A
+            # refusal can also set a cookie -- a login that answers 302 is the
+            # usual way a session arrives.
+            if e.headers:
+                self.keep_cookies(e.headers.get_all("Set-Cookie") or [])
             return (e.code, e.read(8 * 1024 * 1024).decode("utf-8", "replace"),
                     dict(e.headers.items() if e.headers else []))
         except (urllib.error.URLError, TimeoutError, ssl.SSLError) as e:
@@ -3560,7 +3598,11 @@ _DRAFT_INSTRUCTIONS = (
     "visible only in the response to the request that causes it, that request belongs in "
     "observe.\n"
     "  Over http a request is {\"method\": \"GET\", \"path\": \"/x\", \"headers\": {}, "
-    "\"body\": null}, and each one stands alone. A body is text, or a JSON object or array "
+    "\"body\": null}. The requests share a session: a cookie the target sets is sent back "
+    "on every request after it, discovery steps included, so a login handshake is written "
+    "as what it is -- read the page for a token, post the credentials, then make the "
+    "request that needs the session, in that order. A Cookie header the spec writes itself "
+    "always wins. A body is text, or a JSON object or array "
     "written as itself and serialised for you -- do not escape it into a string. A body is "
     "not how a file is sent, though: an upload has its own key, below. Over tcp or tls a "
     "message is instead "

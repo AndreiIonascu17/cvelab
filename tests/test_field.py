@@ -1817,3 +1817,100 @@ class UploadIsExpressibleTests(unittest.TestCase):
             "probe": [{"method": "GET", "path": "/"}], "expect": {"status": 200},
         })
         self.assertNotIn("uploads a file", field._poc_footprint(plain))
+
+
+class SessionIsCarriedAcrossRequestsTests(unittest.TestCase):
+    """A login handshake is how most web findings are reached at all.
+
+    MobSF's CSRF finding needs a csrftoken read from the login page, a
+    sessionid from the POST that follows, and both carried into the forged
+    request. The draft named the obstacle exactly: "The spec format sends
+    each HTTP request standalone with no cookie jar". Authorization bypass,
+    IDOR and CSRF all look like this.
+    """
+
+    def _target(self) -> Any:
+        spec = field.validate_spec({
+            "strategy": "direct_observation",
+            "observable_effect": "a state-changing post is accepted without a token",
+            "probe": [{"method": "POST", "path": "/delete_scan/"}],
+            "expect": {"status": 200},
+        })
+        script = field.emit_field_poc("CVE-2026-1", spec)
+        namespace: dict[str, Any] = {}
+        exec(compile(script, "<f>", "exec"), namespace)  # noqa: S102
+        return namespace["Target"]("http://10.0.0.5:8000", False, 5)
+
+    def test_what_the_target_sets_comes_back_on_the_next_request(self) -> None:
+        target = self._target()
+        target.keep_cookies([
+            "csrftoken=abc; Path=/; SameSite=Lax",
+            "sessionid=xyz; HttpOnly; Path=/",
+        ])
+        sent: list[dict[str, str]] = []
+
+        class Answer:
+            status = 200
+            headers = type("H", (), {"items": lambda _s: [],
+                                     "get_all": lambda _s, _n: []})()
+
+            def read(self, _n: int) -> bytes:
+                return b""
+
+            def __enter__(self) -> Any:
+                return self
+
+            def __exit__(self, *_a: Any) -> None:
+                return None
+
+        def urlopen(req: Any, **_kw: Any) -> Any:
+            sent.append(dict(req.header_items()))
+            return Answer()
+
+        with mock.patch.object(urllib.request, "urlopen", urlopen):
+            target.send({"method": "GET", "path": "/scans"})
+        cookie = next(v for k, v in sent[0].items() if k.lower() == "cookie")
+        self.assertEqual(cookie, "csrftoken=abc; sessionid=xyz")
+
+    def test_a_cookie_the_spec_writes_itself_wins(self) -> None:
+        """An operator's own session is never overwritten by one picked up."""
+        target = self._target()
+        target.keep_cookies(["sessionid=picked-up"])
+        sent: list[dict[str, str]] = []
+
+        class Answer:
+            status = 200
+            headers = type("H", (), {"items": lambda _s: [],
+                                     "get_all": lambda _s, _n: []})()
+
+            def read(self, _n: int) -> bytes:
+                return b""
+
+            def __enter__(self) -> Any:
+                return self
+
+            def __exit__(self, *_a: Any) -> None:
+                return None
+
+        with mock.patch.object(urllib.request, "urlopen",
+                               lambda req, **_k: (sent.append(dict(req.header_items())),
+                                                  Answer())[1]):
+            target.send({"method": "GET", "path": "/x",
+                         "headers": {"Cookie": "sessionid=mine"}})
+        cookie = next(v for k, v in sent[0].items() if k.lower() == "cookie")
+        self.assertEqual(cookie, "sessionid=mine")
+
+    def test_a_cleared_cookie_is_forgotten(self) -> None:
+        target = self._target()
+        target.keep_cookies(["sessionid=xyz"])
+        target.keep_cookies(['sessionid=""; Max-Age=0'])
+        self.assertNotIn("sessionid", target.cookies)
+
+    def test_rubbish_in_a_set_cookie_header_is_ignored(self) -> None:
+        target = self._target()
+        target.keep_cookies(["", "   ", "novalue", "=novalue"])
+        self.assertEqual(target.cookies, {})
+
+    def test_the_instructions_say_the_requests_share_a_session(self) -> None:
+        self.assertIn("share a session", field._DRAFT_INSTRUCTIONS)
+        self.assertIn("login handshake", field._DRAFT_INSTRUCTIONS)
