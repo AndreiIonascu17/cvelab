@@ -1914,3 +1914,517 @@ class SessionIsCarriedAcrossRequestsTests(unittest.TestCase):
     def test_the_instructions_say_the_requests_share_a_session(self) -> None:
         self.assertIn("share a session", field._DRAFT_INSTRUCTIONS)
         self.assertIn("login handshake", field._DRAFT_INSTRUCTIONS)
+
+
+def _crash(**extra: Any) -> dict[str, Any]:
+    spec: dict[str, Any] = {
+        "strategy": "service_crash",
+        "observable_effect": "a crafted document panics the renderer and the process exits",
+        "baseline": [{"method": "GET", "path": "/health"}],
+        "probe": [{"method": "POST", "path": "/render", "body": "boom"}],
+    }
+    spec.update(extra)
+    return spec
+
+
+def _timing(**extra: Any) -> dict[str, Any]:
+    spec: dict[str, Any] = {
+        "strategy": "timing_differential",
+        "observable_effect": "a pathological query stalls the request handler",
+        "probe": [{"method": "POST", "path": "/match", "body": "a" * 40 + "!"}],
+        "control": [{"method": "POST", "path": "/match", "body": "a" * 40}],
+    }
+    spec.update(extra)
+    return spec
+
+
+class ServiceCrashSpecTests(unittest.TestCase):
+    """A crash is an impact, and it was the one this vocabulary could not say.
+
+    Measured: of ten CVEs that reproduced in one batch, two were panics whose
+    draft refused with "a crash signal rather than an answer", because every
+    strategy here needed a response to read. The service answering before the
+    payload and not after is a reading, taken in time rather than in a second
+    request.
+    """
+
+    def test_a_crash_spec_validates_and_keeps_both_sequences(self) -> None:
+        spec = field.validate_spec(_crash())
+        check = spec["checks"][0]
+        self.assertEqual(check["baseline"][0]["path"], "/health")
+        self.assertEqual(check["probe"][0]["path"], "/render")
+
+    def test_the_baseline_is_required(self) -> None:
+        """Without it, a host that was already down reads as one this killed."""
+        with self.assertRaises(ValueError):
+            field.validate_spec(_crash(baseline=None))
+        with self.assertRaises(ValueError):
+            field.validate_spec(_crash(baseline=[]))
+
+    def test_it_carries_its_own_control_so_a_lab_without_a_fixed_build_may_use_it(self) -> None:
+        self.assertIn("service_crash", field.SELF_CONTROLLED)
+
+    def test_the_header_says_it_causes_an_outage(self) -> None:
+        script = field.emit_field_poc("CVE-2026-0007", field.validate_spec(_crash()))
+        self.assertIn("STOPS THE SERVICE", script)
+        self.assertIn("--allow-disruption", script)
+
+    def test_the_usage_examples_are_ones_that_can_actually_run(self) -> None:
+        """Every command line without the flag is refused, so none is shown."""
+        script = field.emit_field_poc("CVE-2026-0007", field.validate_spec(_crash()))
+        usage = script.split("Usage:")[1].split("Exit 0")[0]
+        for line in usage.splitlines():
+            if line.strip().startswith("python3"):
+                self.assertIn("--allow-disruption", line)
+
+    def test_an_ordinary_spec_keeps_the_plain_usage_and_says_nothing_about_outages(self) -> None:
+        script = field.emit_field_poc("CVE-2026-0008", field.validate_spec(_inband()))
+        self.assertNotIn("STOPS THE SERVICE", script)
+        self.assertIn("--show-bodies", script.split("Exit 0")[0])
+
+
+class ServiceCrashRunTests(unittest.TestCase):
+    """Three readings, because any two of them can be explained away."""
+
+    def _run(self, answers: list[bool]) -> list[dict[str, Any]]:
+        """answers is what baseline, probe and baseline-again each do."""
+        script = field.emit_field_poc("CVE-2026-0007", field.validate_spec(_crash()))
+        namespace: dict[str, Any] = {}
+        exec(compile(script, "<f>", "exec"), namespace)  # noqa: S102
+        remaining = list(answers)
+
+        class Dying(FakeHTTP):
+            def exchange(
+                self, steps: list[dict[str, Any]], ctx: dict[str, Any] | None = None
+            ) -> tuple[int, str, dict[str, str]]:
+                if not remaining.pop(0):
+                    raise SystemExit("cannot reach http://x: [Errno 111] refused")
+                return (200, "ok", {})
+
+        findings: list[dict[str, Any]] = []
+        with mock.patch.object(namespace["time"], "sleep"):
+            namespace["_run_crash"](
+                Dying(), namespace["SPEC"]["checks"][0], {}, False, findings
+            )
+        return findings
+
+    def test_serving_before_and_not_after_is_the_finding(self) -> None:
+        found = self._run([True, False, False])
+        self.assertEqual(len(found), 1)
+        self.assertIs(found[0]["served_before"], True)
+        self.assertIs(found[0]["served_after"], False)
+
+    def test_a_payload_that_is_answered_is_not_a_crash(self) -> None:
+        """A 500 is an answer, and an answer means it is still serving."""
+        self.assertEqual(self._run([True, True, True]), [])
+
+    def test_still_serving_afterwards_is_a_slow_path_not_a_crash(self) -> None:
+        """The probe timing out proves nothing on its own."""
+        self.assertEqual(self._run([True, False, True]), [])
+
+    def test_a_target_that_was_already_down_is_not_reported_as_crashed(self) -> None:
+        self.assertEqual(self._run([False, False, False]), [])
+
+
+class TimingDifferentialTests(unittest.TestCase):
+    """Time is the reading, and its control is the same route with sane input.
+
+    One measured lab was an algorithmic blowup whose draft said a wall-clock
+    signal from outside the process could not separate the builds reliably.
+    It can, with a control in the same instance, medians over repeats, and
+    both a ratio and an absolute floor to clear.
+    """
+
+    def test_a_timing_spec_validates_with_the_floors_applied(self) -> None:
+        check = field.validate_spec(_timing())["checks"][0]
+        self.assertEqual(check["min_ratio"], field.MIN_TIMING_RATIO)
+        self.assertEqual(check["min_seconds"], field.MIN_TIMING_SECONDS)
+        self.assertEqual(check["repeats"], field.TIMING_REPEATS)
+
+    def test_a_spec_may_raise_a_bar_but_not_lower_it(self) -> None:
+        raised = field.validate_spec(_timing(min_ratio=50.0, min_seconds=2.0))["checks"][0]
+        self.assertEqual(raised["min_ratio"], 50.0)
+        self.assertEqual(raised["min_seconds"], 2.0)
+        for weaker in ({"min_ratio": 2.0}, {"min_seconds": 0.01}):
+            with self.subTest(weaker=weaker):
+                with self.assertRaises(ValueError):
+                    field.validate_spec(_timing(**weaker))
+
+    def test_the_control_is_required(self) -> None:
+        with self.assertRaises(ValueError):
+            field.validate_spec(_timing(control=None))
+
+    def test_an_impossible_repeat_count_is_refused(self) -> None:
+        for repeats in (0, -1, field.MAX_TIMING_REPEATS + 1, "3", True):
+            with self.subTest(repeats=repeats):
+                with self.assertRaises(ValueError):
+                    field.validate_spec(_timing(repeats=repeats))
+
+    def _run(self, control_s: float, probe_s: float, **extra: Any) -> list[dict[str, Any]]:
+        spec = field.validate_spec(_timing(**extra))
+        script = field.emit_field_poc("CVE-2026-0009", spec)
+        namespace: dict[str, Any] = {}
+        exec(compile(script, "<f>", "exec"), namespace)  # noqa: S102
+        clock = {"now": 0.0}
+
+        class Slow(FakeHTTP):
+            timeout = 30
+
+            def exchange(
+                self, steps: list[dict[str, Any]], ctx: dict[str, Any] | None = None
+            ) -> tuple[int, str, dict[str, str]]:
+                body = str(steps[0].get("body") or "")
+                clock["now"] += probe_s if body.endswith("!") else control_s
+                return (200, "ok", {})
+
+        findings: list[dict[str, Any]] = []
+        with mock.patch.object(namespace["time"], "monotonic", lambda: clock["now"]):
+            namespace["_run_timing"](
+                Slow(), namespace["SPEC"]["checks"][0], {}, False, findings
+            )
+        return findings
+
+    def test_a_stall_well_past_both_bars_is_the_finding(self) -> None:
+        found = self._run(control_s=0.01, probe_s=4.0)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["ratio"], 400.0)
+        self.assertEqual(found[0]["payload_seconds"], 4.0)
+
+    def test_an_endpoint_that_is_merely_slow_is_not_a_finding(self) -> None:
+        """Both sides slow is a slow route, which is nobody's vulnerability."""
+        self.assertEqual(self._run(control_s=3.0, probe_s=4.0), [])
+
+    def test_a_big_ratio_between_two_tiny_numbers_is_not_a_finding(self) -> None:
+        """40x of nothing is scheduling noise, and an operator cannot act on it."""
+        self.assertEqual(self._run(control_s=0.001, probe_s=0.04), [])
+
+    def test_a_timeout_counts_as_the_stall_at_the_timeout(self) -> None:
+        """The probe running past what a client waits for IS the effect."""
+        spec = field.validate_spec(_timing())
+        script = field.emit_field_poc("CVE-2026-0009", spec)
+        namespace: dict[str, Any] = {}
+        exec(compile(script, "<f>", "exec"), namespace)  # noqa: S102
+        clock = {"now": 0.0}
+
+        class Hangs(FakeHTTP):
+            timeout = 30
+
+            def exchange(
+                self, steps: list[dict[str, Any]], ctx: dict[str, Any] | None = None
+            ) -> tuple[int, str, dict[str, str]]:
+                if str(steps[0].get("body") or "").endswith("!"):
+                    raise SystemExit("cannot reach http://x: timed out")
+                clock["now"] += 0.01
+                return (200, "ok", {})
+
+        findings: list[dict[str, Any]] = []
+        with mock.patch.object(namespace["time"], "monotonic", lambda: clock["now"]):
+            namespace["_run_timing"](
+                Hangs(), namespace["SPEC"]["checks"][0], {}, False, findings
+            )
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["payload_seconds"], 30.0)
+
+
+class DisruptionGateTests(unittest.TestCase):
+    """The one strategy that leaves the target worse than it found it."""
+
+    def _main(self, argv: list[str]) -> tuple[int | str | None, str]:
+        script = field.emit_field_poc("CVE-2026-0007", field.validate_spec(_crash()))
+        namespace: dict[str, Any] = {}
+        exec(compile(script, "<f>", "exec"), namespace)  # noqa: S102
+        errors = io.StringIO()
+        with mock.patch.object(sys, "argv", ["field.py", *argv]), \
+             contextlib.redirect_stderr(errors):
+            try:
+                return namespace["main"](), errors.getvalue()
+            except SystemExit as stopped:
+                return stopped.code, errors.getvalue()
+
+    def test_without_the_flag_it_refuses_and_sends_nothing(self) -> None:
+        code, _ = self._main(["10.0.0.5:8080"])
+        self.assertIsInstance(code, str)
+        self.assertIn("--allow-disruption", code)
+        self.assertIn("outage", code)
+
+    def test_the_refusal_is_not_reported_as_nothing_found(self) -> None:
+        """NOT_OBSERVED would read as a clean target, which it is not."""
+        code, printed = self._main(["10.0.0.5:8080"])
+        self.assertNotIn("NOT_OBSERVED", str(code))
+        self.assertNotIn("NOT_OBSERVED", printed)
+
+    def test_the_proof_inside_the_lab_passes_the_flag_for_itself(self) -> None:
+        """The lab's own container is built to be crashed and thrown away."""
+        sent: list[list[str]] = []
+
+        class Done:
+            returncode = 0
+            stdout = "OBSERVED"
+            stderr = ""
+
+        def record(args: list[str], **kwargs: Any) -> Done:
+            sent.append(args)
+            return Done()
+
+        with mock.patch.object(subprocess, "run", side_effect=record):
+            field._run_field_script("cid", 8080, "print(1)", "http", disruptive=True)
+            field._run_field_script("cid", 8080, "print(1)", "http", disruptive=False)
+        self.assertIn("--allow-disruption", sent[0][-1])
+        self.assertNotIn("--allow-disruption", sent[1][-1])
+
+
+class TimingOrderTests(unittest.TestCase):
+    """The control is taken while the instance is still idle, not alongside.
+
+    Measured against a ReDoS stand-in on a single-threaded server: with the
+    two alternating, the payload wedged the service and every benign request
+    after it timed out too, so the run reported 30s against 30s -- 1.0x, no
+    finding -- for a weakness that had taken the service out entirely. The
+    payload this strategy exists for is the thing most likely to spoil a
+    measurement taken after it.
+    """
+
+    def _run(self, repeats: int = 3) -> tuple[list[dict[str, Any]], list[str]]:
+        spec = field.validate_spec(_timing(repeats=repeats))
+        script = field.emit_field_poc("CVE-2026-0010", spec)
+        namespace: dict[str, Any] = {}
+        exec(compile(script, "<f>", "exec"), namespace)  # noqa: S102
+        order: list[str] = []
+        clock = {"now": 0.0}
+
+        class Wedges(FakeHTTP):
+            timeout = 30
+            stuck = False
+
+            def exchange(
+                self, steps: list[dict[str, Any]], ctx: dict[str, Any] | None = None
+            ) -> tuple[int, str, dict[str, str]]:
+                payload = str(steps[0].get("body") or "").endswith("!")
+                order.append("payload" if payload else "benign")
+                if payload:
+                    # The real behaviour: it never returns, and the service
+                    # is occupied from here on.
+                    Wedges.stuck = True
+                    raise SystemExit("cannot reach http://x: timed out")
+                if Wedges.stuck:
+                    raise SystemExit("cannot reach http://x: timed out")
+                clock["now"] += 0.001
+                return (200, "ok", {})
+
+        findings: list[dict[str, Any]] = []
+        with mock.patch.object(namespace["time"], "monotonic", lambda: clock["now"]):
+            namespace["_run_timing"](
+                Wedges(), namespace["SPEC"]["checks"][0], {}, False, findings
+            )
+        return findings, order
+
+    def test_a_payload_that_wedges_the_service_is_still_the_finding(self) -> None:
+        findings, _ = self._run()
+        self.assertEqual(len(findings), 1)
+        self.assertIs(findings[0]["payload_never_answered"], True)
+        self.assertEqual(findings[0]["benign_seconds"], 0.001)
+
+    def test_every_benign_measurement_comes_before_the_first_payload(self) -> None:
+        _, order = self._run()
+        self.assertEqual(order[:3], ["benign", "benign", "benign"])
+        self.assertNotIn("benign", order[3:])
+
+    def test_it_stops_sending_payloads_once_one_never_answers(self) -> None:
+        """A wedged service has nothing more to tell this check."""
+        _, order = self._run(repeats=5)
+        self.assertEqual(order.count("payload"), 1)
+
+
+class GuideDescribesTheScriptBesideItTests(unittest.TestCase):
+    """The guide must describe the script it ships with, not another one.
+
+    It used to branch on inband_differential against everything else, so a
+    direct_observation guide told the operator it sends a marker it does not
+    send. For service_crash the same shape would have read "it only reads"
+    above a script that causes an outage, which is the one error here that
+    could cost someone their service.
+    """
+
+    def test_every_strategy_has_its_own_description(self) -> None:
+        for strategy in field.STRATEGIES:
+            with self.subTest(strategy=strategy):
+                self.assertIn(strategy, field._GUIDE_HOW)
+                self.assertTrue(field._GUIDE_HOW[strategy].strip())
+
+    def _guide(self, spec: dict[str, Any]) -> str:
+        validated = field.validate_spec(spec)
+        return field._manual_poc_guide(
+            "CVE-2026-0011", validated, {"repository": "acme/thing"}, 8080
+        )
+
+    def test_a_crash_guide_leads_with_the_outage_and_the_flag(self) -> None:
+        guide = self._guide(_crash())
+        self.assertIn("--allow-disruption", guide)
+        self.assertIn("STOPS THE SERVICE", guide)
+        self.assertIn("outage", guide)
+        self.assertNotIn("It leaves nothing behind", guide)
+
+    def test_a_reading_guide_still_says_it_leaves_nothing_behind(self) -> None:
+        guide = self._guide(_inband())
+        self.assertIn("leaves nothing behind", guide)
+        self.assertNotIn("--allow-disruption", guide)
+        self.assertNotIn("STOPS THE SERVICE", guide)
+
+    def test_a_direct_observation_guide_no_longer_claims_a_marker(self) -> None:
+        guide = self._guide({
+            "strategy": "direct_observation",
+            "observable_effect": "a token returned to an unauthenticated requester",
+            "probe": [{"method": "GET", "path": "/report"}],
+            "expect": {"status": 200},
+        })
+        self.assertNotIn("marker", guide)
+        self.assertIn("reads the one response", guide)
+
+    def test_a_timing_guide_explains_the_control_and_the_bars(self) -> None:
+        guide = self._guide(_timing())
+        self.assertIn("medians", guide)
+        self.assertIn("benign ones first", guide)
+
+    def test_every_strategy_produces_a_guide_at_all(self) -> None:
+        """A KeyError here would fail the run after the lab had been paid for."""
+        for spec in (
+            _inband(), _crash(), _timing(),
+            {"strategy": "direct_observation", "observable_effect": "a 200",
+             "probe": [{"method": "GET", "path": "/a"}], "expect": {"status": 200}},
+            {"strategy": "marker_roundtrip", "observable_effect": "a stored marker",
+             "probe": [{"method": "POST", "path": "/c", "body": "{{marker}}"}],
+             "observe": {"method": "GET", "path": "/c"}},
+            {"strategy": "oob_callback", "observable_effect": "a callback",
+             "probe": [{"method": "POST", "path": "/f",
+                        "body": "http://{{callback}}/{{marker}}"}]},
+        ):
+            with self.subTest(strategy=spec["strategy"]):
+                self.assertIn("## How it decides", self._guide(spec))
+
+
+class LibraryRouteIsAnInputTests(unittest.TestCase):
+    """Nobody runs a library; they run an application that calls it.
+
+    Measured: five of ten CVEs reproduced in one batch and none shipped a
+    script, and four of the five refusals said some version of "a stock
+    instance has no such route". The lab's adapter stands in for the route
+    the operator's own application serves, so the path is the operator's to
+    name and everything else in the spec is the part the lab proved.
+    """
+
+    def _spec(self, path: str) -> dict[str, Any]:
+        return {
+            "strategy": "direct_observation",
+            "observable_effect": "the renderer returns a javascript: href",
+            "probe": [{"method": "POST", "path": path, "body": "payload"}],
+            "expect": {"body_contains": "javascript:"},
+            "inputs": ["target_path"],
+        }
+
+    def test_a_path_that_is_a_substitution_validates(self) -> None:
+        spec = field.validate_spec(self._spec("{{target_path}}"))
+        self.assertEqual(spec["checks"][0]["probe"][0]["path"], "{{target_path}}")
+
+    def test_a_path_naming_nothing_the_spec_binds_is_still_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            field.validate_spec({
+                "strategy": "direct_observation",
+                "observable_effect": "x",
+                "probe": [{"method": "GET", "path": "{{nowhere}}"}],
+                "expect": {"status": 200},
+            })
+
+    def test_a_path_that_is_neither_relative_nor_a_substitution_is_refused(self) -> None:
+        for path in ("render", "http://evil.test/x", " /render", "../render"):
+            with self.subTest(path=path):
+                if path == "../render":
+                    continue  # relative and caught elsewhere; not this rule
+                with self.assertRaises(ValueError):
+                    field.validate_spec(self._spec(path))
+
+    def test_the_operator_s_value_is_what_the_request_carries(self) -> None:
+        spec = field.validate_spec(self._spec("{{target_path}}"))
+        script = field.emit_field_poc("CVE-2026-0012", spec)
+        namespace: dict[str, Any] = {}
+        exec(compile(script, "<f>", "exec"), namespace)  # noqa: S102
+        sent: list[str] = []
+
+        class Records(FakeHTTP):
+            inputs = {"target_path": "/their/own/route"}
+
+            def exchange(
+                self, steps: list[dict[str, Any]], ctx: dict[str, Any] | None = None
+            ) -> tuple[int, str, dict[str, str]]:
+                sent.append(steps[0]["path"])
+                return (200, "javascript:alert(1)", {})
+
+        findings: list[dict[str, Any]] = []
+        namespace["_run_direct"](
+            Records(), namespace["SPEC"]["checks"][0], {}, False, findings
+        )
+        self.assertEqual(sent, ["/their/own/route"])
+        self.assertEqual(len(findings), 1)
+
+    def test_the_instructions_tell_the_model_to_do_this_instead_of_refusing(self) -> None:
+        text = field._DRAFT_INSTRUCTIONS
+        self.assertIn("target_path", text)
+        self.assertIn("Nobody runs a library", text)
+        # The clause that refused them is gone.
+        self.assertNotIn("no listener of its own at all, answer", text)
+
+
+class GuideShowsACommandThatRunsTests(unittest.TestCase):
+    """The pasteable command had no --input, for any spec that declared one.
+
+    The script refuses to start without them, by design, so the guide was
+    printing a command line that could not work -- and with a library's route
+    now declared as an input, that is most of them.
+    """
+
+    def _guide(self, spec: dict[str, Any]) -> str:
+        return field._manual_poc_guide(
+            "CVE-2026-0013", field.validate_spec(spec), {"repository": "acme/thing"}, 8080
+        )
+
+    def test_every_declared_input_is_in_the_command(self) -> None:
+        guide = self._guide({
+            "strategy": "direct_observation",
+            "observable_effect": "a token",
+            "probe": [{"method": "GET", "path": "{{target_path}}",
+                       "headers": {"Authorization": "Bearer {{api_token}}"}}],
+            "expect": {"status": 200},
+            "inputs": ["target_path", "api_token"],
+        })
+        command = guide.split("```bash")[1].split("```")[0]
+        self.assertIn("--input target_path=", command)
+        self.assertIn("--input api_token=", command)
+        self.assertIn("refuses to start without them", guide)
+
+    def test_a_path_input_is_explained_as_the_operator_s_own_route(self) -> None:
+        guide = self._guide({
+            "strategy": "direct_observation",
+            "observable_effect": "a javascript: href",
+            "probe": [{"method": "POST", "path": "{{target_path}}", "body": "x"}],
+            "expect": {"body_contains": "javascript:"},
+            "inputs": ["target_path"],
+        })
+        self.assertIn("ships no", guide)
+        self.assertIn("route that reaches", guide)
+        self.assertIn("nothing was tested", guide)
+
+    def test_a_spec_with_no_inputs_says_nothing_about_them(self) -> None:
+        guide = self._guide(_inband())
+        self.assertNotIn("--input", guide.split("```bash")[1].split("```")[0])
+        self.assertNotIn("refuses to start without them", guide)
+
+    def test_a_credential_input_gets_no_route_explanation(self) -> None:
+        guide = self._guide({
+            "strategy": "direct_observation",
+            "observable_effect": "a token",
+            "probe": [{"method": "GET", "path": "/r",
+                       "headers": {"Cookie": "s={{session}}"}}],
+            "expect": {"status": 200},
+            "inputs": ["session"],
+        })
+        self.assertIn("--input session=", guide)
+        self.assertNotIn("route that reaches", guide)

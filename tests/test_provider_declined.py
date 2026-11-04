@@ -44,7 +44,11 @@ class DetectionTests(unittest.TestCase):
             "stop_details": {"type": "refusal", "category": "cyber", "explanation": "declined by policy"},
             "content": [{"type": "refusal"}],
         }
-        with mock.patch("cvelab.ai._request_json", return_value=payload):
+        # The fallback is off here so the decline this test is about is the
+        # one that surfaces: left on, both attempts decline and the exception
+        # names the second model, which is a different test's subject.
+        with mock.patch.dict(os.environ, {"CVELAB_FALLBACK_MODEL": "off"}), \
+             mock.patch("cvelab.ai._request_json", return_value=payload):
             with self.assertRaises(ProviderDeclined) as caught:
                 ask("anthropic", "claude-haiku-5-5")
         self.assertEqual(caught.exception.provider, "Anthropic")
@@ -118,13 +122,17 @@ if __name__ == "__main__":
 class FallbackModelTests(unittest.TestCase):
     """A declined request may be asked again on another model, never reworded.
 
-    Every decline CVELab has recorded -- seven -- came back under the
-    category "cyber", which the provider documents as one that "benign
-    cybersecurity work can also trigger". Its guidance for integrators is
-    that the same request sent to another model usually gets an answer, and
-    Claude Haiku has no server-side fallback, so the retry is the client's
-    to make. It stays off unless a model is named, because a decline a
-    fallback answered is not the same measurement as a run never declined.
+    Every decline CVELab has recorded came back under the category "cyber",
+    which the provider documents as one that "benign cybersecurity work can
+    also trigger". Its guidance for integrators is that the same request sent
+    to another model usually gets an answer, and Claude Haiku has no
+    server-side fallback, so the retry is the client's to make.
+
+    It is on by default now, which it was not: a decline a fallback answered
+    is indeed not the same measurement as a run never declined, but a
+    measured batch of ten lost three CVEs to declines with nothing else
+    wrong, and a lost CVE is the worse answer. The decline is recorded before
+    the second attempt either way, so both remain countable.
     """
 
     def setUp(self) -> None:
@@ -161,10 +169,44 @@ class FallbackModelTests(unittest.TestCase):
             {"type": "refusal", "category": "cyber", "explanation": "..."},
         )
 
-    def test_without_one_configured_the_decline_stands(self) -> None:
-        answered, asked = self._ask([self._declined()], fallback=None)
+    def test_without_one_configured_the_provider_default_answers(self) -> None:
+        # Nothing in the environment: the provider's own default stands in,
+        # so the CVE is not lost to a refusal nobody configured for.
+        answered, asked = self._ask([self._declined(), {}], fallback=None)
+        self.assertEqual(answered, {})
+        self.assertEqual(asked, ["claude-haiku-5-5", "claude-sonnet-5-5"])
+
+    def test_off_turns_it_back_off(self) -> None:
+        # The way to measure refusals as they fall, with no rescue.
+        answered, asked = self._ask([self._declined()], fallback="off")
         self.assertIsNone(answered)
         self.assertEqual(asked, ["claude-haiku-5-5"])
+
+    def test_a_run_already_on_the_default_is_not_asked_twice(self) -> None:
+        asked: list[str] = []
+
+        def anthropic(key, model, instructions, text, schema, budget, tools, seconds):
+            asked.append(model)
+            raise self._declined()
+
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch.object(ai, "_anthropic_response", anthropic):
+            os.environ.pop("CVELAB_FALLBACK_MODEL", None)
+            with self.assertRaises(ai.ProviderDeclined):
+                ai.structured_response(
+                    api_key="k", model="claude-sonnet-5-5", provider="anthropic",
+                    instructions="i", input_text="t",
+                    schema={"type": "object", "properties": {}, "required": []},
+                    schema_name="s", max_output_tokens=100,
+                )
+        self.assertEqual(asked, ["claude-sonnet-5-5"])
+
+    def test_the_decline_is_recorded_even_when_the_fallback_rescues_it(self) -> None:
+        # What keeps the benchmark honest: the run succeeded, and the refusal
+        # that nearly ended it is still in the usage record.
+        answered, _ = self._ask([self._declined(), {}], fallback=None)
+        self.assertEqual(answered, {})
+        self.assertEqual(usage.snapshot().declines, ["cyber"])
 
     def test_with_one_configured_the_same_request_goes_to_it(self) -> None:
         answered, asked = self._ask(

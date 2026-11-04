@@ -95,8 +95,19 @@ _CVE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 #: itself rather than handing the data to a third-party collaborator service,
 #: which on a client engagement would send their traffic somewhere neither
 #: party controls.
+#:
+#: service_crash and timing_differential were added because their absence,
+#: not the vulnerabilities', is what refused a measured batch. Of ten CVEs
+#: five reproduced and none shipped a script: two were panics the draft could
+#: only describe as "a crash signal rather than an answer", one was an
+#: algorithmic blowup it called unobservable from outside the process, and the
+#: vocabulary had no way to say either. A crash and a stall are impacts an
+#: operator cares about more than most, and both are observable from one
+#: instance -- a crash because the service stops answering, a stall because
+#: the same request with benign input does not.
 STRATEGIES = (
     "inband_differential", "marker_roundtrip", "oob_callback", "direct_observation",
+    "service_crash", "timing_differential",
 )
 
 #: The strategies that carry their own control, inside the one instance they
@@ -106,14 +117,41 @@ STRATEGIES = (
 #: where it cannot legitimately, or the target reaching out -- neither is
 #: ordinary behaviour whatever the version.
 #:
+#: service_crash and timing_differential belong here for the same reason, and
+#: each carries its control in time rather than in a second reading:
+#: service_crash establishes that the instance was answering before the
+#: payload and is not after, and timing_differential measures the same request
+#: shape with benign input alongside the pathological one.
+#:
 #: This is what makes a lab with no fixed build usable. A patched build answers
 #: one question: is what I am seeing the bug, or how the thing always behaves.
 #: It is a check against self-deception, not the definition of a vulnerability,
-#: and these three answer it on their own.
-SELF_CONTROLLED = ("inband_differential", "marker_roundtrip", "oob_callback")
+#: and these answer it on their own.
+SELF_CONTROLLED = (
+    "inband_differential", "marker_roundtrip", "oob_callback",
+    "service_crash", "timing_differential",
+)
 
 #: What direct_observation may assert about the one response it reads.
 EXPECTATIONS = ("status", "header", "body_contains", "extract")
+
+#: How much slower the pathological input has to be than the benign one of the
+#: same shape before a timing_differential run counts. Ten times is the floor
+#: because wall-clock noise across a network is real: a loaded host, a cold
+#: cache or a GC pause can double a response, and none of those multiply it by
+#: ten. A spec may raise it, never lower it past this.
+MIN_TIMING_RATIO = 10.0
+
+#: The pathological request also has to take this long outright. Without it a
+#: ratio is meaningless at small numbers -- 0.4ms against 0.02ms is twenty
+#: times and is nothing but scheduling -- and an operator cannot act on it.
+MIN_TIMING_SECONDS = 0.5
+
+#: Times each side of a timing_differential is measured. The median is taken,
+#: so one unlucky sample cannot carry or sink a run. Three is enough for a
+#: median and keeps a slow endpoint from making the script take minutes.
+TIMING_REPEATS = 3
+MAX_TIMING_REPEATS = 7
 
 #: The marker the operator's script generates fresh per run, so a stored
 #: reflection from an earlier run is never mistaken for this one's.
@@ -183,8 +221,18 @@ def _validate_request(request: Any, where: str) -> dict[str, Any]:
     if not isinstance(request, dict):
         raise ValueError(f"{where} must be an object")
     path = str(request.get("path", "/"))
-    if not path.startswith("/"):
-        raise ValueError(f"{where} path must start with /")
+    if not path.startswith(("/", "{{")):
+        # A path that begins with a substitution is the one exception, and it
+        # is what makes a library CVE expressible: nobody runs a library, they
+        # run an application that calls it, and that application's route is
+        # the operator's to name. The lab's own adapter route stands in for it
+        # while the script is proved here. What the value has to be is checked
+        # where it is known -- the script refuses a filled path that is not
+        # relative, so an operator passing a whole URL is told so rather than
+        # sending a request somewhere else entirely.
+        raise ValueError(
+            f"{where} path must start with / or with a substitution naming an input"
+        )
     method = str(request.get("method", "GET")).upper()
     headers = request.get("headers", {})
     if not isinstance(headers, dict):
@@ -646,6 +694,26 @@ def _validate_discover(
     return steps, bound
 
 
+def _at_least(value: Any, where: str, floor: float) -> float:
+    """A threshold a spec may raise and may not lower.
+
+    The floors exist because a timing claim is the easiest of these to fool
+    oneself with, and the spec is written by the same model that wants the
+    answer to be yes. Raising one is a spec saying this effect needs a
+    stronger signal than the floor; lowering it would be a spec weakening the
+    bar it has to clear, so it is refused rather than clamped -- silently
+    accepting a 2x threshold and then testing 10x reports on something the
+    spec did not ask for.
+    """
+    if value is None:
+        return floor
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{where} must be a number")
+    if float(value) < floor:
+        raise ValueError(f"{where} may not be lower than {floor}")
+    return float(value)
+
+
 def _validate_check(
     check: Any, strategy: str, where: str, transport: str = "http",
     inputs: list[str] | None = None,
@@ -722,6 +790,48 @@ def _validate_check(
             )
         out["probe"] = probe
         _allowed(probe, "probe")
+    elif strategy == "service_crash":
+        # The payload, and a benign request that proves the instance was
+        # answering before it. The baseline is required rather than optional:
+        # without it "no answer" cannot be told apart from "never answered",
+        # and a script that reports a crash against a host that was already
+        # down is worse than one that reports nothing.
+        out["baseline"] = _validate_sequence(
+            check.get("baseline"), f"{where}.baseline", transport
+        )
+        out["probe"] = _validate_sequence(check.get("probe"), f"{where}.probe", transport)
+        _allowed(out["baseline"], "baseline")
+        _allowed(out["probe"], "probe")
+    elif strategy == "timing_differential":
+        out["probe"] = _validate_sequence(check.get("probe"), f"{where}.probe", transport)
+        # The same request shape with input that does not trigger the blowup.
+        # It is the control, and it is what makes the measurement mean
+        # anything: a slow endpoint is not a finding, a slow endpoint that is
+        # fast with ordinary input is.
+        out["control"] = _validate_sequence(
+            check.get("control"), f"{where}.control", transport
+        )
+        out["min_ratio"] = _at_least(
+            check.get("min_ratio"), f"{where}.min_ratio", MIN_TIMING_RATIO
+        )
+        out["min_seconds"] = _at_least(
+            check.get("min_seconds"), f"{where}.min_seconds", MIN_TIMING_SECONDS
+        )
+        repeats = check.get("repeats", TIMING_REPEATS)
+        # bool before int: True is an int in Python and 1 <= True <= 7 holds,
+        # so repeats=true would have been accepted as one measurement.
+        if (
+            isinstance(repeats, bool)
+            or not isinstance(repeats, int)
+            or not 1 <= repeats <= MAX_TIMING_REPEATS
+        ):
+            raise ValueError(
+                f"{where}.repeats must be a whole number of measurements, "
+                f"1 to {MAX_TIMING_REPEATS}"
+            )
+        out["repeats"] = repeats
+        _allowed(out["probe"], "probe")
+        _allowed(out["control"], "control")
     else:  # marker_roundtrip
         probe = _validate_sequence(check.get("probe"), f"{where}.probe", transport)
         if _MARKER_TOKEN not in json.dumps(probe):
@@ -853,10 +963,7 @@ _FIELD_POC = r'''#!/usr/bin/env python3
 
 @@FACTS@@
 Usage:
-    python3 @@FILE@@ 10.0.0.5:8080
-    python3 @@FILE@@ 10.0.0.5:8080 --show-bodies
-    python3 @@FILE@@ https://app.example.com --insecure
-
+@@USAGE@@
 Exit 0 and OBSERVED when the effect is present on that target, 1 and
 NOT_OBSERVED when it is not. A NOT_OBSERVED is not a clean bill: the effect
 may simply not be reachable with this input, or the instance may hold nothing
@@ -873,7 +980,8 @@ Requests carry User-Agent: CVELab-Field-PoC/1.0, so the target's own logs can
 be matched to this run.
 """
 from __future__ import annotations
-import argparse, base64, hashlib, io, json, re, socket, socketserver, ssl, sys, tarfile
+import argparse, base64, hashlib, http.client, io, json, re, socket, socketserver, ssl
+import sys, tarfile
 import threading, time, urllib.error, urllib.parse, urllib.request, uuid, zipfile
 
 # The spec travels as JSON text rather than as a Python literal. A bodyless
@@ -1598,7 +1706,17 @@ class Target:
                 self.keep_cookies(e.headers.get_all("Set-Cookie") or [])
             return (e.code, e.read(8 * 1024 * 1024).decode("utf-8", "replace"),
                     dict(e.headers.items() if e.headers else []))
-        except (urllib.error.URLError, TimeoutError, ssl.SSLError) as e:
+        except (OSError, http.client.HTTPException) as e:
+            # Deliberately this wide. A server that dies mid-request answers
+            # with RemoteDisconnected, which is ConnectionResetError and
+            # BadStatusLine and neither of them is a URLError, so the clause
+            # that named URLError, TimeoutError and SSLError let it past as an
+            # unhandled traceback -- measured against a service_crash PoC,
+            # where a dropped connection is the whole observation and came
+            # back as a crashed script instead. OSError covers URLError,
+            # TimeoutError, SSLError and the socket errors; HTTPException
+            # covers a response that stops partway. HTTPError is matched by
+            # the clause above, so a refusal is still a response.
             raise SystemExit("cannot reach %s: %s" % (self.http_base, e))
 
 
@@ -1831,6 +1949,144 @@ def _run_oob(target, check, ctx, show_bodies, findings):
                          "marker": marker, "from": hit["from"], "at": hit["at"]})
 
 
+def _answered(target, messages, ctx=None):
+    """Run a sequence and say whether the target answered, instead of exiting.
+
+    Everywhere else an unreachable target ends the run, because silence from
+    a host that was never going to answer proves nothing. For a crash the
+    silence IS the observation, so here it is caught and returned.
+    """
+    try:
+        return True, target.exchange(messages, ctx)
+    except SystemExit as stopped:
+        return False, str(stopped)
+
+
+def _median(values):
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _run_crash(target, check, ctx, show_bodies, findings):
+    """The effect is that the service stops serving.
+
+    Three steps, in this order, because any two of them can be explained
+    away. A benign request first, so a host that was already down cannot be
+    reported as one this script took down. Then the payload, which is
+    expected not to come back. Then the benign request again: if it still
+    answers, the payload merely timed out on a slow path and nothing is
+    claimed, and only a service that answered before and does not now is a
+    finding.
+
+    This is the one strategy that leaves the target worse than it found it,
+    which is why main() will not run it without --allow-disruption.
+    """
+    before, _ = _answered(target, target.fill(check["baseline"], ctx), ctx)
+    if not before:
+        # Not a negative result: there was nothing serving to crash.
+        print("  [ERROR] %s did not answer the baseline request, so this run cannot say "
+              "anything about a crash" % target.base, file=sys.stderr)
+        return
+    sent, detail = _answered(target, target.fill(check["probe"], ctx), ctx)
+    if sent:
+        status = detail[0]
+        print("  [NO CRASH] the payload was answered (status=%s) via %s"
+              % (status, check["label"]), file=sys.stderr)
+        return
+    # It did not answer. Give a dying process a moment to finish dying, then
+    # ask the benign question again.
+    time.sleep(2)
+    after, _ = _answered(target, target.fill(check["baseline"], ctx), ctx)
+    if after:
+        print("  [INCONCLUSIVE] the payload got no answer but %s is still serving, so "
+              "this looks like a slow path rather than a crash" % target.base,
+              file=sys.stderr)
+        return
+    print("  [CRASHED] %s answered before the payload and does not answer after it, via %s"
+          % (target.base, check["label"]))
+    if show_bodies:
+        print("            %s" % detail)
+    findings.append({"check": check["label"], "where": ctx,
+                     "served_before": True, "served_after": False,
+                     "transport_error": detail})
+
+
+def _run_timing(target, check, ctx, show_bodies, findings):
+    """The effect is time: the same request shape, pathological input, stalls.
+
+    Measured against its own control in the same instance and the same run,
+    median of several, because a single pair of samples on a shared host is
+    not a measurement. Both bars have to clear: the ratio, so an endpoint
+    that is simply slow is not a finding, and the absolute floor, so a ratio
+    between two sub-millisecond numbers is not one either.
+    """
+    def measure(messages):
+        started = time.monotonic()
+        answered, _ = _answered(target, target.fill(messages, ctx), ctx)
+        elapsed = time.monotonic() - started
+        if not answered:
+            # A timeout is the stall, not a failure to observe: the request
+            # ran past what the client would wait for. Recorded at the
+            # timeout, which understates the effect rather than inventing a
+            # number.
+            return float(target.timeout), False
+        return elapsed, True
+
+    # Every control measurement first, then the probes. Alternating them
+    # sounds fairer and is wrong here, measured: the payload this strategy is
+    # for occupies the service, and a single-threaded server never gets back
+    # to the next request. Against a ReDoS stand-in that way round reported
+    # 30s for the payload and 30s for the benign input after it -- 1.0x, no
+    # finding, for a weakness that had wedged the service outright. The
+    # control has to be taken while the instance is still idle.
+    control_times = [measure(check["control"])[0] for _ in range(check["repeats"])]
+    probe_times = []
+    timed_out = False
+    for _ in range(check["repeats"]):
+        elapsed, answered = measure(check["probe"])
+        probe_times.append(elapsed)
+        if not answered:
+            # It never came back. Sending more would measure a service that
+            # is already occupied by the last payload, and there is nothing
+            # left to learn: this is the strongest reading this check has.
+            timed_out = True
+            break
+    fast = _median(control_times)
+    slow = _median(probe_times)
+    ratio = (slow / fast) if fast > 0 else float("inf")
+    print("  measured %s: benign %.3fs, payload %.3fs (%.1fx)"
+          % (check["label"], fast, slow, ratio), file=sys.stderr)
+    if show_bodies:
+        print("            benign  %s" % ["%.3f" % t for t in control_times],
+              file=sys.stderr)
+        print("            payload %s" % ["%.3f" % t for t in probe_times],
+              file=sys.stderr)
+    if slow < check["min_seconds"]:
+        print("  [NOT SLOW] the payload answered in %.3fs, under the %.3fs this check "
+              "requires" % (slow, check["min_seconds"]), file=sys.stderr)
+        return
+    if ratio < check["min_ratio"]:
+        print("  [NOT SLOW] %.1fx is under the %.1fx this check requires"
+              % (ratio, check["min_ratio"]), file=sys.stderr)
+        return
+    if timed_out:
+        print("  [STALLED] the payload never answered: %.3fs is this run's limit, against "
+              "%.3fs for benign input of the same shape, via %s"
+              % (slow, fast, check["label"]))
+    else:
+        print("  [STALLED] %.3fs against %.3fs for benign input of the same shape, %.1fx, "
+              "via %s" % (slow, fast, ratio, check["label"]))
+    findings.append({"check": check["label"], "where": ctx,
+                     "payload_seconds": round(slow, 4),
+                     "benign_seconds": round(fast, 4),
+                     "ratio": round(ratio, 2),
+                     "payload_never_answered": timed_out,
+                     "measurements": len(probe_times)})
+
+
 def _inputs(given):
     """The operator's NAME=VALUE pairs, checked against what the spec declares.
 
@@ -1884,6 +2140,9 @@ def main():
                         "can reach it directly")
     p.add_argument("--callback-wait", type=int, default=15,
                    help="Seconds to wait for the callback after the probe is sent")
+    p.add_argument("--allow-disruption", action="store_true",
+                   help="Required for a service_crash check: it is expected to stop the "
+                        "service answering, and will not be sent without this")
     args = p.parse_args()
     where = args.target or args.target_positional
     if not where:
@@ -1891,6 +2150,19 @@ def main():
     if args.target and args.target_positional:
         p.error("name the target once, not twice")
     oob = SPEC["strategy"] == "oob_callback"
+    if SPEC["strategy"] == "service_crash" and not args.allow_disruption:
+        # Refused, not reported as nothing found: the difference matters to
+        # whoever reads the output. Every other strategy here asks no more of
+        # the target than an ordinary request, and this one is the exception,
+        # so it is the one thing this script will not do because it was told
+        # to once.
+        raise SystemExit(
+            "This PoC demonstrates %s by stopping the service: the payload is expected\n"
+            "to leave it not answering, and on anything shared or in production that is\n"
+            "an outage. Re-run with --allow-disruption once you are on a host where that\n"
+            "is acceptable and you are permitted to do it."
+            % SPEC["observable_effect"]
+        )
     # Checked before anything is printed or sent: learning halfway through a
     # run that a library is missing wastes the run and reads like a result.
     needed = {"ssh": "paramiko", "smb": "impacket.smbconnection"}.get(
@@ -1921,6 +2193,8 @@ def main():
         "marker_roundtrip": _run_marker,
         "oob_callback": _run_oob,
         "direct_observation": _run_direct,
+        "service_crash": _run_crash,
+        "timing_differential": _run_timing,
     }[SPEC["strategy"]]
     try:
         return _check_all(target, args, findings, run)
@@ -2021,6 +2295,23 @@ _FOOTPRINTS = {
         "This run sends a payload naming a listener this script starts, and waits for the\n"
         "target to reach it. Whatever the payload is stored in keeps pointing at that\n"
         "address after the run; tell the owner and clean it up.\n",
+    # The one footprint that is an outage. Said at the top of the file, in
+    # the --help text and again as a refusal if --allow-disruption is not
+    # passed, because an operator who learns this from the output has already
+    # taken the service down.
+    "service_crash":
+        "This run STOPS THE SERVICE. It sends one ordinary request to show the instance\n"
+        "is answering, then the input that kills it, then the first request again to show\n"
+        "it is not answering any more. That is the finding, and it means an outage until\n"
+        "someone restarts the service -- this script does not restart it. It refuses to\n"
+        "run at all without --allow-disruption. Do not point it at anything shared or in\n"
+        "production, and have the owner's agreement before you do.\n",
+    "timing_differential":
+        "This run only reads, and sends each request several times: the input that stalls\n"
+        "the service and an ordinary one of the same shape, alternating, comparing how\n"
+        "long each took. It leaves nothing behind, but the stalling requests occupy the\n"
+        "service while they run, so a small instance will be slow for other callers\n"
+        "during the run.\n",
 }
 
 #: A session that authenticates leaves more than a request does, and the
@@ -2051,10 +2342,31 @@ def _poc_footprint(spec: dict[str, Any]) -> str:
     return text
 
 
+def _poc_usage(spec: dict[str, Any], filename: str) -> str:
+    """The invocations that actually work for this spec's strategy.
+
+    A service_crash script refuses every command line without
+    --allow-disruption, so showing the bare form first would put an example
+    at the top of the file that cannot run.
+    """
+    if spec["strategy"] == "service_crash":
+        return (
+            f"    python3 {filename} 10.0.0.5:8080 --allow-disruption\n"
+            f"    python3 {filename} https://app.example.com --allow-disruption --insecure\n"
+            "\nWithout --allow-disruption it does nothing: the payload is expected to stop\n"
+            "the service, so the acknowledgement is required rather than assumed.\n"
+        )
+    return (
+        f"    python3 {filename} 10.0.0.5:8080\n"
+        f"    python3 {filename} 10.0.0.5:8080 --show-bodies\n"
+        f"    python3 {filename} https://app.example.com --insecure\n"
+    )
+
+
 def _uploads(spec: dict[str, Any]) -> bool:
     """Whether any request the script sends carries an upload."""
     for check in spec.get("checks") or []:
-        for key in ("probe", "control", "observe"):
+        for key in ("probe", "control", "observe", "baseline"):
             if any(request.get("upload") for request in check.get(key) or []):
                 return True
         for step in check.get("discover") or []:
@@ -2093,6 +2405,7 @@ def emit_field_poc(
         .replace("@@SPEC@@", text)
         .replace("@@FACTS@@", _poc_facts(cve, spec, plan))
         .replace("@@LEAVES@@", _poc_footprint(spec))
+        .replace("@@USAGE@@", _poc_usage(spec, filename))
         .replace("@@FILE@@", filename)
         .replace("@@EFFECT@@", effect)
         .replace("@@CVE@@", cve)
@@ -2265,7 +2578,7 @@ def _run_setup(
 def _run_field_script(
     container: str, port: int, script: str, transport: str = "http",
     image: str = sidecar.BASE_IMAGE, inputs: dict[str, str] | None = None,
-    host: str = "127.0.0.1",
+    host: str = "127.0.0.1", disruptive: bool = False,
 ) -> dict[str, Any]:
     """Run the emitted field PoC from a sidecar sharing the lab's network.
 
@@ -2284,7 +2597,12 @@ def _run_field_script(
         "(home / 'field.py').write_text(os.environ['CVELAB_FIELD'])\n"
         "given = json.loads(os.environ.get('CVELAB_INPUTS') or '{}')\n"
         "sys.argv = ['field.py', '--target', os.environ['CVELAB_BASE'], '--json']\n"
-        "for name, value in given.items():\n"
+        # A service_crash script refuses to run without this, which is the
+        # point of the flag. Here the target is a container of the lab's own,
+        # built to be crashed and thrown away, so the acknowledgement the
+        # operator makes by typing it is one CVELab can make for itself.
+        + ("sys.argv.append('--allow-disruption')\n" if disruptive else "")
+        + "for name, value in given.items():\n"
         "    sys.argv += ['--input', '%s=%s' % (name, value)]\n"
         "runpy.run_path(str(home / 'field.py'), run_name='__main__')\n"
     )
@@ -2916,7 +3234,8 @@ def prove_manual_poc(
                 filled = dict(applied.pop("bound", {}), **filled)
                 seeded[name] = applied
             runs[name] = _run_field_script(
-                cid, port, script, spec.get("transport", "http"), image, filled, where
+                cid, port, script, spec.get("transport", "http"), image, filled, where,
+                disruptive=spec["strategy"] == "service_crash",
             )
     except Exception as error:  # noqa: BLE001 - the outcome is the report
         return {"shipped": False, "reason": f"{type(error).__name__}: {error}"[:600]}
@@ -3310,27 +3629,84 @@ def run_manual_poc(
     return {"ok": bool(outcome["shipped"]), "cve": cve, "lab_dir": str(lab_dir), **outcome}
 
 
-def _manual_poc_guide(cve: str, spec: dict[str, Any], plan: dict[str, Any], port: int) -> str:
-    """What the operator needs beside the script, and nothing more."""
-    strategy = spec["strategy"]
-    how = (
+#: One line per strategy, saying how a run decides. Every strategy CVELab
+#: will accept needs an entry, which a test asserts: a guide that describes a
+#: different script than the one beside it is worse than no guide.
+_GUIDE_HOW = {
+    "inband_differential":
         "It reads the same resource two ways in one request round -- the way the "
         "vulnerability allows and the way that authorizes correctly -- and reports "
         "what only the first returned. A value it prints is one the server "
-        "disclosed to a requester that should not have seen it."
-        if strategy == "inband_differential"
-        else "It sends a marker, fresh on every run, through the vulnerable vector and "
+        "disclosed to a requester that should not have seen it.",
+    "marker_roundtrip":
+        "It sends a marker, fresh on every run, through the vulnerable vector and "
         "looks for it where it should not appear. Because the marker is new each "
-        "time, a reflection left by an earlier run is never counted."
+        "time, a reflection left by an earlier run is never counted.",
+    "oob_callback":
+        "It starts a listener of its own, sends a payload that names it, and waits. "
+        "The effect produces no answer to read, so the evidence is the target "
+        "reaching out, carrying a marker generated for this run.",
+    "direct_observation":
+        "It sends the request the weakness allows and reads the one response. The "
+        "evidence is that this response came back at all -- a fixed build does not "
+        "produce it, which is what CVELab checked before shipping the script.",
+    "service_crash":
+        "It asks an ordinary question, sends the input that kills the service, then "
+        "asks the ordinary question again. The finding is that the instance "
+        "answered the first time and does not answer the last. A payload that "
+        "merely returns an error is reported as no crash, because an answer means "
+        "the service is still serving.",
+    "timing_differential":
+        "It times the same request twice over: with the input that triggers the "
+        "blowup, and with ordinary input of the same shape, the benign ones first "
+        "while the instance is idle. It takes medians over several measurements and "
+        "reports only when the payload is both slow outright and far slower than "
+        "its control, so a route that is simply slow is not a finding.",
+}
+
+
+def _manual_poc_guide(cve: str, spec: dict[str, Any], plan: dict[str, Any], port: int) -> str:
+    """What the operator needs beside the script, and nothing more."""
+    strategy = spec["strategy"]
+    # Keyed on the strategy, every one of them. This was an if/else on
+    # inband_differential against everything else, which meant the guide for
+    # a direct_observation script told the operator it sends a marker, and
+    # would have told a service_crash operator it only reads.
+    how = _GUIDE_HOW[strategy]
+    # The same text the script's own header carries, so the two cannot drift,
+    # and it already accounts for an upload or an authenticated session.
+    leaves = _poc_footprint(spec)
+    crashes = strategy == "service_crash"
+    # A command line the operator can paste and have work. Shown with the
+    # acknowledgement where the script will not run without it, and with
+    # every input the spec declares, because the script refuses to start
+    # without them -- and the guide used to print a command that could not
+    # run for any spec that declared one.
+    extra_flag = " --allow-disruption" if crashes else " --show-bodies"
+    for name in spec.get("inputs") or ():
+        extra_flag += f" \\\n    --input {name}=..."
+    gate = (
+        "\n\nIt will not run without `--allow-disruption`, and that is deliberate: the\n"
+        "payload is expected to leave the service not answering, which on anything\n"
+        "shared or in production is an outage. Nobody restarts it for you. Have the\n"
+        "owner's agreement in writing before you type it."
+        if crashes else ""
     )
-    leaves = (
-        "This strategy only reads, so it leaves nothing behind."
-        if strategy == "inband_differential"
-        else "This strategy sends one inert random marker, `cvelab-<16 hex>`, through the "
-        "vulnerable vector, because a reflection or storage bug cannot be shown "
-        "without sending something. Where the vector stores what it is given, that "
-        "marker stays until someone removes it -- this script does not remove it, so "
-        "tell the owner and clean it up."
+    declared = list(spec.get("inputs") or ())
+    inputs_note = (
+        "\nThis PoC needs values only you have, and refuses to start without them: `"
+        + "`, `".join(declared)
+        + "`. Pass each as `--input NAME=VALUE`."
+        + (
+            "\n\nWhere one of them names a path, that is because the affected project "
+            "ships no\nserver of its own: your application is what calls it, and the "
+            "route that reaches\nthe vulnerable code is yours, not the project's. Point "
+            "it at a route of yours\nthat passes a request through the affected library. "
+            "A route that never reaches it\nwill report `NOT_OBSERVED`, which means "
+            "nothing was tested rather than nothing is\nwrong."
+            if any("path" in name or "route" in name for name in declared) else ""
+        )
+        if declared else ""
     )
     project = plan.get("repository") or "the affected project"
     if plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION":
@@ -3380,13 +3756,13 @@ artifact, the one that leaves the lab.
 
 ```bash
 cd {cve}/artifacts
-python3 {MANUAL_POC_NAME} --target 10.0.0.5:8080 --show-bodies
-```
+python3 {MANUAL_POC_NAME} --target 10.0.0.5:8080{extra_flag}
+```{gate}
 
 `--target` is one host and port, however you write it: `10.0.0.5:8080`,
 `[2001:db8::1]:8443`, `app.example.com` or `https://app.example.com`. Without a
-scheme it assumes `http`, except on port 443. Every request path comes from the
-embedded spec, so the target carries none.
+scheme it assumes `http`, so the target carries no path.
+{inputs_note}
 
 Without `--show-bodies` each disclosed value is cut at 120 characters; with it
 they print in full, which is what a report needs as evidence. Add `--insecure`
@@ -3394,9 +3770,9 @@ for a self-signed certificate and `--json` for machine-readable findings.
 
 It names the target and the effect on stderr before it sends anything, so the
 run is visible in the output and in whatever log captured it. It sends live
-requests and reads what comes back, so point it only at a host your engagement
-covers, and keep that permission in writing: the effect it demonstrates is real
-data leaving a real server.
+requests against a real server, so point it only at a host your engagement
+covers, and keep that permission in writing: what it demonstrates happens for
+real on the instance you aim it at.
 
 ## Rehearse it first
 
@@ -3424,10 +3800,10 @@ Any other ending is a run that did not finish, not a result.
 ## What it does to the target
 
 It sends the requests in its embedded `SPEC` and nothing else. It does not
-escalate, create accounts, write files, or plant anything to make the effect
-easier to see. Read `SPEC` to see every request before you run it. The requests
-carry `User-Agent: CVELab-Field-PoC/1.0`, so the target's own logs can be
-matched to your run.
+escalate, create accounts, or plant anything to make the effect easier to see.
+Read `SPEC` to see every request before you run it. The requests carry
+`User-Agent: CVELab-Field-PoC/1.0`, so the target's own logs can be matched to
+your run.
 
 {leaves}
 
@@ -3597,19 +3973,33 @@ _DRAFT_INSTRUCTIONS = (
     "effect occurs on the vulnerable revision and not on the fixed one. That work is "
     "finished and recorded, and nothing in your answer changes it.\n\n"
     "Decide one thing. Can the effect the lab already confirmed also be shown by one script "
-    "pointed at one running instance, with no second instance to compare against? Many "
-    "vulnerabilities cannot: a crash or a hang, a race, a timing or memory signal, a library "
-    "with no listener of its own, anything needing a second host or a client you control. "
-    "When this one cannot, answer feasible=false and give the reason. That is the expected "
-    "answer for most labs and is not a failure -- prefer it over a guess.\n\n"
+    "pointed at one running instance, with no second instance to compare against? Some "
+    "vulnerabilities cannot: a race that needs two clients driven at once, a memory or "
+    "register state visible only inside the process, an effect that needs a second host "
+    "you control, a weakness in a client rather than a server. When this one cannot, "
+    "answer feasible=false and give the reason.\n"
+    "  Four things that used to be answered feasible=false are now expressible, and "
+    "answering feasible=false for them is the wrong answer. A crash, a panic or a hang "
+    "is service_crash: the service answering before the payload and not after is the "
+    "observation, and an outage is an impact an operator cares about more than most. An "
+    "algorithmic blowup -- a pathological regular expression, a quadratic parser, a "
+    "decompression bomb -- is timing_differential: the same request shape with ordinary "
+    "input is the control, and from outside the process the wall clock is exactly where "
+    "that effect shows. A project that ships no listener of its own is not out of reach "
+    "either: see the paragraph on a library below. And an effect needing a route a stock "
+    "instance does not serve is an input, not a refusal -- also below.\n\n"
     "Three things that sound like obstacles are not. The service need not speak HTTP. The "
     "effect need not come back in an answer. And a write the demonstration itself requires "
     "is allowed: where the effect is the write -- a record created that should have been "
     "refused, an entry added to shared configuration, a field changed by a caller who may "
     "not change it -- performing it is how it is shown, and marker_roundtrip is the strategy "
     "for it. What is not allowed is damage past what the demonstration needs: deleting what "
-    "is there, taking the service down, or touching anything the demonstration does not need "
-    "to touch.\n"
+    "is there, or touching anything the demonstration does not need to touch. Taking the "
+    "service down is in that class too, with one exception: where the finding IS that the "
+    "service goes down, service_crash is the strategy for it, the script refuses to run "
+    "without --allow-disruption, and its header says plainly that it causes an outage. Do "
+    "not reach for it for anything else -- a crash is not a shortcut to showing a bug whose "
+    "real effect is an answer.\n"
     "  Where the finding is that a request is accepted at all, you often need not "
     "complete the action to show it. A check the fixed build makes before the request "
     "reaches the code -- a CSRF token, an Origin, a signature, an authorization header "
@@ -3642,8 +4032,9 @@ _DRAFT_INSTRUCTIONS = (
     "domain. These reach access "
     "and what a session is permitted to do; they are not a way to attack the handshake, so "
     "do not propose one for a flaw in the protocol implementation itself.\n"
-    "  strategy: direct_observation, inband_differential, marker_roundtrip or "
-    "oob_callback, exactly one of those four spellings and no other.\n"
+    "  strategy: direct_observation, inband_differential, marker_roundtrip, "
+    "oob_callback, service_crash or timing_differential, exactly one of those six "
+    "spellings and no other.\n"
     "  observable_effect: one sentence naming what a run shows.\n"
     "  extract, wherever it appears -- in a discover step, in inband_differential, in a "
     "direct_observation expectation -- is exactly one of four things. {\"json_values\": "
@@ -3696,6 +4087,31 @@ _DRAFT_INSTRUCTIONS = (
     "Only observe's body is read and the probe responses are discarded, so when the effect is "
     "visible only in the response to the request that causes it, that request belongs in "
     "observe.\n"
+    "  For service_crash, when the effect is that the service stops serving -- an "
+    "unrecovered panic, an abort, an uncaught exception that takes the process with it, a "
+    "hang that never answers again: baseline, a list of requests that any working instance "
+    "answers, such as a health route or the index; and probe, the requests carrying the "
+    "input that kills it. A run sends baseline, then probe, then baseline again, and counts "
+    "only when the instance answered the first time and does not answer the last. So "
+    "baseline must be something ordinary and cheap that does not itself depend on the "
+    "weakness -- if it is the same request as the probe, the run can say nothing. A payload "
+    "that merely returns an error is not this strategy: a 500 is an answer, and an answer "
+    "means the service is still serving, so use direct_observation with {\"status\": 500} "
+    "instead.\n"
+    "  For timing_differential, when the effect is time -- a regular expression that "
+    "backtracks, a parser that goes quadratic, an input that makes the service do far more "
+    "work than its size suggests: probe, the requests carrying the pathological input; and "
+    "control, the same requests with ordinary input of comparable size. The control is what "
+    "makes the measurement mean anything, so it has to be the same route and the same shape, "
+    "differing only in the input the weakness is about -- a different endpoint proves "
+    "nothing. A run measures each several times, alternating, and compares medians. It "
+    f"counts only when the payload takes at least {MIN_TIMING_SECONDS} seconds outright and "
+    f"at least {MIN_TIMING_RATIO} times the control, and you may raise either bar with "
+    "min_seconds and min_ratio where the effect is stronger than that, which makes the "
+    "claim harder rather than easier. You may not lower them. repeats sets how many "
+    f"measurements each side gets, up to {MAX_TIMING_REPEATS}. Choose an input whose cost "
+    "is in the algorithm and not in its length: a payload that is simply enormous shows "
+    "bandwidth, not the weakness.\n"
     "  Over http a request is {\"method\": \"GET\", \"path\": \"/x\", \"headers\": {}, "
     "\"body\": null}. The requests share a session: a cookie the target sets is sent back "
     "on every request after it, discovery steps included, so a login handshake is written "
@@ -3803,8 +4219,29 @@ _DRAFT_INSTRUCTIONS = (
     "an endpoint the lab added so the validator could read internal state, or a page it "
     "renders to observe a browser, does not exist on a stock instance, so a spec aimed at "
     "it would pass against the lab and mean nothing against a real server. When the only "
-    "evidence is of that kind, or the project ships no listener of its own at all, answer "
-    "feasible=false and say which.\n"
+    "evidence is of that kind, answer feasible=false and say so.\n"
+    "  A project that ships no listener of its own -- a library, a parser, an "
+    "instrumentation package, anything an application depends on -- is a different case, "
+    "and used to be refused right here. It should not be. Nobody runs a library; they run "
+    "an application that calls it, and that application serves a route of its own which "
+    "reaches the vulnerable code. The lab's adapter stands in for exactly that route. So "
+    "the one thing the spec cannot hardcode is the path, because the operator's "
+    "application has its own: declare it as an input, name it something like target_path, "
+    "write the probe as {\"method\": \"POST\", \"path\": \"{{target_path}}\"}, and put the "
+    "lab's own adapter route in lab_values_json as that input's value so the script can be "
+    "proved here. The operator passes --input target_path=/their/route at run time.\n"
+    "    What makes this honest is that the payload is both the part that matters and the "
+    "part the lab proved: the input that triggers the weakness is the same bytes wherever "
+    "the library is called from. What a spec must not assume is a route only the lab "
+    "serves, and declaring it as an input is how that assumption is removed. Say in "
+    "observable_effect what the operator's route has to do to be in range -- that it "
+    "passes a request body to the library's render, parse or decode entry point -- so a "
+    "script pointed at a route that never reaches the library reports nothing, which is "
+    "an honest answer rather than a false one.\n"
+    "    Where such a library's effect is a panic, the strategy is service_crash and the "
+    "baseline is a route of the operator's application that answers normally. Where it is "
+    "an algorithmic blowup, it is timing_differential. Between those two and the input "
+    "above, a library CVE is expressible, and feasible=false is the wrong answer for it.\n"
     "  That list also decides which strategies can work here at all, so read it against "
     "the one you are about to choose. A lab that records outbound HTTP in process "
     "instead of sending it -- one disclosed exactly that, a 'global fetch in-process "
@@ -3832,7 +4269,8 @@ _DRAFT_INSTRUCTIONS = (
     "on the fixed one, so a spec that watches ordinary behaviour is discarded rather than "
     "shipped. Where the lab has no fixed build, which happens when the project publishes no "
     "resolvable patched revision, that check is unavailable and the strategy has to supply it: "
-    "inband_differential, marker_roundtrip and oob_callback each carry their own control and "
+    "inband_differential, marker_roundtrip, oob_callback, service_crash and "
+    "timing_differential each carry their own control and "
     "are allowed, while direct_observation is not, because its only check was the fixed build. "
     "A lab with no fixed build is not a reason to answer feasible=false."
 )
