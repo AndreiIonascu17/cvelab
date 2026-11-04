@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `service_crash` and `timing_differential`, two strategies for the effects the
+  manual PoC could not express. A crash, a panic or a hang is shown by asking
+  an ordinary question, sending the input that kills the service, and asking
+  again: answering before and not after is the finding, and a payload that
+  merely returns an error is reported as no crash, because an answer means the
+  service is still serving. An algorithmic blowup is shown by timing the
+  pathological input against ordinary input of the same shape, medians over
+  several measurements, counting only when the payload is both slow outright
+  and far slower than its control.
+
+  Measured, and the reason both exist: of ten CVEs in one batch, five
+  reproduced and **none** shipped a script. Two were panics whose draft refused
+  with "a crash signal rather than an answer"; one was a blowup it called
+  unobservable from outside the process. The vocabulary had no way to say
+  either, so the model was refusing correctly and the gap was ours.
+
+- A library's route is an input, not a refusal. Nobody runs a library; they run
+  an application that calls it, and the route reaching the vulnerable code
+  belongs to that application. A probe path may now be a substitution naming an
+  input, so the lab's own adapter route stands in while the script is proved
+  and the operator passes `--input target_path=/their/route` to run it. Four of
+  the five refusals above said some version of "a stock instance has no such
+  route". The payload -- the part the lab proved, and the part that matters --
+  is the same bytes wherever the library is called from.
+
+- `--allow-disruption`, without which a `service_crash` script does nothing.
+  Every other strategy asks no more of a target than an ordinary request; this
+  one is expected to leave the service not answering, so the acknowledgement is
+  required rather than assumed, and a run without it is refused rather than
+  reported as nothing found. The script header, the generated guide and the
+  refusal itself all say it causes an outage.
+
+### Fixed
+
+- A request to a server that dies mid-response no longer ends the script as an
+  unhandled traceback. `RemoteDisconnected` is `ConnectionResetError` and
+  `BadStatusLine`, and neither is a `URLError`, so the clause naming
+  `URLError`, `TimeoutError` and `SSLError` let it straight past. Found by
+  running a `service_crash` PoC against a service that really does exit
+  mid-request, where a dropped connection is the whole observation and came
+  back as a crashed script instead.
+
+- A `timing_differential` run takes every benign measurement before the first
+  payload, not alternating with it. Alternating sounds fairer and is wrong
+  here, measured: the payload this strategy exists for occupies the service,
+  and against a single-threaded stand-in every benign request after it timed
+  out too -- 30s against 30s, 1.0x, no finding, for a weakness that had wedged
+  the service outright. It also stops sending payloads once one never answers,
+  because a wedged service has nothing more to tell the check.
+
+- The generated guide describes the script beside it. It branched on
+  `inband_differential` against everything else, so a `direct_observation`
+  guide told the operator it sends a marker it does not send -- and a
+  `service_crash` guide would have read "it only reads" above a script that
+  causes an outage. Every strategy now has its own description, and the
+  footprint is the same text the script's own header carries, so the two cannot
+  drift.
+
+- The guide's pasteable command includes every input the spec declares. The
+  script refuses to start without them, by design, so for any spec that
+  declared one the guide printed a command that could not run.
+
+- A declined request is asked again on another model by default, which recovers
+  the CVE instead of losing it. The provider's own refusal text points
+  integrators at this remedy. It was off unless `CVELAB_FALLBACK_MODEL` named a
+  model, on the grounds that a decline a fallback answered is not the same
+  measurement as a run never declined -- which is true, and the other error was
+  bigger: three of ten CVEs in one batch were lost to declines with nothing
+  else wrong. Both stay countable, because the decline is recorded before the
+  second attempt is made. `CVELAB_FALLBACK_MODEL=off` restores the old
+  behaviour, which is how refusals are measured as they fall.
+
 ### Changed
 
 - A proven spec is kept and reused, so `cvelab manual` on the same lab gives

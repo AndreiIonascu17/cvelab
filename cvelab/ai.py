@@ -82,24 +82,35 @@ class ProviderDeclined(RuntimeError):
         )
 
 
-def fallback_model() -> str | None:
-    """The model a declined request is asked again on, if one is configured.
+def fallback_model(provider: str | None = None) -> str | None:
+    """The model a declined request is asked again on.
 
     Anthropic's own guidance for integrators: a refusal arrives as a normal
     answer with stop_reason "refusal" and a category, and the same request
     sent to another model usually gets an answer. Every decline CVELab has
-    recorded -- seven of them -- came back under the category "cyber", which
-    the provider documents as one that "benign cybersecurity work can also
-    trigger". Claude Haiku has no server-side fallback, so this is the
-    client-side form the documentation points to.
+    recorded came back under the category "cyber", which the provider
+    documents as one that "benign cybersecurity work can also trigger".
+    Claude Haiku has no server-side fallback, so this is the client-side form
+    the documentation points to.
 
-    It is off unless CVELAB_FALLBACK_MODEL names a model, because it changes
-    what a benchmark measures: a decline that a fallback answered is not the
-    same as a run that was never declined, and the usage record keeps both.
+    CVELAB_FALLBACK_MODEL names it; where it does not, the provider's own
+    default stands in, and CVELAB_FALLBACK_MODEL=off turns the whole thing
+    off. It used to be off unless named, on the grounds that it changes what
+    a benchmark measures -- and it does. What settled it is the size of the
+    other error: a measured batch of ten lost three CVEs to declines with
+    nothing else wrong, and a lost CVE is a worse answer than a recorded
+    decline. Both are kept, so the distinction survives: `usage.note_decline`
+    records every refusal before the second attempt is made, and a run a
+    fallback rescued is never reported as one that was never declined.
+
     The request itself is never reworded.
     """
     named = os.getenv("CVELAB_FALLBACK_MODEL", "").strip()
-    return named or None
+    if named:
+        return None if named.lower() in ("off", "none", "0") else named
+    if provider is None:
+        return None
+    return get_provider(provider).declines_fallback_to or None
 
 
 class OutputBudgetExhausted(RuntimeError):
@@ -629,7 +640,7 @@ def structured_response(
         result = attempt(model)
     except ProviderDeclined as declined:
         usage.note_decline(getattr(declined, "category", None))
-        other = fallback_model()
+        other = fallback_model(selected)
         if not other or other == model:
             raise
         # The same request, on another model, which is what the provider's
@@ -638,7 +649,7 @@ def structured_response(
         # that were declined.
         progress.step(
             f"{get_provider(selected).label} declined the request on {model}; asking "
-            f"{other}, which CVELAB_FALLBACK_MODEL names"
+            f"{other} instead (CVELAB_FALLBACK_MODEL=off to stop this)"
         )
         result = attempt(other)
     _validate_schema(result, schema)

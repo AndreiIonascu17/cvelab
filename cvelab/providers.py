@@ -96,6 +96,15 @@ class Provider:
     # the model is always the user's choice. An unlisted model runs fine and
     # simply reports no price.
     models: tuple[str, ...] = ()
+    # The model a request this provider declined is asked again on, when the
+    # environment names none. A refusal arrives as an ordinary answer and the
+    # provider's own refusal text points integrators at this remedy, so the
+    # default is to take it: a declined request is a CVE lost, and three of
+    # ten in one measured batch were lost that way on claude-haiku-5-5 with
+    # nothing else wrong. The decline is recorded either way, so a run a
+    # fallback rescued is never counted as one that was never declined.
+    # Empty where the provider has no second model to reach for.
+    declines_fallback_to: str = ""
     notes: str = ""
 
 
@@ -134,6 +143,12 @@ PROVIDERS: dict[str, Provider] = {
             "claude-sonnet-5-5",
             "claude-haiku-5-5",
         ),
+        # Sonnet rather than Opus: a refusal turns on which model answers, so
+        # what matters is that it is a different one, and at half Opus's price
+        # this leaves Opus for whoever names it themselves. A run already on
+        # Sonnet gets no second attempt, which the caller handles by
+        # re-raising rather than asking the same model twice.
+        declines_fallback_to="claude-sonnet-5-5",
         prices={
             "claude-opus-5-5": (4.00, 20.00),
             "claude-opus-5": (5.00, 25.00),

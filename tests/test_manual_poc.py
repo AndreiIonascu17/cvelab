@@ -151,7 +151,7 @@ class ProofTests(unittest.TestCase):
             field, "_still_serving", return_value="127.0.0.1"
         ), mock.patch.object(
             field, "_run_field_script",
-            side_effect=lambda cid, port, script, transport, image, given, host=None:
+            side_effect=lambda cid, port, script, transport, image, given, host=None, disruptive=False:
                 outcomes[cid],
         ):
             return field.prove_manual_poc(
@@ -715,6 +715,22 @@ class NoFixedBuildTests(unittest.TestCase):
                 "strategy": "direct_observation", "observable_effect": "a 200",
                 "probe": [{"method": "GET", "path": "/a"}], "expect": {"status": 200},
             },
+            # Its control is in time: answering before the payload and not
+            # after, inside the one instance.
+            "service_crash": {
+                "strategy": "service_crash",
+                "observable_effect": "the service stops answering",
+                "baseline": [{"method": "GET", "path": "/health"}],
+                "probe": [{"method": "POST", "path": "/render", "body": "boom"}],
+            },
+            # And its control is the same route with input that does not
+            # trigger the blowup.
+            "timing_differential": {
+                "strategy": "timing_differential",
+                "observable_effect": "the pathological input stalls the service",
+                "probe": [{"method": "POST", "path": "/match", "body": "aaaaaaaa!"}],
+                "control": [{"method": "POST", "path": "/match", "body": "aaaaaaaa"}],
+            },
         }[strategy]
         with mock.patch.object(
             field, "_service_container", side_effect=lambda c, n, d, e: f"cid-{n}"
@@ -722,7 +738,7 @@ class NoFixedBuildTests(unittest.TestCase):
             field, "_still_serving", return_value="127.0.0.1"
         ), mock.patch.object(
             field, "_run_field_script",
-            side_effect=lambda cid, port, script, transport, image, given, host=None:
+            side_effect=lambda cid, port, script, transport, image, given, host=None, disruptive=False:
                 _run(observed, True),
         ):
             return field.prove_manual_poc(
@@ -763,7 +779,7 @@ class NoFixedBuildTests(unittest.TestCase):
             field, "_still_serving", return_value="127.0.0.1"
         ), mock.patch.object(
             field, "_run_field_script",
-            side_effect=lambda cid, port, script, transport, image, given, host=None:
+            side_effect=lambda cid, port, script, transport, image, given, host=None, disruptive=False:
                 _run(True, True),
         ):
             field.prove_manual_poc(
@@ -991,7 +1007,7 @@ class ServiceWentAwayTests(unittest.TestCase):
             field, "_container_logs", return_value="killed: out of memory"
         ), mock.patch.object(
             field, "_run_field_script",
-            side_effect=lambda cid, port, script, transport, image, given, host=None:
+            side_effect=lambda cid, port, script, transport, image, given, host=None, disruptive=False:
                 _run(True, True),
         ):
             return field.prove_manual_poc(
@@ -1979,7 +1995,7 @@ class SetupCanBindWhatItReadsTests(unittest.TestCase):
                  return_value={"requests": [], "bound": {"admin_key": "fresh-at-boot"}},
              ), mock.patch.object(
                  field, "_run_field_script",
-                 side_effect=lambda cid, port, script, transport, image, given, host=None:
+                 side_effect=lambda cid, port, script, transport, image, given, host=None, disruptive=False:
                      (seen.append(given), _run(observed=True, ran=True))[1],
              ):
             seen: list[Any] = []
@@ -2001,7 +2017,7 @@ class SetupCanBindWhatItReadsTests(unittest.TestCase):
                  return_value={"requests": [], "bound": {"admin_key": "from-the-lab"}},
              ), mock.patch.object(
                  field, "_run_field_script",
-                 side_effect=lambda cid, port, script, transport, image, given, host=None:
+                 side_effect=lambda cid, port, script, transport, image, given, host=None, disruptive=False:
                      (seen.append(given), _run(observed=True, ran=True))[1],
              ):
             seen: list[Any] = []

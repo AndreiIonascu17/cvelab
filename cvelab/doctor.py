@@ -228,12 +228,13 @@ def check_provider_config(provider: str | None, model: str | None,
                      f"Pass --key, or set {variable}.")
     # The key itself is never echoed, here or anywhere else.
     detail = f"{selected} {selected_model}, key present"
-    other = fallback_model()
-    if other:
-        detail += (
-            f"; a request this one declines is asked again on {other} "
-            "(CVELAB_FALLBACK_MODEL)"
-        )
+    other = fallback_model(selected)
+    if other and other != selected_model:
+        detail += f"; a request this one declines is asked again on {other}"
+    else:
+        # Said out loud: a decline is then the end of that CVE, which is the
+        # one failure mode no retry here can recover.
+        detail += "; a request this one declines ends the run (CVELAB_FALLBACK_MODEL)"
     return Check("ai provider", OK, detail)
 
 

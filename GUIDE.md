@@ -595,6 +595,11 @@ Two strategies carry the effect without a listener you have to stand up:
   observes it surface where it should not. The marker is fresh each run, so a
   reflection left by an earlier run is never counted.
 
+Two more carry their control in time rather than in a second reading:
+`service_crash`, where the instance answered before the payload and does not
+after, and `timing_differential`, which measures the pathological input against
+ordinary input of the same shape. Both are below.
+
 A spec names the strategy, the effect in words, and the requests; it never names
 a host. See `examples/field-spec.example.json`.
 
@@ -781,15 +786,100 @@ script works against any instance rather than the objects a fixture happened to
 create. A spec with several `checks` runs each independently and reports them
 together.
 
+### A crash, and a stall
+
+Two effects an operator cares about more than most, and both are read from one
+instance.
+
+`service_crash` is for a panic, an abort, an uncaught exception that takes the
+process with it, or a hang that never answers again. It asks an ordinary
+question, sends the input that kills the service, then asks the ordinary
+question again:
+
+```json
+{"strategy": "service_crash",
+ "observable_effect": "a crafted document panics the renderer and the process exits",
+ "baseline": [{"method": "GET", "path": "/health"}],
+ "probe":    [{"method": "POST", "path": "{{target_path}}", "body": "..."}],
+ "inputs":   ["target_path"]}
+```
+
+The finding is that the instance answered the first time and does not answer
+the last. `baseline` is required: without it a host that was already down reads
+as one the script killed. A payload that merely returns an error is reported as
+no crash -- a `500` is an answer, and an answer means the service is still
+serving, so that belongs in `direct_observation` with `{"status": 500}`.
+
+This is the one strategy that leaves the target worse than it found it, so the
+script **refuses to run without `--allow-disruption`**:
+
+```bash
+python3 Manual-PoC.py 10.0.0.5:8080 --allow-disruption --input target_path=/render
+```
+
+Without the flag it sends nothing and says why. That is a refusal, not a
+`NOT_OBSERVED`: nobody restarts the service for you, and on anything shared or
+in production it is an outage.
+
+`timing_differential` is for an algorithmic blowup -- a backtracking regular
+expression, a quadratic parser, a decompression bomb. It times the pathological
+input against ordinary input of the same shape:
+
+```json
+{"strategy": "timing_differential",
+ "observable_effect": "a pathological query stalls the request handler",
+ "probe":   [{"method": "POST", "path": "/match", "body": "aaaa...!"}],
+ "control": [{"method": "POST", "path": "/match", "body": "aaaa..."}]}
+```
+
+`control` must be the same route and the same shape, differing only in the
+input the weakness is about. A run takes every benign measurement first, while
+the instance is still idle, then the payloads, and compares medians. Taking
+them alternately is worse and was measured so: the payload occupies the
+service, and against a single-threaded target every benign request after it
+timed out too, reporting `1.0x` for a weakness that had wedged the service
+outright.
+
+It reports only when the payload is slow outright and far slower than its
+control, so a route that is simply slow is not a finding. `min_seconds`,
+`min_ratio` and `repeats` tune it; the first two may be raised, never lowered.
+
+### A library has no server, so the route is yours
+
+Nobody runs a library. They run an application that calls it, and the route
+reaching the vulnerable code belongs to that application, not to the project
+the CVE names. So a probe path may be a substitution naming an input:
+
+```json
+{"probe": [{"method": "POST", "path": "{{target_path}}", "body": "..."}],
+ "inputs": ["target_path"]}
+```
+
+The lab's own adapter route stands in while CVELab proves the script; you pass
+`--input target_path=/your/route` to run it. What travels is the payload -- the
+input that triggers the weakness, the same bytes wherever the library is called
+from, and the part the lab actually proved.
+
+Point it at a route of yours that passes a request through the affected
+library. One that never reaches it reports `NOT_OBSERVED`, which means nothing
+was tested rather than nothing is wrong.
+
 ### What the field mode will not do
 
 A class whose effect is not observable on a live target over the wire has no
-field PoC: a memory over-read that only crashes a worker, a race, a timing
-signal. The mode declines such a spec rather than emit a script that prints a
-verdict it never observed. And `NOT_OBSERVED` on a real target is not proof of a
-patch -- a differential strategy also returns it when the instance simply had
-nothing to disclose. To decide affected vs fixed regardless of data, check the
-build.
+field PoC: a race that needs two clients driven at once, a memory or register
+state visible only inside the process, an effect needing a second host you
+control, a weakness in a client rather than a server. The mode declines such a
+spec rather than emit a script that prints a verdict it never observed.
+
+A crash, a hang and a timing signal used to be on that list and are not any
+more, and neither is a library with no listener of its own -- see the two
+sections above.
+
+And `NOT_OBSERVED` on a real target is not proof of a patch: a differential
+strategy also returns it when the instance simply had nothing to disclose, and
+a route that never reaches the affected code returns it too. To decide affected
+vs fixed regardless of data, check the build.
 
 ## 10b. The same deliverable from a source lab
 
