@@ -43,6 +43,148 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A provider too busy to answer no longer counts as a failed repair. Requests
+  now retry a 429, 500, 502, 503, 504 or 529 with a widening pause, honouring
+  `Retry-After` where the server sends one; the statuses that mean the request
+  itself was wrong are untouched and still stop the run. A stall that outlasts
+  those retries gives its attempt back instead of spending it, and leaves the
+  lab's own failure in place rather than replacing it with an HTTP status:
+  measured on a batch of ten, one CVE lost two of its four repair attempts to
+  `overloaded_error`, and each loss also pushed the real evidence a level
+  deeper into the next prompt. Tunable with `CVELAB_PROVIDER_RETRIES`.
+- A pair of revisions that cannot show its fix becomes a vulnerable-only lab
+  before generation, instead of being discovered after five repairs. One lab in
+  the repeated benchmark set had snapshots differing in a single translated
+  README, leaving the file the advisory names byte-identical in both; the
+  attack ran, the effect appeared on both services, and every repair was asked
+  for a differential the inputs forbade. A pair whose two revisions resolve to
+  the same tree is the other half of the same fault and was not caught at all,
+  because zero changed files is not prose.
+
+  What such a pair costs is now the fixing reference, not the run: the
+  vulnerable revision is still authentic, and as Limitations has always said,
+  the absence of a public fix prevents differential validation of remediation
+  rather than a PoC against the affected version. `fix_status` becomes
+  `PUBLIC_FIX_NOT_IDENTIFIED`, and the reason ends with the remedy -- the
+  fixing reference in hand is not the fix, so resolve it again. It reaches
+  `plan.json`, the generation attempt in `automation.json` where a batch reads
+  it, and `artifacts/EVIDENCE.json` under `provenance`, which is the copy that
+  survives `--no-poc`; `REPORT.md` and `WALKTHROUGH.md` then say a fixed
+  revision was identified and discarded, and why, so a demoted lab is neither
+  confused with one whose fix was never found nor told to wait for a fix it
+  already has. The patched snapshot is taken back off disk only once the
+  answer has validated and the demoted plan is about to be written, so a
+  provider that declines or a Ctrl-C leaves the lab exactly as it was; the
+  stamp is unlinked before the tree it vouches for, so an interrupt mid-delete
+  cannot leave an intact stamp hiding a truncated snapshot. Repair demotes the
+  same way, as defence in depth for a lab generated before the check existed.
+  The check is deterministic, so it runs before the first token is spent, and
+  it leans toward keeping the differential: the extension decides and nothing
+  else, so a dependency bump, a lockfile, a policy file, a template, a
+  migration, a test and a workflow are all real fixes and still build a
+  differential.
+- The validator's build context is described by what the answer actually put
+  there. The rejection for an uncopyable file named `requirements.txt` among
+  the context's contents, which is only true when the answer returns
+  `validator/requirements.txt`, so a model was told the file was present and
+  then refused for copying it. The generation instructions now say the same
+  thing, once, in both places they are built.
+- The fidelity level and `vendor_product_started` are required to agree in the
+  instructions, not only in the guard that rejects the answer. `source_component`
+  with a started product was one of three repairs lost to contract violations
+  in a single run.
+- The archived-pool hint no longer offers a newer base image as the better
+  alternative. It did, and the first run to receive it took the offer: a lab
+  pinned to python 3.8 moved from bullseye to `python:3.8.16-bookworm` and the
+  build died on a tag that has never existed, because python 3.8 reached end
+  of life before bookworm shipped. A release reaches the archive at about the
+  time the interpreter above it is dropped, so the population this hint is for
+  is the one where its alternative cannot be built. The hint now names that
+  failure and says to keep the base image and redirect apt.
+- That warning is now attached to the failure it describes rather than to the
+  one the model has already escaped. It lived at the end of the archived-pool
+  hint, so the only run ever shown it was one that had not invented a tag yet;
+  the run that did invent one was classified `runtime_error` and reached a
+  repair carrying a Docker log and nothing else. Two classes of build failure
+  were arriving that way, four of forty measured attempts between them, and
+  each now has a name and a hint:
+
+  - A base image tag that was never published is `unknown_base_image`.
+    Metadata resolution precedes every layer, so nothing below the `FROM`
+    line has run and the log says nothing about the lab. The hint carries the
+    measured lesson -- for an old CVE there is often no variant of the pinned
+    interpreter on a supported release at all, so the answer is the older
+    release with apt redirected, not a newer tag -- and says to name only a
+    tag known to be published.
+  - A dependency version that cannot be fetched is `dependency_pin`: no
+    published version satisfies the requirement, the proxy has withdrawn the
+    one named, or a recorded checksum disagrees with what is served. The hint
+    says to change the pin the output names and to leave the vulnerable and
+    patched revisions on the versions they are on, because relaxing the
+    product's own pin makes the build pass by removing the fix.
+
+  Neither is retried: an unpublished tag and a bad pin are answers that will
+  not change, which is the same reason a `404` is not in the retry markers.
+  The archived pool is still classified first, because one compose solve can
+  produce both and its remedy is the one the other would contradict.
+
+  The marker list was checked against docker 29.9.2 and buildx 0.38.1 rather
+  than assumed. Modern buildkit says `failed to resolve source metadata` and
+  then plain `not found`; it does not say `manifest unknown`, which is the
+  older distribution wording and is matched only for daemons that still emit
+  it.
+- A clone that fails because the repository is not there stops generation at
+  once instead of asking three more times. One of the ten in the repeated
+  benchmark set had its upstream removed between the advisory and the run; all
+  four generation attempts went to an answer that could not change, and the
+  artifact recorded a generic `generation_error` with the cause four attempts
+  back. Such a failure is now `source_unavailable` and says so in one line.
+  A name-resolution failure on the clone is untouched, and still retried.
+- A build that failed for want of something it had to download is no longer
+  sent to a model to rewrite. Three of thirty attempts across three runs of
+  the same ten CVEs ended this way, and not one was a question a model could
+  answer, so each spent the lab's whole repair budget making a correct
+  Dockerfile worse and was recorded `AUTO_REPAIR_EXHAUSTED`. These now split
+  in two, and neither goes to the old path:
+
+  - A mirror, module proxy or name server that is briefly away -- a hash sum
+    mismatch, a `503`, an `i/o timeout` -- is retried as it stands, up to
+    `CVELAB_TRANSIENT_RETRIES` times (2, `CVELAB_TRANSIENT_PAUSE` seconds
+    apart, 15), without spending a validation attempt or a repair. A build
+    that never produced an image says nothing about the PoC, which is the same
+    reason a startup failure already had its own budget.
+  - A `404` is not that, and retrying it is futile: it says the file is not
+    there and will not be. Debian moves a release's pool to
+    `archive.debian.org` once its support ends but keeps serving that
+    release's index from `deb.debian.org`, so `apt-get update` succeeds,
+    reads a current version out of a current index, and every download of it
+    404s in the same layer seconds later. This reaches a repair as it did
+    before, but carrying the one thing the symptom does not point at: the
+    packages are fine, the sources are not.
+
+  Verified against `python:3.8-slim-bullseye`, the sentry lab's own base: the
+  security index lists `libpq5 13.23-0+deb11u4` and gives its pool path, every
+  mirror 404s that path, `archive.debian.org` serves it, and the install then
+  completes. The sentry lab failed this way in all three runs and still does,
+  which is how a retry alone was ruled out.
+
+- A lab built from a monorepo links a module to the sibling beside it rather
+  than to the version its `go.mod` names. Go's `go.work` is conventionally
+  gitignored -- mattermost ignores it twice over -- so a checkout of such a
+  repository cannot build as it stands, and the build fails on symbols the
+  checkout plainly contains. The generator is now told the rule, and told to
+  confirm it with `go list -m`, which names no version when a module resolved
+  to a local directory.
+
+  CVE-2026-6961 cost all three runs this way. Verified in
+  `golang:1.25-bookworm` against that lab's own checkout: without a workspace
+  `go list -m` answers `server/public v0.1.12`, the published module missing
+  both symbols the build wanted; with `go work init . ./public` it answers
+  `server/public` and no version, and the two packages compile. One of the
+  three runs had written the workspace itself and lost the build to a module
+  download, which the retry above now covers -- the two halves of that CVE's
+  failure, and both measured rather than assumed.
+
 - A request to a server that dies mid-response no longer ends the script as an
   unhandled traceback. `RemoteDisconnected` is `ConnectionResetError` and
   `BadStatusLine`, and neither is a `URLError`, so the clause naming

@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from cvelab import closed
+from cvelab import closed, predicate
 
 
 def _contract(**extra: Any) -> dict[str, Any]:
@@ -310,6 +310,83 @@ class MatcherAgreementTests(unittest.TestCase):
             closed._matches({"status": 200, "headers": {}, "body": ""}, {})
         with self.assertRaises(SystemExit):
             self.script_matches(200, {}, "", {})
+
+    def test_the_script_reads_every_kind_the_evaluator_knows(self) -> None:
+        """A kind one side gained and the other did not would disagree quietly.
+
+        The runner's evaluator now lives in its own module, which the script
+        cannot import: it is copied into a container that has no CVELab in it.
+        So the vocabulary is what has to be kept in step, and this is the only
+        place that can notice when it is not.
+        """
+        for kind in predicate.KINDS:
+            self.assertIn(f'"{kind}" in match', closed._POC_SCRIPT, kind)
+
+
+class PredicateEvidenceTests(unittest.TestCase):
+    """The lines the runner records about what it measured.
+
+    They are quoted verbatim into EVIDENCE.json as `observable_effect` and
+    into the walkthrough, so they are a published part of the lab rather than
+    a debug message. Pinned because the evaluator moved to `predicate.py`:
+    re-wording a line here would silently rewrite every closed lab's evidence.
+    """
+
+    RESPONSE = {
+        "status": 200,
+        "headers": {"Server": "nginx/1.25", "X-Tok": "abc"},
+        "body": "canary 42",
+    }
+
+    def test_what_held_is_recorded_clause_by_clause(self) -> None:
+        confirmed, predicates = closed._matches(
+            self.RESPONSE,
+            {
+                "status": [200, 404],
+                "body_contains": "canary",
+                "body_regex": "42",
+                "header": {"name": "Server", "contains": "nginx"},
+            },
+        )
+        self.assertTrue(confirmed)
+        self.assertEqual(
+            predicates,
+            [
+                "status=200 allowed=[200, 404] passed=True",
+                "body_contains='canary' passed=True",
+                "body_regex='42' passed=True",
+                "header='Server' contains='nginx' passed=True",
+            ],
+        )
+
+    def test_what_did_not_hold_is_recorded_the_same_way(self) -> None:
+        for match, line in (
+            ({"status": 404}, "status=200 allowed=[404] passed=False"),
+            ({"body_contains": "absent"}, "body_contains='absent' passed=False"),
+            ({"body_regex": "^canary$"}, "body_regex='^canary$' passed=False"),
+            ({"header": {"name": "Server", "contains": "apache"}},
+             "header='Server' contains='apache' passed=False"),
+        ):
+            with self.subTest(match=match):
+                confirmed, predicates = closed._matches(self.RESPONSE, match)
+                self.assertFalse(confirmed)
+                self.assertEqual(predicates, [line])
+
+    def test_a_contract_nothing_can_decide_stops_the_run(self) -> None:
+        """No verdict is written for a measurement that was never made.
+
+        A contract whose predicate cannot be evaluated is a contract that
+        proves nothing, and the closed path has always raised here rather
+        than report `confirmed: false` as if a fixed build had been measured.
+        """
+        for label, response, match in (
+            ("no body was observed", {"status": 200, "headers": {}}, {"body_contains": "x"}),
+            ("the pattern does not compile", self.RESPONSE, {"body_regex": "(unterminated"}),
+            ("the header clause is half written", self.RESPONSE, {"header": {"name": "Server"}}),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    closed._matches(response, match)
 
 
 class EvidenceTests(unittest.TestCase):

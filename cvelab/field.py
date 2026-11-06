@@ -53,8 +53,6 @@ it never observed.
 
 from __future__ import annotations
 
-import base64
-import binascii
 import contextlib
 import json
 import os
@@ -62,11 +60,11 @@ import re
 import shutil
 import subprocess
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import progress, sidecar
+from . import progress, sidecar, steps
 from .ai import ProviderDeclined, ai_is_configured, structured_response
 from .closed import (
     DEFAULT_HEALTH_TIMEOUT,
@@ -153,23 +151,36 @@ MIN_TIMING_SECONDS = 0.5
 TIMING_REPEATS = 3
 MAX_TIMING_REPEATS = 7
 
-#: The marker the operator's script generates fresh per run, so a stored
-#: reflection from an earlier run is never mistaken for this one's.
-_MARKER_TOKEN = "{{marker}}"
-
-#: The target as the operator wrote it, and its host alone. A spec cannot
-#: name a host -- the operator supplies that at run time -- but some effects
-#: are about the target's own address: an Origin or Referer the server is
-#: supposed to reject, a DNS-rebinding check, a redirect back to itself. A
-#: measured lab reproduced and then had no spec for exactly this reason.
-_TARGET_TOKENS = ("target", "targetHost")
+# The step grammar lives in cvelab.steps, because three callers need it and
+# only one of them can run it: the step that validates a generated lab's
+# answer has to read it before any build exists, and importing this module to
+# get it would drag a provider and Docker along. What stayed here is the
+# runner -- a sidecar joined to one container's network namespace, which is
+# what a single-target proof has and a compose-network lab does not.
+#
+# The spellings are the ones this file has always used, so that every name it
+# held before the move still resolves here and to the same object.
+_MARKER_TOKEN = steps.MARKER_TOKEN
+_TARGET_TOKENS = steps.TARGET_TOKENS
+_BIND_NAME = steps.BIND_NAME
+EXTRACTORS = steps.EXTRACTORS
+_MAX_REQUESTS = steps.MAX_REQUESTS
+_MAX_INPUTS = steps.MAX_INPUTS
+_MAX_UPLOAD_PARTS = steps.MAX_UPLOAD_PARTS
+_PART_CONTENT = steps.PART_CONTENT
+_MAX_SETUP_REQUESTS = steps.MAX_SETUP_REQUESTS
+_substitutions = steps.substitutions
+_validate_request = steps.validate_request
+_validate_upload = steps.validate_upload
+_validate_extractor = steps.validate_extractor
+_validate_inputs = steps.validate_inputs
+_validate_setup = steps.validate_setup
 
 #: Where the script's own listener can be reached, substituted into the probe.
 #: The operator names it when the target cannot reach the bound address
 #: directly, which is the usual case across a network.
 _CALLBACK_TOKEN = "{{callback}}"
 
-_MAX_REQUESTS = 25
 _MAX_FIELD_OUTPUT = 32 * 1024
 
 #: How the script talks to the one target. HTTP was the only transport at
@@ -215,124 +226,6 @@ AUTH_FIELDS = {
 
 #: A socket exchange reads until the delimiter, the cap, or the peer stops.
 _MAX_READ = 1024 * 1024
-
-
-def _validate_request(request: Any, where: str) -> dict[str, Any]:
-    if not isinstance(request, dict):
-        raise ValueError(f"{where} must be an object")
-    path = str(request.get("path", "/"))
-    if not path.startswith(("/", "{{")):
-        # A path that begins with a substitution is the one exception, and it
-        # is what makes a library CVE expressible: nobody runs a library, they
-        # run an application that calls it, and that application's route is
-        # the operator's to name. The lab's own adapter route stands in for it
-        # while the script is proved here. What the value has to be is checked
-        # where it is known -- the script refuses a filled path that is not
-        # relative, so an operator passing a whole URL is told so rather than
-        # sending a request somewhere else entirely.
-        raise ValueError(
-            f"{where} path must start with / or with a substitution naming an input"
-        )
-    method = str(request.get("method", "GET")).upper()
-    headers = request.get("headers", {})
-    if not isinstance(headers, dict):
-        raise ValueError(f"{where} headers must be an object")
-    body = request.get("body")
-    if isinstance(body, (dict, list)):
-        # A JSON body written as an object is what anyone means, and demanding
-        # the escaped string form cost a lab its spec for nothing: the draft
-        # was otherwise correct and was thrown away over quoting. Serialised
-        # here, so what the script sends is still one exact string.
-        body = json.dumps(body)
-    elif body is not None and not isinstance(body, str):
-        raise ValueError(f"{where} body must be a string or a JSON object")
-    out: dict[str, Any] = {
-        "method": method,
-        "path": path,
-        "headers": {str(k): str(v) for k, v in headers.items()},
-        "body": body,
-    }
-    if request.get("upload") is not None:
-        if body is not None:
-            raise ValueError(f"{where} takes body or upload, not both")
-        out["upload"] = _validate_upload(request["upload"], f"{where}.upload")
-    return out
-
-
-#: Parts in one upload. A few: this is a form, not a filesystem.
-_MAX_UPLOAD_PARTS = 6
-
-#: What one part's content may be built from, besides a plain form field.
-_PART_CONTENT = ("text", "base64", "tar_gz", "zip")
-
-
-def _validate_upload(value: Any, where: str) -> list[dict[str, Any]]:
-    """A multipart/form-data body, with its file parts built at run time.
-
-    Three labs that reproduced were refused a manual PoC over this, the last
-    of them naming it outright: "the precondition needs a denied report.dat
-    uploaded through the user files API as multipart", and before it, "the
-    effect is a write of a gzip-compressed tar bundle ... a binary gzip
-    archive cannot be expressed faithfully". A crafted upload is a whole
-    class of weakness -- an archive that escapes its extraction root, a file
-    whose name or type a filter should have refused -- and it was the one
-    thing a spec could not say.
-    """
-    if not isinstance(value, list) or not value:
-        raise ValueError(f"{where} must be a non-empty list of parts")
-    if len(value) > _MAX_UPLOAD_PARTS:
-        raise ValueError(f"{where} may hold at most {_MAX_UPLOAD_PARTS} parts")
-    parts = []
-    for index, part in enumerate(value):
-        at = f"{where}[{index}]"
-        if not isinstance(part, dict):
-            raise ValueError(f"{at} must be an object")
-        name = str(part.get("name", "")).strip()
-        if not name:
-            raise ValueError(f"{at}.name must be the form field's name")
-        kinds = [kind for kind in _PART_CONTENT if part.get(kind) is not None]
-        if "value" in part and not kinds:
-            parts.append({"name": name, "value": str(part["value"])})
-            continue
-        if len(kinds) != 1:
-            raise ValueError(
-                f"{at} needs value for a form field, or exactly one of "
-                f"{', '.join(_PART_CONTENT)} for a file part"
-            )
-        kind = kinds[0]
-        built: dict[str, Any] = {
-            "name": name,
-            "filename": str(part.get("filename") or name),
-            "content_type": str(part.get("content_type") or "application/octet-stream"),
-            "kind": kind,
-        }
-        if kind == "text":
-            built["text"] = str(part["text"])
-        elif kind == "base64":
-            raw = str(part["base64"])
-            # Checked before the encoding is, because a marker here is the
-            # mistake worth naming: it would be sent as six literal
-            # characters inside the bytes, or refused as bad base64, and
-            # neither says what to do instead.
-            if _MARKER_TOKEN in raw:
-                raise ValueError(
-                    f"{at}.base64 cannot carry {_MARKER_TOKEN}; put the marker in a "
-                    "text, tar_gz or zip part, which are built at run time"
-                )
-            try:
-                base64.b64decode(raw, validate=True)
-            except (ValueError, binascii.Error) as error:
-                raise ValueError(f"{at}.base64 is not valid base64: {error}") from error
-            built["base64"] = raw
-        else:
-            files = part[kind]
-            if not isinstance(files, dict) or not files:
-                raise ValueError(f"{at}.{kind} must map a file name to its text")
-            if any(not str(n).strip() or not isinstance(t, str) for n, t in files.items()):
-                raise ValueError(f"{at}.{kind} names must be text and so must their contents")
-            built[kind] = {str(n): t for n, t in files.items()}
-        parts.append(built)
-    return parts
 
 
 def _validate_message(message: Any, where: str) -> dict[str, Any]:
@@ -448,6 +341,20 @@ def _validate_auth(value: Any, transport: str, inputs: list[str]) -> dict[str, s
     return out
 
 
+#: What one entry of a sequence is, per transport. HTTP is the shared case and
+#: lives in cvelab.steps; the rest are socket exchanges and session operations,
+#: which only a script run from here speaks.
+_SEQUENCE_ITEM: dict[str, Callable[[Any, str], dict[str, Any]]] = {
+    "http": _validate_request,
+    "tcp": _validate_message,
+    "tls": _validate_message,
+    "ws": _validate_message,
+    "wss": _validate_message,
+    "ssh": _validate_exec,
+    "smb": _validate_smb_op,
+}
+
+
 def _validate_sequence(value: Any, where: str, transport: str = "http") -> list[dict[str, Any]]:
     """A sequence of requests, or of socket exchanges on one connection.
 
@@ -455,93 +362,14 @@ def _validate_sequence(value: Any, where: str, transport: str = "http") -> list[
     protocol that needs a login before a command cannot be expressed as
     independent messages. HTTP requests stay independent, as they were.
     """
-    if not isinstance(value, list) or not value:
-        raise ValueError(f"{where} must be a non-empty list")
-    if len(value) > _MAX_REQUESTS:
-        raise ValueError(f"{where} may hold at most {_MAX_REQUESTS} requests")
-    one = {
-        "http": _validate_request,
-        "tcp": _validate_message,
-        "tls": _validate_message,
-        "ws": _validate_message,
-        "wss": _validate_message,
-        "ssh": _validate_exec,
-        "smb": _validate_smb_op,
-    }[transport]
-    return [one(item, f"{where}[{index}]") for index, item in enumerate(value)]
-
-
-#: A name a discover step or an input binds, used only as a substitution key.
-#: Lowercase-only was arbitrary and cost a measured lab its spec: the draft
-#: was otherwise right and bound oauthState, so a correct answer was thrown
-#: away over a letter's case.
-_BIND_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,31}")
-
-#: Where the evidence is read from. Only bodies could be read at first, which
-#: left two measured labs unprovable for no reason to do with their CVE: one
-#: disclosed a token in a response header, and one differed only in its status
-#: code, 200 against 401. Both are the ordinary shape of an authorization
-#: finding, so both are read now.
-EXTRACTORS = ("json_values", "regex", "header", "status")
-
-
-def _validate_extractor(value: Any) -> dict[str, Any]:
-    """How tokens are pulled from a response for the set-difference proof."""
-    listed = ", ".join(EXTRACTORS)
-    if not isinstance(value, dict) or len(value) != 1:
-        raise ValueError(f"extract must be exactly one of {listed}")
-    if "json_values" in value:
-        name = str(value["json_values"])
-        if not name:
-            raise ValueError("extract.json_values must name a JSON key")
-        return {"json_values": name}
-    if "regex" in value:
-        pattern = str(value["regex"])
-        try:
-            re.compile(pattern)
-        except re.error as error:
-            raise ValueError(f"extract.regex is not a valid regex: {error}") from error
-        return {"regex": pattern}
-    if "header" in value:
-        name = str(value["header"]).strip()
-        if not name:
-            raise ValueError("extract.header must name a response header")
-        return {"header": name}
-    if "status" in value:
-        if value["status"] is not True:
-            raise ValueError("extract.status takes only true")
-        return {"status": True}
-    raise ValueError(f"extract must be one of {listed}")
-
-
-#: Values the operator supplies at run time, which the lab cannot know: a test
-#: account's credential, a tenant id, a licence key. A control request that
-#: has to read a resource "the correctly authorized way" needs one, and
-#: without them that whole shape of check could not be written.
-_MAX_INPUTS = 8
-
-
-def _validate_inputs(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if not isinstance(value, list) or len(value) > _MAX_INPUTS:
-        raise ValueError(f"inputs must be a list of at most {_MAX_INPUTS} names")
-    names = []
-    for offered in value:
-        name = str(offered)
-        if not _BIND_NAME.fullmatch(name):
-            raise ValueError(f"inputs name {name!r} must match {_BIND_NAME.pattern}")
-        if name in ("marker", "callback", *_TARGET_TOKENS):
-            raise ValueError(f"inputs cannot redefine {{{{{name}}}}}")
-        names.append(name)
-    return names
+    # The lookup is deferred into the call so the list is checked first, the
+    # order the one function had before the shared part of it moved out.
+    return steps.validate_sequence(
+        value, where, lambda item, at: _SEQUENCE_ITEM[transport](item, at)
+    )
 
 
 _MAX_DISCOVER_STEPS = 6
-
-
-def _substitutions(text: str) -> set[str]:
-    return set(re.findall(r"\{\{([A-Za-z][A-Za-z0-9_]*)\}\}", text))
 
 
 def _asserted_kind(expect: dict[str, Any]) -> str:
@@ -554,61 +382,6 @@ def _asserted_kind(expect: dict[str, Any]) -> str:
     if kind == "extract":
         return next(iter(expect["extract"] or {}), "")
     return kind
-
-
-#: How many requests may put the lab in the state the proof needs. Small on
-#: purpose: this is seeding, and a spec that needs more than this is
-#: describing a workflow rather than a precondition.
-_MAX_SETUP_REQUESTS = 10
-
-
-def _validate_setup(value: Any, inputs: Sequence[str]) -> list[dict[str, Any]]:
-    """Steps that put this lab in the state the effect needs.
-
-    They are HTTP whatever the probe speaks, because a seeding route is: the
-    lab's own /lab/seed, an admin API, a sign-up. An entry is a request, or
-    {"bind": name, "query": [requests], "extract": {...}} to read a value out
-    of one and fill it in for what follows.
-
-    That reading is what a fixed lab value cannot replace. A nebula-mesh lab
-    reproduced end to end and was refused a script because the effect needs a
-    non-admin API key, and "that admin key is generated fresh on each run, so
-    no fixed lab value can be recorded for it". A name bound here has to be
-    declared in inputs as well: the shipped script asks the operator for
-    their own, and this only supplies the lab's for the proof.
-    """
-    if not isinstance(value, list) or not value:
-        raise ValueError("setup must be a non-empty list of steps")
-    if len(value) > _MAX_SETUP_REQUESTS:
-        raise ValueError(f"setup may hold at most {_MAX_SETUP_REQUESTS} steps")
-    out: list[dict[str, Any]] = []
-    known = set(inputs) | set(_TARGET_TOKENS)
-    for index, item in enumerate(value):
-        at = f"setup[{index}]"
-        if isinstance(item, dict) and "bind" in item:
-            name = str(item.get("bind") or "")
-            if not _BIND_NAME.fullmatch(name):
-                raise ValueError(f"{at}.bind {name!r} must match {_BIND_NAME.pattern}")
-            if name not in set(inputs):
-                raise ValueError(
-                    f"{at}.bind {name!r} must also be declared in inputs, so the script "
-                    "the operator receives asks them for their own value"
-                )
-            query = _validate_sequence(item.get("query"), f"{at}.query")
-            missing = _substitutions(json.dumps(query)) - known
-            if missing:
-                raise ValueError(f"{at}.query uses names nothing binds: {sorted(missing)}")
-            out.append({
-                "bind": name, "query": query,
-                "extract": _validate_extractor(item.get("extract")),
-            })
-            continue
-        request = _validate_request(item, at)
-        missing = _substitutions(json.dumps(request)) - known
-        if missing:
-            raise ValueError(f"{at} uses names nothing binds: {sorted(missing)}")
-        out.append(request)
-    return out
 
 
 def _validate_expectation(value: Any, where: str) -> dict[str, Any]:
@@ -2477,6 +2250,9 @@ _SETUP_RUNNER = (
     "        with urllib.request.urlopen(call, timeout=60) as answer:\n"
     "            status = answer.status\n"
     "            body_back = answer.read(1048576).decode('utf-8', 'replace')\n"
+    # Held like status and body_back are: overwritten per request, read after
+    # the inner loop, so the extractor sees the last request's response.
+    "            headers_back = dict(answer.headers.items())\n"
     "            for header in answer.headers.get_all('Set-Cookie') or []:\n"
     "                pair = str(header).split(';', 1)[0].strip()\n"
     "                if '=' in pair:\n"
@@ -2485,6 +2261,10 @@ _SETUP_RUNNER = (
     "    except urllib.error.HTTPError as refused:\n"
     "        status = refused.code\n"
     "        body_back = refused.read(1048576).decode('utf-8', 'replace')\n"
+    # A refusal is a response and carries headers, which is where a seeding
+    # step's value can be: a 401 that still sets a CSRF token, a 403 naming
+    # the tenant it wanted. HTTPError.headers can be None, hence the guard.
+    "        headers_back = dict(refused.headers.items() if refused.headers else [])\n"
     "    except Exception as error:\n"
     "        print(json.dumps({'path': request['path'], 'error': str(error)[:300]}))\n"
     "        sys.exit(1)\n"
@@ -2512,6 +2292,17 @@ _SETUP_RUNNER = (
     "                stack.extend(node.values())\n"
     "            elif isinstance(node, list):\n"
     "                stack.extend(node)\n"
+    # The validator has accepted all four extractors since header was added,
+    # and this dispatch had three, so a spec declaring extract.header
+    # validated clean and then died on 'nothing to bind from the response' --
+    # a refusal that names the response rather than the gap in the runner.
+    # Matched case-insensitively because a header name is: validate_extractor
+    # only strips the name, so Location and location are the same header and
+    # the in-process extractor (tokens, above) already compares them lowered.
+    "    elif 'header' in taken:\n"
+    "        want = taken['header'].lower()\n"
+    "        found = next((value for name, value in headers_back.items()\n"
+    "                      if name.lower() == want and str(value)), None)\n"
     "    elif 'status' in taken:\n"
     "        found = status\n"
     "    if found in (None, ''):\n"

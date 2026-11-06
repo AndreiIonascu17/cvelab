@@ -28,7 +28,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
-from . import policy, progress
+from . import policy, predicate, progress
 from .ai import ai_is_configured, plan_with_ai
 from .providers import PROVIDERS
 from .templates import APP_PY, DOCKERFILE, VALIDATOR_DOCKERFILE, VALIDATOR_PY, compose_yaml
@@ -781,13 +781,27 @@ def shipyard_report(cve: str, lab_dir: Path, plan: dict) -> dict:
     vulnerable_result = validation.get("vulnerable", {})
     patched_result = validation.get("patched", {})
     proof_contract = plan.get("exploit_contract", {})
+    # The same measurement as the Docker path, for the same reason, and the
+    # second instance of the same defect rather than a different one: this
+    # read a string out of a JSON file an arbitrary script wrote and treated
+    # it as a mandatory proof. Nothing in CVELab generates a Shipyard runner
+    # -- plan.get("runner") is honoured only for a lab that arrived with one,
+    # behind the host-runner opt-in -- so there is no generation step here in
+    # which a predicate could be declared and refused. That makes this path
+    # fail closed where the Docker path can be made to pass: a plan that
+    # declares no effect_predicate, or a result.json that prints no
+    # observations, no longer reproduces. That is the right way round. The
+    # opt-in this path sits behind is about running a script on the host,
+    # not about whether its verdict is sound, and the report it writes is
+    # the strongest claim CVELab makes -- real_poc_verified together with
+    # product_e2e_verified, both shipped by `cvelab upload`.
+    effect_held, effect_evidence = effect_observed(validation, proof_contract)
     proof_checks = {
         "source_reproduction": plan.get("lab_type") == "END_TO_END_REPRODUCTION",
         "contract_effect_defined": bool(proof_contract.get("observable_effect")),
         "contract_evidence_defined": bool(proof_contract.get("evidence_type")),
         "attack_executed": validation.get("attack_executed") is True,
-        "security_effect_observed": validation.get("proof_quality")
-        == "end_to_end_security_effect_observed",
+        "security_effect_observed": effect_held,
         "observable_effect_recorded": bool(validation.get("observable_effect")),
         "evidence_type_matches": validation.get("evidence_type")
         == proof_contract.get("evidence_type"),
@@ -810,6 +824,10 @@ def shipyard_report(cve: str, lab_dir: Path, plan: dict) -> dict:
         "proof_contract": proof_contract,
         "fidelity": fidelity,
         "proof_checks": proof_checks,
+        "effect_evidence": effect_evidence,
+        "proof_quality_agreement": label_agreement(
+            validation, "end_to_end_security_effect_observed", effect_held
+        ),
         "real_poc_verified": validated,
         "product_e2e_verified": product_e2e_verified,
         "fix_status": plan.get("fix_status", "PUBLIC_FIX_AVAILABLE"),
@@ -1036,6 +1054,134 @@ def _validator_said(validation: dict[str, object], build: str, answer: str) -> b
     return held is True and build == "vulnerable" and answer == "confirmed"
 
 
+def _validator_observations(validation: dict, build: str) -> dict:
+    """The raw status, body and headers the validator printed for one build.
+
+    Nested beside that build's own `confirmed`, which is where the contract
+    asks for it, with the flat `vulnerable_observations` spelling accepted
+    for the same reason `_validator_said` accepts `vulnerable_confirmed`:
+    both shapes arrive, neither is worth a repair, and reading only one of
+    them has already cost this project two reproduced differentials.
+
+    An absent or wrongly shaped record returns an empty mapping rather than
+    raising. `predicate.effect_observed` then reports every clause as
+    undecided, which is the honest answer: nothing was measured.
+    """
+    held = validation.get(build)
+    if isinstance(held, dict) and isinstance(held.get("observations"), dict):
+        return held["observations"]
+    flat = validation.get(f"{build}_observations")
+    if isinstance(flat, dict):
+        return flat
+    return {}
+
+
+def effect_observed(
+    validation: dict, contract: dict, vulnerable_only: bool = False
+) -> tuple[bool, list[str]]:
+    """CVELab's own verdict on whether the declared security effect happened.
+
+    WHY THIS IS NOT A FIELD THE VALIDATOR WROTE
+
+    This check used to be `validation.get("proof_quality") ==
+    "security_effect_observed"`: a string equality on a key the model's own
+    validator prints about itself. A validator that printed that one literal
+    cleared a mandatory proof gate having measured nothing, and the lab
+    fixture checked in beside this package does exactly that -- it labels
+    the run from its own differential boolean. The anti-hardcoding guard in
+    sourcegen never looked at the field, so nothing stood in the way.
+    Reading some other validator-written key instead would only have moved
+    the hole: the problem was that the thing being judged was also the judge.
+
+    So the contract names the effect before any image is built, the
+    validator prints the observations, and the decision is made here. That
+    is the order of events the closed path has always had, and the evaluator
+    is literally the same one, lifted into `predicate.py` for this.
+
+    WHY THE DIFFERENTIAL IS WHAT ENFORCES SUBSTANCE
+
+    Moving the check onto a declared predicate is not on its own enough.
+    Executed against the evaluator, `{"body_contains": ""}` holds against a
+    body reading "nothing interesting happened here"; so does
+    `{"body_regex": ".*"}`; so does a status list naming both outcomes. A
+    model inclined to pass could declare one of those and clear the gate
+    exactly as hollowly as writing the literal did.
+
+    What rules that out is the shape of the question rather than a blocklist
+    of degenerate patterns: for a lab with a fixed build, the effect is that
+    the predicate held on the vulnerable side and did NOT hold on the
+    patched side. A vacuous predicate holds on both and so fails on its own
+    terms. There is nothing to write around, because the looser the
+    predicate the more certainly it fails.
+
+    A vulnerable-only lab has no patched side, so the comparison cannot do
+    that work there; the declaration is instead held to a syntactic minimum
+    at generation time, in `sourcegen._vulnerable_only_substance`.
+
+    Returns the verdict and the evidence lines behind it. Fails closed in
+    every direction: an undeclared predicate, a kind nothing evaluates, an
+    observation that was never printed and a pattern that does not compile
+    all read as the effect not having been observed, with the reason kept
+    rather than lost.
+    """
+    declared = contract.get("effect_predicate")
+    if not isinstance(declared, dict) or not predicate.declared_kinds(declared):
+        return False, [
+            "the contract declared no effect predicate, so nothing was measured; passed=False"
+        ]
+    unknown = predicate.unknown_kinds(declared)
+    if unknown:
+        # Refused at generation, so reaching here means the plan was edited
+        # afterwards. Still answered rather than raised: an ignored clause
+        # makes the predicate weaker than it reads, and the run has
+        # therefore not measured what the contract claims.
+        return False, [
+            "the contract's effect predicate names "
+            + ", ".join(unknown)
+            + ", which is not evaluated, so it measures less than it claims; passed=False"
+        ]
+    where = "exploit_contract.effect_predicate"
+    vulnerable = predicate.effect_observed(
+        _validator_observations(validation, "vulnerable"), declared, where=where
+    )
+    evidence = [f"vulnerable: {line}" for line in vulnerable.evidence]
+    if vulnerable_only:
+        return vulnerable.held, evidence
+    patched = predicate.effect_observed(
+        _validator_observations(validation, "patched"), declared, where=where
+    )
+    evidence += [f"patched: {line}" for line in patched.evidence]
+    held = vulnerable.held and not patched.held
+    evidence.append(
+        f"effect on vulnerable={vulnerable.held} effect on patched={patched.held} "
+        f"passed={held}"
+    )
+    return held, evidence
+
+
+def label_agreement(validation: dict, label: str, measured: bool) -> str:
+    """Whether the validator's own label agrees with what CVELab measured.
+
+    Recorded beside the proof checks and deliberately never among them.
+    Every value in proof_checks is ANDed into the lab's status, and this is
+    a claim rather than a measurement, so it must not be able to fail a run
+    that measured; the comment above the anti-hardcoding guard records what
+    banning a literal too broadly cost -- "banning that literal rejected
+    every validator written exactly as asked, across two unrelated model
+    families, on all four attempts".
+
+    It is still worth writing down, because a disagreement is a defect in
+    one of the two: a validator labelling a run it did not reproduce, or a
+    predicate that does not describe the effect the validator was written to
+    look for. Silence would hide both, and the second is the likelier one
+    while this contract is new.
+    """
+    claimed = validation.get("proof_quality") == label
+    if claimed == measured:
+        return "agrees" if measured else "agrees_not_observed"
+    return "claimed_but_not_measured" if claimed else "measured_but_not_claimed"
+
+
 def run_lab(
     cve_value: str,
     output_root: Path,
@@ -1102,6 +1248,9 @@ def run_lab(
         patched_blocked = _validator_said(validation, "patched", "blocked")
         proof_contract = plan.get("exploit_contract", {})
         vulnerable_only = plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION"
+        effect_held, effect_evidence = effect_observed(
+            validation, proof_contract, vulnerable_only
+        )
         proof_checks = {
             "source_reproduction": plan.get("lab_type")
             in {
@@ -1111,8 +1260,11 @@ def run_lab(
             "contract_effect_defined": bool(proof_contract.get("observable_effect")),
             "contract_evidence_defined": bool(proof_contract.get("evidence_type")),
             "attack_executed": validation.get("attack_executed") is True,
-            "security_effect_observed": validation.get("proof_quality")
-            == "security_effect_observed",
+            # CVELab's measurement over the observations the validator
+            # printed, against the predicate the contract declared before
+            # the build. It was a string equality on proof_quality, which
+            # the validator writes about itself; see effect_observed.
+            "security_effect_observed": effect_held,
             "observable_effect_recorded": bool(validation.get("observable_effect")),
             "evidence_type_matches": validation.get("evidence_type")
             == proof_contract.get("evidence_type"),
@@ -1135,6 +1287,21 @@ def run_lab(
             if vulnerable_only
             else validation.get("differential_confirmed") is True
         )
+        # The gate stays: running the handed-over actions against a lab that
+        # did not prove is wasted container time. What has to stay out of
+        # proof_checks is the verdict on actions that never ran. Folding the
+        # empty dict with `bool(manual_poc_checks) and all(...)` claimed the
+        # check and failed it on every failed run, and autoflow's repair
+        # digest names the checks whose value is False -- so the model was
+        # told to fix one name in the list it cannot reach. Measured on the
+        # picoclaw lab, identically in three benchmark runs: the digest
+        # carried four names and only three were real, the fourth being this
+        # one. Note the converse is not a phantom -- where the gate does open
+        # and an action genuinely fails, this check is the only false name in
+        # the list and belongs there, which is why the gate is kept rather
+        # than the fold loosened. An absent key is not listed at all; the
+        # state an operator still wants is manual_poc_status in the report
+        # below.
         manual_poc_checks = {}
         if automatic_proof:
             targets = ["vulnerable"] if vulnerable_only else ["vulnerable", "patched"]
@@ -1166,9 +1333,12 @@ def run_lab(
                         "output": output[:6000],
                         "stderr": checked.stderr.strip()[:2000],
                     }
-        proof_checks["manual_poc_verified"] = bool(manual_poc_checks) and all(
-            item["passed"] for item in manual_poc_checks.values()
-        )
+            # Inside the gate, and only here: targets is never empty, so the
+            # dict always holds the two or four actions this run made, and
+            # the check keeps its teeth where it is a real measurement.
+            proof_checks["manual_poc_verified"] = all(
+                item["passed"] for item in manual_poc_checks.values()
+            )
         real_source_proof = all(proof_checks.values())
         # After proof_checks is complete and never part of it: those are ANDed
         # into the lab's status, and an artifact beside the lab's claim must
@@ -1213,7 +1383,24 @@ def run_lab(
             "proof_contract": proof_contract,
             "fidelity": fidelity,
             "proof_checks": proof_checks,
+            # What the predicate measured, clause by clause, so a failed
+            # effect check says which clause failed on which side rather
+            # than only that it failed. These lines are the whole of the
+            # evidence for the mandatory check, and a repair that cannot see
+            # them can only guess.
+            "effect_evidence": effect_evidence,
+            "proof_quality_agreement": label_agreement(
+                validation, "security_effect_observed", effect_held
+            ),
             "manual_poc_checks": manual_poc_checks,
+            # Beside the checks rather than among them: "not_run" is the
+            # third state proof_checks has no room for, since every value
+            # there is ANDed into the status.
+            "manual_poc_status": (
+                "not_run" if "manual_poc_verified" not in proof_checks
+                else "verified" if proof_checks["manual_poc_verified"]
+                else "failed"
+            ),
             "manual_poc_field": manual_poc_field,
             "validator_exit_code": validator_exit,
             "real_poc_verified": real_source_proof,

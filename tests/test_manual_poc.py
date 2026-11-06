@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from cvelab import cli, core, field, sourcegen, upload
+from cvelab import autoflow, cli, closed, core, field, sourcegen, upload
 
 
 def _spec(**extra: Any) -> dict[str, Any]:
@@ -128,6 +128,215 @@ class GenerationIsLeftAloneTests(unittest.TestCase):
         self.assertNotIn("from .field import", source)
         self.assertNotIn("import field", source)
         self.assertNotIn("structured_response", source)
+
+
+#: What the lab's contract commits to before anything is built, and so the
+#: text the observations have to carry on the affected build and not on the
+#: fixed one.
+_EFFECT = "the-withheld-record"
+
+#: The affected build as a run that did not reproduce leaves it: the service
+#: answered, and the effect is not in what it answered. Used where a test
+#: needs a failure somewhere other than in the handed-over actions.
+_NOT_REPRODUCED = {
+    "confirmed": False,
+    "observations": {"status": 200, "headers": {}, "body": "no record here"},
+}
+
+
+def _proving_validator(**extra: Any) -> dict[str, Any]:
+    """A validator document that passes every check run_lab makes."""
+    said = {
+        "attack_executed": True,
+        "proof_quality": "security_effect_observed",
+        "observable_effect": "the record the authorized path withholds",
+        "evidence_type": "http_response_body",
+        # The raw responses the booleans were derived from.
+        # security_effect_observed is CVELab's own measurement over these
+        # against the predicate the plan below declares, rather than a
+        # string comparison on proof_quality, which this document writes
+        # about itself -- so a document without them passes nothing.
+        "vulnerable": {
+            "confirmed": True,
+            "observations": {"status": 200, "headers": {}, "body": _EFFECT},
+        },
+        "patched": {
+            "confirmed": False, "blocked": True,
+            "observations": {"status": 403, "headers": {}, "body": "forbidden"},
+        },
+        "differential_confirmed": True,
+    }
+    said.update(extra)
+    return said
+
+
+class ManualPocNeverRanTests(unittest.TestCase):
+    """A check that never ran is not a check that failed.
+
+    The in-lab manual actions sit behind `if automatic_proof`, which is
+    deliberate: running them against a lab that did not prove is wasted
+    container time. Folding their empty result into proof_checks anyway
+    reported them as failed on every failed run. The lab left under
+    generated-labs has manual_poc_verified false beside manual_poc_checks
+    {}, and its automation record shows what that cost: validation attempt 2
+    sent the repair model failed_proof_checks ["manual_poc_verified"] and
+    nothing else, while the actual cause -- a differential the validator did
+    not confirm -- is not a proof check and so appeared nowhere in the list.
+    """
+
+    CVE = "CVE-2026-0001"
+
+    def _on_disk(self, root: Path) -> Path:
+        """The lab run_lab's preflight asks for, and nothing more."""
+        lab = root / self.CVE
+        for side in ("vulnerable", "patched"):
+            (lab / side).mkdir(parents=True)
+            (lab / side / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            (lab / "source" / side).mkdir(parents=True)
+        (lab / "validator").mkdir(parents=True)
+        (lab / "validator" / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+        (lab / "validator" / "validator.py").write_text("", encoding="utf-8")
+        (lab / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        (lab / "plan.json").write_text(
+            json.dumps({
+                "cve": self.CVE,
+                "cwe": "CWE-639",
+                "lab_type": "SOURCE_REPRODUCTION",
+                "startup_services": ["vulnerable", "patched"],
+                "exploit_contract": {
+                    "observable_effect": "a record the authorized path withholds",
+                    "evidence_type": "http_response_body",
+                    "effect_predicate": {"body_contains": _EFFECT},
+                },
+            }),
+            encoding="utf-8",
+        )
+        return lab
+
+    def _run(self, said: dict[str, Any], *, actions_pass: bool = True) -> dict[str, Any]:
+        """run_lab against a mocked Docker, returning the report it writes."""
+
+        def validator(
+            _compose: list[str], _docker: str, _environment: dict[str, str],
+            _lab_dir: Path, extra: dict[str, str] | None = None,
+            wait_for_services: bool = True,
+        ) -> tuple[int, str, str]:
+            if not extra:
+                return 0, json.dumps(said), ""
+            if not actions_pass:
+                return 1, "", "the handed-over script exited non-zero"
+            return 0, (
+                "REPRODUCED" if extra["CVELAB_TARGET"] == "vulnerable" else "BLOCKED"
+            ), ""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._on_disk(root)
+            scratch = root / "limits"
+            scratch.mkdir()
+            with mock.patch.object(
+                        core, "prepare_compose",
+                        return_value=("docker", {}, ["docker", "compose"], scratch),
+                    ), \
+                    mock.patch.object(core, "run_docker_stage"), \
+                    mock.patch.object(core, "run_validator", side_effect=validator), \
+                    mock.patch(
+                        "subprocess.run",
+                        return_value=subprocess.CompletedProcess([], 0, "", ""),
+                    ):
+                outcome = core.run_lab(self.CVE, root, keep=False)
+            return outcome["report"]
+
+    def test_a_run_that_failed_elsewhere_claims_nothing_about_the_actions(self) -> None:
+        report = self._run(_proving_validator(vulnerable=_NOT_REPRODUCED))
+
+        self.assertNotIn("manual_poc_verified", report["proof_checks"])
+        self.assertEqual(report["manual_poc_status"], "not_run")
+        self.assertEqual(report["manual_poc_checks"], {})
+        # The checks that really failed, and only those. Two now rather than
+        # one, and the second is a measurement rather than a phantom: the
+        # affected build answered without the effect in it, so CVELab's own
+        # evaluation of the contract's predicate fails alongside the
+        # validator's own verdict. The phantom this test exists for is
+        # manual_poc_verified, asserted absent above.
+        self.assertEqual(
+            sorted(
+                name for name, passed in report["proof_checks"].items()
+                if passed is False
+            ),
+            ["security_effect_observed", "vulnerable_confirmed"],
+        )
+        self.assertIs(report["ok"], False)
+        self.assertIs(report["real_poc_verified"], False)
+        self.assertEqual(report["evidence_label"], "Not reproduced")
+
+    def test_a_proved_run_whose_actions_pass_still_reports_the_check(self) -> None:
+        report = self._run(_proving_validator())
+
+        self.assertIs(report["proof_checks"]["manual_poc_verified"], True)
+        self.assertEqual(report["manual_poc_status"], "verified")
+        self.assertEqual(sorted(report["manual_poc_checks"]), [
+            "patched_exploit", "patched_verify",
+            "vulnerable_exploit", "vulnerable_verify",
+        ])
+        self.assertIs(report["ok"], True)
+        self.assertIs(report["real_poc_verified"], True)
+        self.assertTrue(report["evidence_label"].startswith("Reproduced"))
+
+    def test_a_proved_run_whose_actions_fail_still_fails_the_check(self) -> None:
+        """Where the measurement is real the check keeps its teeth."""
+        report = self._run(_proving_validator(), actions_pass=False)
+
+        self.assertIs(report["proof_checks"]["manual_poc_verified"], False)
+        self.assertEqual(report["manual_poc_status"], "failed")
+        self.assertTrue(report["manual_poc_checks"])
+        self.assertIs(report["ok"], False)
+        self.assertIs(report["real_poc_verified"], False)
+        self.assertEqual(report["evidence_label"], "Not reproduced")
+        self.assertEqual(
+            autoflow._validation_digest(report)["failed_proof_checks"],
+            ["manual_poc_verified"],
+        )
+
+    def test_the_repair_digest_no_longer_names_what_never_ran(self) -> None:
+        """The digest lists the names whose value is False, so absence is enough.
+
+        This is why dropping the key is the whole fix: autoflow needs no
+        change, and the model is no longer told to repair the one item on
+        the list it cannot reach.
+        """
+        report = self._run(_proving_validator(vulnerable=_NOT_REPRODUCED))
+        digest = autoflow._validation_digest(report)
+
+        self.assertEqual(
+            digest["failed_proof_checks"],
+            ["security_effect_observed", "vulnerable_confirmed"],
+        )
+        self.assertNotIn("manual_poc_verified", digest["failed_proof_checks"])
+
+    def test_the_verdict_is_still_folded_from_proof_checks_alone(self) -> None:
+        """No third state in proof_checks: every value there is ANDed.
+
+        The assignment is pinned at the gate's indentation, because moving
+        it back out is exactly the defect, and both forms read the same from
+        a diff of the surrounding lines.
+        """
+        source = Path(core.__file__).read_text(encoding="utf-8")
+        self.assertIn("real_source_proof = all(proof_checks.values())", source)
+        self.assertIn('            proof_checks["manual_poc_verified"] = all(', source)
+
+    def test_the_closed_lab_path_folds_its_own_empty_dict_on_purpose(self) -> None:
+        """There the checks always run, so no entries means no PoC shipped.
+
+        Nothing gates them, which is what makes False a measurement rather
+        than a consequence of another failure. Pinned because the two reads
+        are the same expression and unifying them would be wrong.
+        """
+        source = Path(closed.__file__).read_text(encoding="utf-8")
+        self.assertIn(
+            "manual_poc_verified = bool(manual_poc_checks) and all(", source
+        )
+        self.assertNotIn("automatic_proof", source)
 
 
 class ProofTests(unittest.TestCase):

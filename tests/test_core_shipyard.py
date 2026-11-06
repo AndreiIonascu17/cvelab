@@ -78,8 +78,22 @@ class ShipyardRunnerTests(unittest.TestCase):
                 "observable_effect": "protected object created",
                 "evidence_type": "authorization_bypass",
                 "differential_confirmed": True,
-                "vulnerable": {"confirmed": True},
-                "patched": {"confirmed": False, "rejection_logged": True},
+                # The raw responses, because security_effect_observed is now
+                # CVELab evaluating the contract's predicate over these
+                # rather than reading proof_quality out of a file an
+                # arbitrary runner script wrote. A result.json that prints
+                # no observations no longer reproduces: see
+                # tests/test_effect_predicate.py for that direction.
+                "vulnerable": {
+                    "confirmed": True,
+                    "observations": {
+                        "status": 201, "headers": {}, "body": "object-created",
+                    },
+                },
+                "patched": {
+                    "confirmed": False, "rejection_logged": True,
+                    "observations": {"status": 403, "headers": {}, "body": "forbidden"},
+                },
             }
             (evidence_dir / "result.json").write_text(json.dumps(evidence))
             plan = {
@@ -88,6 +102,7 @@ class ShipyardRunnerTests(unittest.TestCase):
                 "exploit_contract": {
                     "observable_effect": "protected object created",
                     "evidence_type": "authorization_bypass",
+                    "effect_predicate": {"body_contains": "object-created"},
                 },
                 "fidelity": {"execution_level": "product_end_to_end"},
             }

@@ -135,6 +135,20 @@ NOT_SHARED = {
 STATUS = {
     "VALIDATED": "succeeded",
     "ARTIFACT_REQUIRED": "declined",
+    # The same answer as the line above -- there is no public source to build
+    # a lab from -- returned instead of it when discovery named a proprietary
+    # product, appliance, operating system or licensed binary. Missing here it
+    # fell through the default, so the control plane filed an honest decline
+    # as a failure, next to the crashes and the exhausted repair budgets, and
+    # a batch's failure rate counted every proprietary product in it as
+    # something that had gone wrong.
+    "VENDOR_ARTIFACT_REQUIRED": "declined",
+    # The closed-image planner's own verdict that the published images cannot
+    # show this fix, returned from the plan rather than from a run. Reachable
+    # by construction -- it is in that planner's status enum and returned
+    # whenever the plan is not READY -- and missing here it was filed as a
+    # failure, which says the tool broke rather than that it judged and said so.
+    "UNSUPPORTED": "declined",
     "GENERATION_NOT_AVAILABLE": "declined",
     "PROVIDER_DECLINED": "declined",
     "AUTO_GENERATION_FAILED": "failed",

@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
@@ -201,6 +202,49 @@ def _local_timeout() -> int:
     return value
 
 
+#: Statuses that mean "ask again later" rather than "you asked wrongly". 429
+#: is the rate limit and 529 is Anthropic's own overload code; the rest are a
+#: busy or unwell gateway. 400, 401, 403, 404 and 422 are deliberately absent:
+#: there the request itself is what is wrong, and repeating it changes
+#: nothing. The schema fallback further down also depends on 400 and 422
+#: arriving unretried.
+_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504, 529})
+
+
+def provider_retry_limit() -> int:
+    """Times a busy provider is asked again (CVELAB_PROVIDER_RETRIES, 0 to 8).
+
+    Measured on 2026-11-04: one CVE in a batch of ten spent two of its four
+    repair attempts on `overloaded_error`. A provider too busy to answer has
+    said nothing about the lab, so counting that as a failed repair both lost
+    the attempt and put the blame in the wrong place.
+    """
+    raw = os.getenv("CVELAB_PROVIDER_RETRIES", "").strip()
+    try:
+        value = int(raw) if raw else 4
+    except ValueError:
+        value = 4
+    return max(0, min(value, 8))
+
+
+def _retry_pause(exc: urllib.error.HTTPError, attempt: int) -> float:
+    """Seconds before asking again, preferring the server's own answer.
+
+    Retry-After may instead carry an HTTP date, which is not read here: the
+    doubling is the answer whenever the header is absent or is not a plain
+    number of seconds.
+    """
+    header = ""
+    if exc.headers is not None:
+        header = (exc.headers.get("retry-after") or "").strip()
+    if header:
+        try:
+            return max(0.0, min(float(header), 60.0))
+        except ValueError:
+            pass
+    return min(2.0 * (2**attempt), 30.0)
+
+
 def _request_json(
     provider: str,
     url: str,
@@ -215,14 +259,27 @@ def _request_json(
         headers={"Content-Type": "application/json", **headers},
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise AIHTTPError(provider, exc.code, detail) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Could not connect to {provider} API at {url}: {exc.reason}") from exc
+    attempts = provider_retry_limit() + 1
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code not in _RETRYABLE_STATUSES or attempt == attempts - 1:
+                raise AIHTTPError(provider, exc.code, detail) from exc
+            pause = _retry_pause(exc, attempt)
+            progress.step(
+                f"{provider} was too busy to answer (HTTP {exc.code}); "
+                f"asking again in {pause:.0f}s"
+            )
+            time.sleep(pause)
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                f"Could not connect to {provider} API at {url}: {exc.reason}"
+            ) from exc
+    # Unreachable: the final attempt raises above rather than falling through.
+    raise RuntimeError(f"{provider} API gave no answer and no error")
 
 
 def _decode_json_text(text: str, provider: str) -> dict:

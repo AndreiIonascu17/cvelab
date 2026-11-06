@@ -27,6 +27,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from . import predicate
 from .core import runtime_flags
 
 _CVE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
@@ -130,37 +131,22 @@ def _container_request(
 
 
 def _matches(response: dict[str, Any], match: dict[str, Any]) -> tuple[bool, list[str]]:
-    checks: list[bool] = []
-    evidence: list[str] = []
-    if "status" in match:
-        allowed = match["status"]
-        if not isinstance(allowed, list):
-            allowed = [allowed]
-        passed = response["status"] in [int(value) for value in allowed]
-        checks.append(passed)
-        evidence.append(f"status={response['status']} allowed={allowed} passed={passed}")
-    if "body_contains" in match:
-        value = str(match["body_contains"])
-        passed = value in response["body"]
-        checks.append(passed)
-        evidence.append(f"body_contains={value!r} passed={passed}")
-    if "body_regex" in match:
-        value = str(match["body_regex"])
-        passed = re.search(value, response["body"]) is not None
-        checks.append(passed)
-        evidence.append(f"body_regex={value!r} passed={passed}")
-    if "header" in match:
-        expected = match["header"]
-        name, value = str(expected["name"]), str(expected["contains"])
-        actual = next(
-            (v for k, v in response["headers"].items() if k.lower() == name.lower()), ""
-        )
-        passed = value in actual
-        checks.append(passed)
-        evidence.append(f"header={name!r} contains={value!r} passed={passed}")
-    if not checks:
-        raise ValueError("observe.match must define at least one predicate")
-    return all(checks), evidence
+    """The contract's own predicate, read against the observation response.
+
+    The predicate lives in `predicate.py` now, so the source path can be held
+    to the same standard: the contract names what would count as the effect
+    before anything is started, and CVELab decides whether it happened.
+
+    The adapter is a rename rather than a translation. An HTTP observation is
+    already a mapping of `status`, `headers` and `body`, which is what the
+    evaluator asks for, so the only thing this adds is the name the error
+    message should use.
+
+    Strict on purpose: a contract whose predicate cannot be decided has
+    measured nothing, and the closed run has always stopped here rather than
+    write a verdict it did not measure.
+    """
+    return predicate.evaluate(response, match, where="observe.match")
 
 
 def _seconds(value: Any, name: str, default: int, ceiling: int) -> int:

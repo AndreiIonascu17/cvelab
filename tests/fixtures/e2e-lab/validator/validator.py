@@ -10,18 +10,24 @@ def read_note(base):
     """The attack: ask for someone else's note with no credential at all."""
     try:
         with urllib.request.urlopen(base + "/notes/1", timeout=10) as answer:
-            return answer.status, answer.read().decode("utf-8", "replace")
+            return answer.status, dict(answer.headers), answer.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as refused:
-        return refused.code, refused.read().decode("utf-8", "replace")
+        return refused.code, dict(refused.headers), refused.read().decode("utf-8", "replace")
     except OSError as error:
-        return None, "transport: %s" % error
+        return None, {}, "transport: %s" % error
 
 
 def probe(name):
-    status, body = read_note(TARGETS[name])
+    status, headers, body = read_note(TARGETS[name])
     confirmed = status == 200 and CANARY in body
     return {"confirmed": confirmed, "blocked": not confirmed,
-            "http_status": status, "raw_body": body[:400]}
+            "http_status": status, "raw_body": body[:400],
+            # The raw response both booleans were derived from, under the
+            # names CVELab's predicate evaluator reads. It is the evaluator,
+            # not proof_quality below, that decides whether the effect
+            # happened -- so this is the lab's evidence and the label is
+            # only the validator's own claim about it.
+            "observations": {"status": status, "headers": headers, "body": body[:4000]}}
 
 
 def main():

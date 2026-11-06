@@ -371,6 +371,102 @@ startup on its own, from the container logs, up to twice
 (`CVELAB_STARTUP_REPAIRS`, 0 to 5), without spending a validation attempt or a
 repair meant for the exploit.
 
+A build that failed for want of something it had to download is not a question
+for a model, so it is not put to one. Where a mirror, a module proxy or a name
+server was briefly away -- a hash sum mismatch, a `503`, an `i/o timeout` --
+the same build is simply run again, up to twice (`CVELAB_TRANSIENT_RETRIES`, 0
+to 5) and fifteen seconds apart (`CVELAB_TRANSIENT_PAUSE`, 0 to 120), spending
+neither a validation attempt nor a repair, on the same reasoning as a startup
+failure: nothing was built, so nothing is yet known about the PoC.
+
+A `404` is treated differently, because retrying it cannot help. Debian moves a
+release's pool to `archive.debian.org` once its support ends but keeps serving
+that release's index from `deb.debian.org`, so `apt-get update` succeeds and
+every download that index names then 404s. Old CVEs want old distributions, so
+a lab meets this the moment a release it needs is archived. This one does reach
+a repair, carrying the part the symptom does not point at: the packages are
+right and the sources are stale. Pointing apt at the archive is the answer, and
+the hint says so without offering a newer base image as an alternative. It used
+to, and the first run to receive it reached for `python:3.8.16-bookworm`, a tag
+that has never existed: a release reaches the archive at about the time the
+interpreter pinned above it is dropped, so for an old CVE there is usually no
+variant of that interpreter on a supported release at all.
+
+Two more build failures are deterministic in the same way, and each now reaches
+a repair under its own name rather than as a bare log. A base image tag that
+was never published is `unknown_base_image`: metadata resolution precedes every
+layer, so nothing below the `FROM` line has run and the log says nothing about
+the lab beyond the tag it asked for. That hint says to name only a tag known to
+be published, and carries the lesson above -- where no variant of the
+interpreter exists on a supported release, the answer is the older release with
+apt redirected, not a newer tag. A dependency version that cannot be fetched is
+`dependency_pin`: no published version satisfies the requirement, the proxy has
+withdrawn the one named, or a recorded checksum disagrees with what is served.
+That hint says to change the pin the output names and to leave the vulnerable
+and patched revisions on the versions they are on, since relaxing the product's
+own pin makes the build pass by removing the fix.
+
+Neither is retried, for the same reason a `404` is not: the answer will not
+change. Where one log carries both an archived pool and an unresolvable tag --
+a single compose solve builds every target -- the archived pool is what is
+reported, because its remedy is to keep the base image and the other's is to
+change it.
+
+A provider that cannot answer is held apart from a model that answered badly.
+A `429`, `500`, `502`, `503`, `504` or `529` is asked again with a widening
+pause, four times by default (`CVELAB_PROVIDER_RETRIES`, 0 to 8), honouring
+`Retry-After` where the server sends one; a `401` or a `404` is not, because
+the request itself is what is wrong. Should a stall outlast those retries
+during a repair, the attempt is given back rather than spent, and the lab's own
+failure stays in the next prompt: an overload describes the API, and putting it
+where the evidence belongs buries what the repair was meant to read.
+
+A pair of revisions that cannot show its fix becomes a vulnerable-only lab
+before generation. Two pairs cannot: one where everything between the
+vulnerable and the fixed revision is prose -- a README, a changelog, a
+translation -- and one whose two revisions resolve to the same tree, which is a
+tag moved onto the commit it was meant to precede or the same reference given
+twice. Either way nothing the program is built from changed, and no adapter and
+no repair can produce a difference. The fixing reference is therefore dropped
+rather than the run: the vulnerable revision is still authentic, and the
+absence of a usable fix prevents differential validation of remediation, not a
+PoC against the affected version. `fix_status` becomes
+`PUBLIC_FIX_NOT_IDENTIFIED`, and the reason ends with the one thing to do about
+it -- the fixing reference in hand is not the fix, so resolve it again.
+
+The demotion is recorded rather than announced, because the one line it prints
+goes to stderr and `CVELAB_QUIET` silences it. `plan.json` carries a `demotion`
+object naming the rejected reference and the reason; the generation attempt in
+`automation.json` carries the same object, which is where a batch reads it; and
+`artifacts/EVIDENCE.json` repeats it under `provenance`, as
+`discarded_fixed_revision` and `demotion_reason`, which is the copy that
+survives being shared -- `plan.json` is withheld by `--no-poc`, `EVIDENCE.json`
+never is. `REPORT.md` and `WALKTHROUGH.md` then say a fixed revision was
+identified and discarded, and why, in place of the sentences a lab with no
+public fix at all gets, so a demoted lab is not mistaken for a CVE whose fix
+was never found and is not told to wait for a fix it already has.
+
+The patched snapshot is taken back off disk, but only once the answer has
+validated and the demoted `plan.json` is about to be written. Deleting it when
+the demotion was decided meant a provider that declined, or a Ctrl-C, left the
+tree, its stamp and `patched/` gone while `plan.json` still said
+`SOURCE_REPRODUCTION`, and the next `cvelab run` failed its preflight on a lab
+that had worked. The stamp is unlinked before the tree it vouches for, so an
+interrupt mid-delete always leaves a state that re-extracts rather than one
+where an intact stamp hides a truncated snapshot, and nothing in the deletion
+raises: removing an abort disposition is the whole point of the demotion.
+
+The check is deterministic and costs nothing, so it runs before the first token
+is spent, and it leans toward keeping the differential, because over-triggering
+turns a lab that would have succeeded into a weaker one. The extension decides
+and nothing else: a dependency bump, a lockfile, a policy file, a template, a
+migration, a test and a vendored bump are all real fixes and still build a
+differential, because that is how a great many vulnerabilities are actually
+fixed. A directory prefix was tried and withdrawn -- it read everything under
+`docs/`, `doc/` and `.github/` as prose, so `docs/conf.py` and
+`.github/workflows/ci.yml` counted, and a workflow is a program whose command
+injection is a vulnerability shape of its own.
+
 When the lab builds, starts and the validator reaches both services but the
 effect does not show, the repair is given the validator's observations and the
 end of each service's log first, and up to two repairs are added beyond the
