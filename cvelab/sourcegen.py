@@ -33,7 +33,7 @@ from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
-from . import policy, progress, releases, research
+from . import baseimages, policy, predicate, progress, releases, research, revisions
 from .ai import (
     ai_is_configured,
     provider_supports_web_search,
@@ -51,6 +51,65 @@ from .core import (
     write_text,
 )
 from .research import clip_section as _clip_context_section
+
+#: What the contract commits to before anything is built, so that the
+#: mandatory effect check can be a measurement.
+#:
+#: WHY THE CONTRACT CARRIES IT AND THE VALIDATOR DOES NOT
+#:
+#: `security_effect_observed` used to be `validation["proof_quality"] ==
+#: "security_effect_observed"`: a string equality on a field the model's own
+#: validator writes about itself. A validator that printed that one literal
+#: cleared a mandatory proof gate having measured nothing, and the end-to-end
+#: fixture checked in under tests/ does exactly that -- it labels the run from
+#: its own differential boolean. Reading some other validator-written key
+#: instead would only move the hole; what closes it is the order of events.
+#: The contract names what would count as the effect before any image is
+#: built, the validator prints the raw observations, and CVELab evaluates the
+#: predicate itself. That is the shape the closed path has always had.
+#:
+#: The vocabulary is `predicate.KINDS` and nothing else. A fifth kind would
+#: have to be written twice, because `closed.py` embeds a second, independent
+#: copy of the evaluator in the PoC script it ships to reviewers, which runs
+#: in a sidecar with no CVELab to import; a drift test in
+#: tests/test_closed_fixture.py is the only thing that notices when the two
+#: fall out of step.
+#:
+#: Every kind is listed in `required` with a null alternative because
+#: OpenAI's strict structured output rejects a property that is not required,
+#: which is why every other object in these schemas requires all of its
+#: properties too. A kind this contract does not declare therefore arrives as
+#: null and is dropped by `_validate_effect_predicate` before it is written
+#: to plan.json.
+EFFECT_PREDICATE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["status", "body_contains", "body_regex", "header"],
+    "properties": {
+        "status": {
+            "type": ["array", "null"],
+            "items": {"type": "integer"},
+            "description": "Whole response status codes any one of which counts.",
+        },
+        "body_contains": {
+            "type": ["string", "null"],
+            "description": "Literal text the response body must contain.",
+        },
+        "body_regex": {
+            "type": ["string", "null"],
+            "description": "A Python regular expression the response body must match.",
+        },
+        "header": {
+            "type": ["object", "null"],
+            "additionalProperties": False,
+            "required": ["name", "contains"],
+            "properties": {
+                "name": {"type": "string"},
+                "contains": {"type": "string"},
+            },
+        },
+    },
+}
 
 SOURCE_SCHEMA = {
     "type": "object",
@@ -92,11 +151,17 @@ SOURCE_SCHEMA = {
         "exploit_contract": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["attack_summary", "preconditions", "observable_effect", "evidence_type"],
+            "required": [
+                "attack_summary", "preconditions", "observable_effect", "evidence_type",
+                "effect_predicate",
+            ],
             "properties": {
                 "attack_summary": {"type": "string"},
                 "preconditions": {"type": "array", "items": {"type": "string"}},
                 "observable_effect": {"type": "string"},
+                # The prose above says what the effect is for a reader; this
+                # says it in the terms CVELab can decide for itself.
+                "effect_predicate": EFFECT_PREDICATE_SCHEMA,
                 "evidence_type": {
                     "type": "string",
                     "enum": [
@@ -512,6 +577,147 @@ def _fix_listing(
     return diff, files, tree
 
 
+def _pair_is_identical(files: list[str]) -> bool:
+    """Whether the two revisions resolve to one and the same tree.
+
+    An empty name-only diff, which is a pair and not a fix: a tag moved onto
+    the commit it was supposed to precede, a `fixed^` that resolved back to
+    `fixed`, or the same reference given twice. `_only_prose_changed` cannot
+    stand in for this, because it has nothing to read and must not claim
+    prose it never saw, so zero changed files used to pass the guard
+    untouched and reach generation as a differential.
+    """
+    return not files
+
+
+#: Extensions whose change cannot alter what a program does, wherever the file
+#: sits. Deliberately short: a dependency bump lands in go.mod, package.json or
+#: requirements.txt, and a template, policy or migration change is a real fix,
+#: so none of those belong here. Only prose does.
+#:
+#: The extension decides, and nothing else. A directory prefix was tried --
+#: docs/, doc/, .github/ -- and read every file under them as prose regardless
+#: of what it was, so `docs/conf.py`, `docs/Dockerfile`, `doc/examples/server.py`
+#: and `.github/workflows/ci.yml` all counted. A workflow is a program, and
+#: command injection in one is a vulnerability shape of its own, so that prefix
+#: demoted real fixes. Measured on this project's own corpus: one pair was
+#: demoted for a change confined to .github/workflows/main.yml.
+_PROSE_SUFFIXES = (".md", ".rst", ".adoc", ".po", ".pot")
+
+#: Names that are prose when they carry no extension or a plain-text one, and
+#: code otherwise. Matched against the whole stem, never the text before the
+#: first dot: that read `src/license.php`, `db/changes.sql`,
+#: `templates/notice.html`, `pkg/changes.go` and `src/notice.ts` as prose, which
+#: contradicts the comment above -- a license check, a migration and a template
+#: are all places a fix really lands, and a license-activation auth bypass is a
+#: vulnerability shape of its own.
+_PROSE_STEMS = frozenset(
+    {"license", "licence", "notice", "authors", "contributors", "changelog", "changes"}
+)
+#: What a prose stem may be called: NOTICE, or NOTICE.txt. ".txt" is here and
+#: not in _PROSE_SUFFIXES because requirements.txt is a dependency bump, and
+#: its stem is not a prose stem.
+_PROSE_STEM_SUFFIXES = ("", ".txt")
+
+
+def _is_prose_path(path: str) -> bool:
+    """Whether this one changed path cannot alter what the program does."""
+    name = posixpath.basename(path.lower())
+    head, dot, tail = name.rpartition(".")
+    # rpartition puts a name with no dot in the tail, which is its stem.
+    stem, suffix = (head, f".{tail}") if dot else (name, "")
+    if suffix in _PROSE_SUFFIXES:
+        return True
+    return suffix in _PROSE_STEM_SUFFIXES and stem in _PROSE_STEMS
+
+
+def _only_prose_changed(files: list[str]) -> bool:
+    """Whether everything the fix touches is prose rather than behaviour.
+
+    A fix that changes nothing the program is built from is not the fix. No
+    lab built from the two snapshots can show a difference, and every repair
+    asked for one is asked for something the inputs forbid.
+
+    Measured on 2026-11-04: one pair differed in a single translated README,
+    leaving the file the advisory points at byte-identical in both snapshots.
+
+    Erring toward keeping the differential is deliberate. Over-triggering
+    turns a lab that would have succeeded into a weaker one, which is the
+    expensive direction; under-triggering costs one run's budget on a pair
+    that was already lost. Test-only, lockfile-only and vendored-bump-only
+    fixes therefore all keep the differential.
+    """
+    if not files:
+        return False
+    return all(_is_prose_path(path) for path in files)
+
+
+def _name_list(files: list[str]) -> str:
+    """Up to ten changed paths, and a count of whatever is left.
+
+    These are repository paths out of an untrusted diff, and they reach the
+    prompt, plan.json and REPORT.md. The cut used to be silent, so a pair of
+    sixty changed files read as a pair of ten and the reason understated what
+    it had looked at.
+    """
+    shown = ", ".join(files[:10])
+    remaining = len(files) - 10
+    return shown if remaining <= 0 else f"{shown} and {remaining} more"
+
+
+#: The one thing an operator can do about either kind of unusable pair, and
+#: the whole of the abort message this demotion replaced. It went missing when
+#: the cause took its place: a reason that explains and never says what to do
+#: leaves a batch operator with nothing to act on, and resolving the reference
+#: again is the action in both cases.
+_RESOLVE_AGAIN = "the fixing reference in hand is not the fix, so resolve it again"
+
+
+def _unusable_pair(files: list[str]) -> str | None:
+    """Why this pair cannot show its fix, in one sentence, or None when it can.
+
+    Two conditions, kept apart because they are different mistakes and the
+    operator's remedy differs: an identical pair means the fixing reference
+    was resolved to the wrong object, while a prose-only pair means it was
+    resolved to a real commit that is not the fix. Both end the differential,
+    so both return a reason here, and the reason is what the demoted lab
+    records rather than a single flag that would read the same for either.
+    """
+    if _pair_is_identical(files):
+        return (
+            "the vulnerable and fixed revisions resolve to the same tree, so the pair "
+            f"holds one program rather than a before and an after; {_RESOLVE_AGAIN}"
+        )
+    if _only_prose_changed(files):
+        # Not "both snapshots compile the same program": the classifier reads
+        # names and never the contents, so it cannot say what compiling them
+        # would produce, and the one corpus pair demoted for a workflow file
+        # was given a reason that was untrue of that file. What it does know
+        # is that nothing the program is built from changed.
+        return (
+            "between the vulnerable and the fixed revision nothing the program is built "
+            f"from changed ({_name_list(files)}); {_RESOLVE_AGAIN}"
+        )
+    return None
+
+
+def _vulnerable_only_limitation(demotion: str | None) -> str:
+    """What `safety.limitations` says about a lab with no patched side.
+
+    deliverables prints this line into REPORT.md verbatim, so a demoted lab
+    either says why here or says nothing anywhere: the bare sentence would
+    report "no public fixed revision was identified" for a run that
+    identified one and then found it unusable, which is a different and
+    much more actionable fact.
+    """
+    if demotion:
+        return (
+            f"A fixed revision was resolved and then discarded: {demotion}. "
+            "Remediation behavior was not tested."
+        )
+    return "No public fixed revision was identified; remediation behavior was not tested."
+
+
 #: Characters of upstream test changes shown ahead of the patch.
 REGRESSION_TEST_CHARS = 12000
 
@@ -898,17 +1104,48 @@ def _check_build_inputs(files: list[dict], lab_dir: Path, vulnerable_only: bool 
                         f"source/{variant}/ and the adapter files it needs instead."
                     )
                     continue
-                if _in_context(source, context, generated, lab_dir):
-                    continue
                 relative = posixpath.normpath(source.replace("\\", "/")).lstrip("/")
+                # A vulnerable-only lab has no patched snapshot, and _in_context
+                # falls back to the disk for the inputs the CLI prepared. A
+                # demoted pair still has the previous extraction there while
+                # this answer is checked -- it is removed only once the demoted
+                # plan is about to be written, so that a model that never
+                # answers leaves the lab intact -- and without this the disk
+                # would vouch for a tree that is on its way out, pushing the
+                # failure to a build that cannot work.
+                stale_patched = vulnerable_only and relative.split("/")[:2] == [
+                    "source", "patched",
+                ]
+                if not stale_patched and _in_context(source, context, generated, lab_dir):
+                    continue
                 if relative.startswith("../"):
                     problems.append(f"{dockerfile} copies {source}, which is outside its build context.")
-                elif context == "validator/":
+                elif stale_patched:
                     problems.append(
-                        f"{dockerfile} copies {source}, but the validator image is built from "
-                        "validator/ alone, which holds validator.py, requirements.txt and plan.json. "
-                        "Nothing under adapter/ or source/ reaches it: put what the probe needs in "
-                        "validator.py, or run it from the target service."
+                        f"{dockerfile} copies {source}, but this lab has no patched snapshot: "
+                        "no usable fixed revision was resolved, so source/patched is not part of "
+                        "it. Build source/vulnerable alone."
+                    )
+                elif context == "validator/":
+                    # Say what this answer put there, not what a validator may
+                    # hold in general. The generic list named requirements.txt,
+                    # which is only present when the answer returns it, so a
+                    # COPY of it was rejected by a sentence that told the model
+                    # the file was there.
+                    held = sorted(
+                        {
+                            path[len(context):]
+                            for path in generated
+                            if path.startswith(context)
+                        }
+                        | set(VALIDATOR_CONTEXT_EXTRAS)
+                    )
+                    problems.append(
+                        f"{dockerfile} copies {source}, which its build context does not hold. "
+                        f"The validator image is built from validator/ alone, and in this answer "
+                        f"that is {', '.join(held)}. Return validator/{relative} as well if the "
+                        f"probe needs it, or put what it needs in validator.py; nothing under "
+                        f"adapter/ or source/ reaches this image."
                     )
                 else:
                     candidates = [path for path in generated if not path.startswith("validator/")]
@@ -924,6 +1161,32 @@ def _check_build_inputs(files: list[dict], lab_dir: Path, vulnerable_only: bool 
         raise RuntimeError("A Dockerfile COPY cannot work as written:\n- " + "\n- ".join(problems))
     if not vulnerable_only:
         _check_variant_parity(contents)
+
+
+def _check_base_images(files: list[dict]) -> None:
+    """Refuse a Dockerfile whose FROM names a tag the registry says is not published.
+
+    The same shape as `_check_build_inputs` and for the same reason. Docker
+    reports an unpublished tag as a metadata resolution failure before one
+    layer runs, so the log carries nothing about the lab beyond the tag, and a
+    repair handed only that log reaches for another tag the same way: one
+    measured run lost its build to a Python version paired with a Debian
+    release that never had an image for it. Checked here it costs one model
+    call and no build at all.
+
+    Only a registry's 404 refuses. `baseimages.tag_state` is tri-state, and an
+    unreachable registry yields "unknown" rather than "absent": a timed-out
+    lookup that refused would spend the contract-retry budget on a tag that was
+    fine, and turn a network minute into a failed generation.
+    """
+    dockerfiles = {
+        item["path"].replace("\\", "/"): item["content"]
+        for item in files
+        if item["path"].replace("\\", "/") in BUILD_CONTEXTS
+    }
+    problems = baseimages.refusals(dockerfiles)
+    if problems:
+        raise RuntimeError("A Dockerfile base image does not exist:\n- " + "\n- ".join(problems))
 
 
 _HEX_RUN = re.compile(r"\b[0-9a-f]{7,40}\b")
@@ -1108,6 +1371,15 @@ def _validate_generated(files: list[dict], vulnerable_only: bool = False) -> Non
             required_contract = {
                 "attack_executed", "proof_quality", "observable_effect", "evidence_type",
                 "vulnerable", "differential_confirmed",
+                # The raw status, body and headers each side's booleans were
+                # derived from. Required because the mandatory effect check
+                # is now CVELab evaluating the contract's predicate over
+                # these, rather than a string comparison on proof_quality,
+                # which the validator writes about itself. A validator that
+                # prints no observations has given CVELab nothing to measure,
+                # and that is worth refusing here for one model call instead
+                # of discovering it after a build.
+                "observations",
             }
             if vulnerable_only:
                 required_contract.update({"patched_tested", "fix_status"})
@@ -1335,6 +1607,175 @@ _READ_NOT_RUN = re.compile(
 )
 
 
+def _validate_effect_predicate(contract: dict, vulnerable_only: bool = False) -> dict:
+    """Refuse a predicate that cannot measure, before a single image is built.
+
+    WHY THIS IS MANDATORY AND NOT ADVISORY
+
+    `predicate.evaluate` ignores a key it does not know, which is what the
+    closed path has always done. Executed against the evaluator, these all
+    came back held=True:
+
+        {"body_contains": ""}   against a body reading "nothing interesting
+                                happened here"
+        {"body_regex": ".*"}
+        {"status": [200, 500]}  a list covering both sides of a differential
+        {"status": 500, "body_contins": "..."}  the misspelled clause
+                                silently ignored, so the status alone decided
+
+    So a contract is not sound merely because CVELab, rather than the
+    validator, evaluates it. The last of those is the one declaration
+    validation closes: an unknown kind is weaker than what the contract
+    appears to claim, and a misspelled kind would buy a free pass on the
+    mandatory effect check -- the same defect wearing a different hat. It is
+    checked here, in the path that costs one model call and no build, rather
+    than discovered in the evidence of a lab that already built.
+
+    The first three are not closed here and must not be: on a differential
+    lab a loose predicate holds on the patched side too, and the differential
+    fails it. Substance is enforced by the comparison rather than by a
+    blocklist of degenerate patterns, which is what makes the check hard to
+    write around. `_vulnerable_only_substance` covers the one shape that has
+    no patched side to compare against.
+
+    Returns the predicate with the kinds it does not declare dropped, and
+    writes that back into the contract, so plan.json records exactly what
+    will be evaluated.
+    """
+    declared = contract.get("effect_predicate")
+    if not isinstance(declared, dict):
+        raise RuntimeError(
+            "exploit_contract.effect_predicate must be an object naming what would "
+            "count as the security effect, using one or more of: "
+            + ", ".join(predicate.KINDS)
+        )
+    # A kind the contract does not declare arrives as null, because a
+    # provider with strict structured output has to list every property as
+    # required. Dropped rather than evaluated: `predicate.READS` would look
+    # for an observation for a clause nobody meant to make.
+    cleaned = {key: value for key, value in declared.items() if value is not None}
+    unknown = predicate.unknown_kinds(cleaned)
+    if unknown:
+        raise RuntimeError(
+            "exploit_contract.effect_predicate names "
+            + ", ".join(unknown)
+            + ", which CVELab does not evaluate: an unknown kind is silently ignored, "
+            "so the predicate would be weaker than it reads. Use only: "
+            + ", ".join(predicate.KINDS)
+        )
+    if not predicate.declared_kinds(cleaned):
+        raise RuntimeError(
+            "exploit_contract.effect_predicate must declare at least one of: "
+            + ", ".join(predicate.KINDS)
+            + ". A contract that declares none measures nothing."
+        )
+    if "status" in cleaned:
+        codes = cleaned["status"]
+        if not isinstance(codes, list) or not codes or not all(
+            isinstance(code, int) and not isinstance(code, bool) for code in codes
+        ):
+            raise RuntimeError(
+                "exploit_contract.effect_predicate.status must be a non-empty list of "
+                "whole response status codes"
+            )
+    for kind in ("body_contains", "body_regex"):
+        if kind in cleaned and not isinstance(cleaned[kind], str):
+            raise RuntimeError(f"exploit_contract.effect_predicate.{kind} must be text")
+    if "body_regex" in cleaned:
+        # Decidability, on every lab shape: an uncompilable pattern is
+        # reported as the effect not having been observed, so leaving it to
+        # the run would spend a whole build to learn what re.compile says
+        # here for nothing.
+        try:
+            re.compile(cleaned["body_regex"])
+        except re.error as error:
+            raise RuntimeError(
+                f"exploit_contract.effect_predicate.body_regex is not a usable regular "
+                f"expression: {error}"
+            ) from None
+    if "header" in cleaned:
+        header = cleaned["header"]
+        if (
+            not isinstance(header, dict)
+            or not isinstance(header.get("name"), str)
+            or not isinstance(header.get("contains"), str)
+        ):
+            raise RuntimeError(
+                "exploit_contract.effect_predicate.header must declare the header's "
+                "name and the text it contains, both as text"
+            )
+    if vulnerable_only:
+        _vulnerable_only_substance(cleaned)
+    contract["effect_predicate"] = cleaned
+    return cleaned
+
+
+def _vulnerable_only_substance(declared: dict) -> None:
+    """The syntactic minimum a lab with nothing to compare against needs.
+
+    On a differential lab the comparison does this work: a predicate loose
+    enough to hold against a body reading "nothing interesting happened here"
+    holds on the patched build too, and the lab fails on its own predicate
+    rather than passing on it. A vulnerable-only lab has no patched side, so
+    the only thing standing between a declaration and a mandatory gate is the
+    declaration itself. This is the one place such a rule is needed, and it
+    is deliberately the only place: the same rule applied to a differential
+    lab would be a blocklist of degenerate patterns, which is the kind of
+    check a model that wants to pass writes around.
+
+    Two rules, both about the declaration and neither about a result:
+
+    1. A status clause may narrow the proof but may not be the whole of it.
+       "The service answered 200" is how the thing behaves on every build,
+       and the generation contract already says in prose that a reply is not
+       evidence; this says it in a form that can be refused. It also
+       subsumes the rule it replaces -- refusing "a status clause that is not
+       every status" -- because a status list of any breadth can no longer
+       clear the gate by itself, so there is no cardinality to pick and
+       defend.
+
+    2. Every text a clause looks for must hold a non-whitespace character,
+       and a body_regex must not match the empty string. That last is the
+       general form of "no pattern equivalent to .*", and it is worth saying
+       that way: `.*`, `.*?`, `(.*)`, `x?` and `a|` all match the empty
+       string and therefore hold against any body whatever, while a pattern
+       that requires at least one character cannot. A blocklist of the
+       spellings would have missed four of those five.
+    """
+    kinds = set(predicate.declared_kinds(declared))
+    if not kinds - {"status"}:
+        raise RuntimeError(
+            "A vulnerable-only lab has no patched build to compare against, so its "
+            "exploit_contract.effect_predicate cannot rest on status alone: a status "
+            "code says the service answered, not that the security effect happened. "
+            "Add body_contains, body_regex or header naming the effect itself."
+        )
+    for kind in ("body_contains", "body_regex"):
+        if kind in declared and not declared[kind].strip():
+            raise RuntimeError(
+                f"exploit_contract.effect_predicate.{kind} is empty, so it holds against "
+                "any response at all; a vulnerable-only lab has no patched build to "
+                "expose that, so name the text the effect actually produces."
+            )
+    pattern = declared.get("body_regex")
+    if pattern is not None and re.search(pattern, "") is not None:
+        raise RuntimeError(
+            f"exploit_contract.effect_predicate.body_regex {pattern!r} matches the empty "
+            "string, so it holds against any response at all. A vulnerable-only lab has "
+            "no patched build to expose that: require at least one character of the "
+            "effect itself."
+        )
+    header = declared.get("header")
+    if header is not None and not (
+        str(header.get("name", "")).strip() and str(header.get("contains", "")).strip()
+    ):
+        raise RuntimeError(
+            "exploit_contract.effect_predicate.header must name a header and the text it "
+            "contains; an empty value holds against any response at all, and a "
+            "vulnerable-only lab has no patched build to expose that."
+        )
+
+
 def _validate_support_services(services: list[str], compose: str) -> None:
     reserved = {"vulnerable", "patched", "validator"}
     if len(services) != len(set(services)) or reserved.intersection(services):
@@ -1405,6 +1846,44 @@ def _snapshot_once(repository: Path, revision: str, destination: Path, repo_url:
         shutil.rmtree(destination)
     _snapshot(repository, revision, destination)
     write_text(marker, stamp)
+
+
+def _discard_patched_half(lab_dir: Path) -> None:
+    """Take the patched side off disk once a demoted plan is about to be written.
+
+    The snapshot is extracted before the pair is judged, because research
+    reads it, so source/patched is already there when the demotion happens.
+    core.run_lab's preflight does not ask a vulnerable-only lab for it, so
+    nothing downstream complains -- which is the trap: the next reader finds
+    a patched tree and a patched/Dockerfile beside a plan that says there is
+    no fix, and cannot tell which of the two is stale.
+
+    The invariant the order enforces: the stamp never outlives the tree it
+    vouches for. _snapshot_once skips extraction only when the directory, the
+    stamp and its contents all agree, so the mirror case is already safe --
+    verified by execution, a stamp with no tree beside it re-extracts. The
+    hazard is the other way round, and removing the tree first created it: an
+    interrupt partway through the rmtree of a large vendor snapshot leaves a
+    truncated directory under an intact stamp, all three conditions hold, and
+    the next run builds from whatever files the rmtree had not reached yet.
+    Unlinking the stamp first closes that window, because from then on every
+    interrupt leaves a state that re-extracts.
+
+    Nothing here raises. The whole point of the demotion is to remove an
+    abort disposition, so a read-only source/ must not reintroduce one: the
+    stamp's unlink used to be the only unguarded call of the three, and a
+    PermissionError there aborted a run the demotion had just rescued. When
+    the stamp cannot go, the tree stays with it -- a stale pair that still
+    agrees with itself, which is the benign direction -- and plan.json names
+    the rejected reference either way.
+    """
+    source = lab_dir / "source"
+    try:
+        (source / ".patched.revision").unlink(missing_ok=True)
+    except OSError:
+        return
+    shutil.rmtree(source / "patched", ignore_errors=True)
+    shutil.rmtree(lab_dir / "patched", ignore_errors=True)
 
 
 def _wants_research(mode: str, listing: tuple[str, list[str], list[str]]) -> bool:
@@ -1482,22 +1961,85 @@ def _prompt_context(
     listing: tuple[str, list[str], list[str]],
     brief: dict | None,
     limit: int,
+    lab_dir: Path | None = None,
+    ecosystems: object = (),
 ) -> str:
-    """The source context and the research brief, together within limit."""
-    brief_text = research.render_brief(brief, limit * 2 // 5) if brief else ""
+    """The source context, the toolchain the snapshot declares, and the brief, within limit.
+
+    The toolchain section is not clipped and is subtracted from the budget
+    before the rest is laid out. It is a few hundred characters of facts the
+    snapshot states about itself, and half of it would be worse than none: a
+    base image tag cut in two is a tag that does not exist.
+    """
+    toolchain = (
+        baseimages.toolchain_section(lab_dir / "source" / "vulnerable", ecosystems)
+        if lab_dir is not None
+        else ""
+    )
+    remaining = max(0, limit - len(toolchain))
+    brief_text = research.render_brief(brief, remaining * 2 // 5) if brief else ""
     return _source_context(
         repository, vulnerable, fixed, dossier,
-        max_chars=limit - len(brief_text), hint=hint, listing=listing,
-    ) + brief_text
+        max_chars=remaining - len(brief_text), hint=hint, listing=listing,
+    ) + toolchain + brief_text
+
+
+#: The declaration and the observations that turn the mandatory effect check
+#: into a measurement, in the words all three validator-contract prompts use.
+#:
+#: WHY IT IS APPENDED AND NOT INSERTED
+#:
+#: tests/test_sourcegen_contract.py splits this file on "the literal keys
+#: attack_executed", requires exactly two blocks, and requires the sentence
+#: "Measure confirmed the same way on both sides" inside the first 2000
+#: characters of each. Measured: the vulnerable-only block has 1657
+#: characters of room ahead of that sentence and the differential block has
+#: 361. Instruction text added ahead of it in the differential block would
+#: push the sentence out of the window and fail that test rather than
+#: anything about this contract -- so this goes after it, in both, and in the
+#: repair prompt, which the split does not reach because it names the keys
+#: differently.
+_EFFECT_CONTRACT = (
+    "Declare in exploit_contract.effect_predicate what would count as the security "
+    "effect, before anything is built, using only these kinds: status (a list of whole "
+    "response status codes, any one of which counts), body_contains (literal text the "
+    "body must contain), body_regex (a Python regular expression the body must match) "
+    "and header (an object with name and contains). Set every kind you do not use to "
+    "null; a kind spelled any other way is refused before the build, because an "
+    "unrecognised one would be ignored and the predicate would be weaker than it reads. "
+    "CVELab decides whether the effect happened, not the validator: it evaluates this "
+    "predicate itself against the observations below. On a lab with a fixed build the "
+    "effect is that the predicate holds on vulnerable and does NOT hold on patched, so "
+    "a predicate loose enough to hold on both -- an empty body_contains, a pattern that "
+    "matches anything, a status list covering both outcomes -- fails the lab instead of "
+    "passing it. Name the effect itself, not the fact that the service answered. "
+    "Alongside confirmed and blocked, each side must print the raw observations its "
+    "booleans were derived from, under the key observations, as status (a whole number), "
+    "body (the response text) and headers (a mapping of header name to value), read from "
+    "that same response. proof_quality stays your own label and no longer decides "
+    "anything, so label it honestly rather than optimistically. "
+)
 
 
 def contract_retries() -> int:
-    """How often an answer refused before the build is asked for again (CVELAB_CONTRACT_RETRIES)."""
+    """How often an answer refused before the build is asked for again (CVELAB_CONTRACT_RETRIES).
+
+    Three, raised from two when `_check_base_images` joined the contract. A
+    refusal path added without budget for it does not improve the failure rate:
+    it moves a build failure to a refused generation, which is a different
+    failure class and not a better one. Each of the checks before the build can
+    refuse independently -- the file layout, the build inputs, variant parity,
+    fidelity, the support services, and now the base image tags -- so a lab that
+    used both retries on its layout had nothing left for a tag, and the
+    measurement would have read flat while the generation was lost earlier
+    instead of later. One more check, one more retry; a retry costs one model
+    call and no build.
+    """
     raw = os.getenv("CVELAB_CONTRACT_RETRIES", "").strip()
     try:
-        value = int(raw) if raw else 2
+        value = int(raw) if raw else 3
     except ValueError:
-        value = 2
+        value = 3
     return max(0, min(value, 5))
 
 
@@ -1553,9 +2095,18 @@ def generate_source_lab(
     mode = research.research_mode(research_mode)
     dossier = collect_cve(cve)
     resolved = resolve_source(dossier, repo, fixed_ref)
+    # Which resolver decided, carried from the branch that decided it rather
+    # than guessed at the end. plan.json recorded a constant string here, so
+    # after a bad pair nothing in the artifacts said how it had been chosen,
+    # and README's "a guessed repository or commit is not accepted as
+    # provenance" was an assertion with no field behind it. An empty value
+    # means resolve_source's own two sources, which revisions tells apart by
+    # looking for the revision among the CVE record's references.
+    resolver = revisions.EXPLICIT if repo and fixed_ref else ""
     vulnerable_only_resolved = None
     if repo and vulnerable_ref and not fixed_ref:
         vulnerable_only_resolved = (_safe_repo_url(repo), vulnerable_ref)
+        resolver = revisions.EXPLICIT
     discovery = None
     if (
         not resolved
@@ -1573,6 +2124,7 @@ def generate_source_lab(
                     _safe_repo_url(candidate_repo),
                     _safe_revision(candidate_fixed, "fixed revision source discovery returned"),
                 )
+                resolver = revisions.DISCOVERY
                 if not vulnerable_ref and discovery.get("vulnerable_ref"):
                     vulnerable_ref = _safe_revision(
                         discovery["vulnerable_ref"], "vulnerable revision source discovery returned"
@@ -1585,6 +2137,7 @@ def generate_source_lab(
                     _safe_repo_url(candidate_repo),
                     _safe_revision(candidate_vulnerable, "vulnerable revision source discovery returned"),
                 )
+                resolver = revisions.DISCOVERY
     if not resolved and not vulnerable_only_resolved and discovery:
         # Last, and mechanical: discovery corroborates the repository even when
         # it will not pin a fixing commit, and an advisory that says "affected
@@ -1606,6 +2159,7 @@ def generate_source_lab(
             if pair:
                 resolved = (safe_repo, pair["fixed_tag"])
                 vulnerable_ref = pair["vulnerable_tag"]
+                resolver = revisions.TAG_PAIR
                 progress.step(
                     "no fixing commit, but the release pair is tagged: "
                     f"{pair['vulnerable_tag']} -> {pair['fixed_tag']}"
@@ -1646,6 +2200,23 @@ def generate_source_lab(
         vulnerable = _safe_revision(vulnerable_ref, "vulnerable revision") if vulnerable_ref else f"{fixed}^"
     else:
         _run_git(["fetch", "--force", "--end-of-options", "origin", vulnerable], cwd=repository)
+    # Before the snapshots and not after them: the verdict can move the
+    # vulnerable side to another parent of a merge or to the advisory's own
+    # affected tag, and a snapshot taken first would have to be thrown away
+    # and extracted again -- which on a vendor tree is the most expensive
+    # thing this function does. Nothing below this point can change the pair,
+    # so the revision that is verified here is the revision that is built.
+    verdict = revisions.verify_pair(
+        repository, vulnerable, fixed, dossier, cve, repo_url,
+        explicit=bool(vulnerable_ref), resolver=resolver,
+    )
+    if verdict.vulnerable != vulnerable or verdict.fixed != fixed:
+        progress.step(
+            "the revision pair was corrected before anything was built: "
+            f"{verdict.vulnerable} -> {verdict.fixed or 'none'} "
+            f"({verdict.provenance['vulnerable_side']})"
+        )
+    vulnerable, fixed = verdict.vulnerable, verdict.fixed
     _run_git(["rev-parse", "--verify", "--end-of-options", f"{vulnerable}^{{commit}}"], cwd=repository)
 
     lab_dir = output_root.resolve() / cve
@@ -1653,6 +2224,46 @@ def generate_source_lab(
     if fixed:
         _snapshot_once(repository, fixed, lab_dir / "source" / "patched", repo_url)
     listing = _fix_listing(repository, vulnerable, fixed or vulnerable)
+    rejected_fixed = None
+    # The verdict's reason second, so a pair that is both unusable and off
+    # history keeps the reason the operator can act on most directly, and so
+    # a pair the verification could not place reaches exactly the demotion
+    # that was already here instead of a path of its own.
+    demotion = (_unusable_pair(listing[1]) or verdict.demotion) if fixed else None
+    if demotion:
+        # Judged before a single token is spent, and demoted rather than
+        # refused. The pair cannot show the fix, but the vulnerable side is
+        # still an authentic affected revision, and a lab that proves the
+        # effect on it is worth more than a dead run -- which is this
+        # project's own rule, written down under Limitations in README: the
+        # absence of a public fix does not prevent a PoC against the
+        # vulnerable version, it prevents differential validation of
+        # remediation. An unusable pair leaves exactly that situation and so
+        # takes exactly that remedy. Everything the differential path would
+        # have needed is dropped here rather than worked around below: the
+        # fixing reference, the snapshot it produced and the schema that
+        # asks for a patched service.
+        #
+        # The identical case is the weaker of the two demotions: with one
+        # tree there is no telling which side of the fix it sits on, so the
+        # lab may instead fail honestly on evidence. That is still a result,
+        # and the reason travels into plan.json and from there into the
+        # report, so nobody has to guess which of the two happened.
+        #
+        # In memory only. _discard_patched_half waits until the answer has
+        # validated and the demoted plan is about to be written, because
+        # everything between here and there can still raise -- a
+        # ProviderDeclined, which autoflow returns on without regenerating,
+        # a Ctrl-C, or `cvelab source`, which has no retry at all. Deleting
+        # here left plan.json still claiming SOURCE_REPRODUCTION with
+        # revisions.patched set while the tree, the stamp and patched/ were
+        # gone, so core.run_lab's preflight then failed on a lab that had
+        # built a minute earlier. Confirmed by execution against a working
+        # differential lab.
+        progress.step(f"demoted to a vulnerable-only lab: {demotion}")
+        rejected_fixed, fixed = fixed, None
+        vulnerable_only = True
+        listing = _fix_listing(repository, vulnerable, vulnerable)
     brief = None
     if _wants_research(mode, listing):
         # A retry in the same run reuses the brief; a fresh run reads anew.
@@ -1679,11 +2290,22 @@ def generate_source_lab(
         )
     if vulnerable_only:
         context = _prompt_context(
-            repository, vulnerable, vulnerable, dossier, hint, listing, brief, context_limit
+            repository, vulnerable, vulnerable, dossier, hint, listing, brief, context_limit,
+            lab_dir=lab_dir,
         )
         context += (
-            "\n\n--- FIX STATUS ---\nNo public fixed revision was identified at generation time. "
-            "Generate and validate only the authentic vulnerable source. Do not invent a patched service."
+            "\n\n--- FIX STATUS ---\n"
+            # A demoted lab reaches here with a fixing reference that was
+            # resolved and then thrown away, so the stock sentence would be
+            # a false statement in the prompt, and the one thing the model
+            # could do with the truth -- not look for a patched tree that
+            # was deleted a moment ago -- is the behaviour being asked for.
+            + (
+                f"A fixed revision was resolved and then discarded: {demotion}. "
+                if demotion
+                else "No public fixed revision was identified at generation time. "
+            )
+            + "Generate and validate only the authentic vulnerable source. Do not invent a patched service."
         )
         def _ask(refused: str) -> dict:
             return structured_response(
@@ -1721,7 +2343,12 @@ def generate_source_lab(
                     "response without the effect is confirmed=false and blocked=true. A patched build "
                     "that refuses the input is the expected outcome; recording that as a confirmation "
                     "inverts the proof. "
-                    f"Use only harmless canary data ({marker}) inside the isolated containers. Do not add arbitrary target "
+                    + _EFFECT_CONTRACT
+                    + "This lab has no patched build, so the comparison cannot show up a loose "
+                    "predicate here: the predicate may not rest on status alone, every text it "
+                    "looks for must be non-empty, and a body_regex that matches the empty string "
+                    "is refused before the build. "
+                    + f"Use only harmless canary data ({marker}) inside the isolated containers. Do not add arbitrary target "
                     "selection, external connectivity, host integration, elevated container permissions, sensitive-data "
                     "access, or lasting system changes. Normalize copied scripts to LF. Source archives contain no .git "
                     "directory, so initialize a local repository without a remote only when the build requires it. "
@@ -1751,7 +2378,9 @@ def generate_source_lab(
             ]
             _validate_generated(generated_files, vulnerable_only=True)
             _check_build_inputs(generated_files, lab_dir, vulnerable_only=True)
+            _check_base_images(generated_files)
             _validate_fidelity(generation["fidelity"])
+            _validate_effect_predicate(generation["exploit_contract"], vulnerable_only=True)
             _validate_support_services(generation["support_services"], generation["docker_compose"])
             return generated_files
 
@@ -1763,6 +2392,14 @@ def generate_source_lab(
                 content = _without_compose_version(content)
             write_text(lab_dir / item["path"], content)
         _enforce_compose_policy(lab_dir)
+        if demotion:
+            # Here, and not where the demotion was decided: this is the last
+            # point before plan.json says the lab is vulnerable-only, so
+            # anything that raised on the way -- the model declining, an
+            # interrupt, a refused compose policy -- left the differential
+            # lab on disk exactly as it was, matching the plan still beside
+            # it.
+            _discard_patched_half(lab_dir)
         plan = {
             "cve": cve,
             "cwe": generation["cwe"],
@@ -1770,14 +2407,29 @@ def generate_source_lab(
             "marker": marker,
             "repository": repo_url,
             "revisions": {"vulnerable": vulnerable, "patched": None},
+            # Beside the null patched revision, not instead of it: a plan
+            # with no fixing reference and no reason reads as a CVE whose fix
+            # was never found, and repair_source_lab, which decides what kind
+            # of lab this is from revisions.patched alone, must keep reading
+            # it as vulnerable-only on every later pass.
+            **(
+                {"demotion": {"rejected_fixed": rejected_fixed, "reason": demotion}}
+                if demotion
+                else {}
+            ),
             "fix_status": "PUBLIC_FIX_NOT_IDENTIFIED",
             "patched_tested": False,
             "startup_services": [*generation["support_services"], "vulnerable"],
-            "source_provenance": "Public vulnerable source resolved from CVE discovery or explicit override",
+            # The verdict and not a sentence that was true of every run alike.
+            # A demoted lab keeps the verdict of the pair it was demoted from,
+            # so the rejected fixing reference, the merge parents it was
+            # chosen among and the advisory tags that disagreed are all still
+            # readable beside the demotion that acted on them.
+            "source_provenance": verdict.provenance,
             "safety": {
                 "target_scope": "internal_docker_network_only",
                 "payload": "non_destructive_exploit_canary",
-                "limitations": "No public fixed revision was identified; remediation behavior was not tested.",
+                "limitations": _vulnerable_only_limitation(demotion),
             },
             "exploit_contract": generation["exploit_contract"],
             "fidelity": generation["fidelity"],
@@ -1802,8 +2454,15 @@ def generate_source_lab(
             "lab_dir": str(lab_dir),
             "plan": plan,
         }
-    context = _prompt_context(repository, vulnerable, fixed, dossier, hint, listing, brief, context_limit)
+    # Resolved before the prompt is assembled, not after: the toolchain section
+    # takes the advisory's ecosystem from this result rather than asking
+    # `releases.advisory_packages` again, which would be a second network round
+    # trip paid on every prompt build.
     published = releases.find_releases(cve)
+    context = _prompt_context(
+        repository, vulnerable, fixed, dossier, hint, listing, brief, context_limit,
+        lab_dir=lab_dir, ecosystems=[item.get("ecosystem") for item in published],
+    )
     context += releases.render(published)
     def _ask(refused: str) -> dict:
         return structured_response(
@@ -1853,6 +2512,13 @@ def generate_source_lab(
                 "access, or lasting system changes. Dockerfiles may install ordinary build dependencies. Normalize copied "
                 "scripts to LF. Before using a Gradle wrapper, verify that its JAR exists; otherwise install the exact "
                 "declared Gradle version. "
+                "A repository whose modules are linked to each other by a file it does not commit cannot be built from "
+                "a checkout as it stands. In Go that file is go.work, which is conventionally gitignored: a module "
+                "requiring a sibling from the same repository then resolves it to the published version named in "
+                "go.mod rather than to the directory beside it, and the build fails on symbols the checkout plainly "
+                "contains. Where a module requires another from the same repository, link it to the tree being built "
+                "-- go work init . ./<dir>, or a replace directive -- and have the build confirm it with "
+                "go list -m <module>, which names no version when it resolved to a local directory. "
                 "Measure confirmed the same way on both sides: one function that decides whether "
                 "the exploit succeeded, called once for vulnerable and once for patched, so the two "
                 "verdicts are comparable. confirmed means the security effect was observed, not that "
@@ -1860,13 +2526,16 @@ def generate_source_lab(
                 "response without the effect is confirmed=false and blocked=true. A patched build "
                 "that refuses the input is the expected outcome; recording that as a confirmation "
                 "inverts the proof. "
-                "Source archives have no .git directory, so initialize a local repository without "
+                + _EFFECT_CONTRACT
+                + "Source archives have no .git directory, so initialize a local repository without "
                 "a remote only if build logic requires it. Healthchecks and the validator must use the final application "
                 "scheme, port, and route, and redirects must not count as healthy. "
                 "Build contexts are fixed: vulnerable and patched build from the lab directory, where the vendor "
                 "snapshots are source/vulnerable and source/patched and adapter/ holds only the adapter files you "
-                "return; the validator builds from validator/ alone, so its Dockerfile can copy only validator.py and "
-                "requirements.txt. Every COPY source must exist in its context. vulnerable/Dockerfile and "
+                "return; the validator builds from validator/ alone, which holds validator.py and the plan.json the CLI "
+                "writes there. requirements.txt is copyable only if you also return validator/requirements.txt "
+                "in this answer; a COPY of it without that file is rejected before the build. "
+                "Every COPY source must exist in its context. vulnerable/Dockerfile and "
                 "patched/Dockerfile, and their Compose services, must be identical except for the snapshot they "
                 "copy, labels carrying their own name, package versions and commit ids; the adapter runs unchanged "
                 "in both and must never compare against the variant name."
@@ -1894,7 +2563,9 @@ def generate_source_lab(
         ]
         _validate_generated(generated_files)
         _check_build_inputs(generated_files, lab_dir)
+        _check_base_images(generated_files)
         _validate_fidelity(generation["fidelity"])
+        _validate_effect_predicate(generation["exploit_contract"])
         _validate_support_services(generation["support_services"], generation["docker_compose"])
         return generated_files
 
@@ -1915,7 +2586,7 @@ def generate_source_lab(
         "marker": marker,
         "repository": repo_url,
         "revisions": {"vulnerable": vulnerable, "patched": fixed},
-        "source_provenance": "CVE reference or explicit user override",
+        "source_provenance": verdict.provenance,
         "startup_services": [*generation["support_services"], "vulnerable", "patched"],
         "safety": {
             "target_scope": "internal_docker_network_only",
@@ -2029,9 +2700,12 @@ def repair_source_lab(
         raise RuntimeError("Curated runners are deterministic and cannot be AI-repaired")
     dossier = json.loads(dossier_path.read_text(encoding="utf-8"))
     repo_url = plan.get("repository")
-    revisions = plan.get("revisions", {})
-    vulnerable = revisions.get("vulnerable")
-    fixed = revisions.get("patched")
+    # Not `revisions`: that is the module that verifies a pair, and a
+    # local of the same name made it unreachable from this function --
+    # silently, because nothing here needed it yet.
+    recorded = plan.get("revisions", {})
+    vulnerable = recorded.get("vulnerable")
+    fixed = recorded.get("patched")
     if not repo_url or not vulnerable:
         raise RuntimeError("Automatic repair is missing repository provenance")
     # plan.json is part of the lab and reaches git below.
@@ -2054,6 +2728,47 @@ def repair_source_lab(
         :12000 if local_provider else 40000
     ]
     listing = _fix_listing(repository, vulnerable, fixed or vulnerable)
+    demotion = _unusable_pair(listing[1]) if fixed else None
+    if demotion:
+        # Demoted here too, and deliberately, not for symmetry alone. This
+        # plan can be rewritten into a vulnerable-only one completely --
+        # every field below that distinguishes the two kinds of lab is
+        # written from `vulnerable_only`, so nothing is left behind claiming
+        # a differential -- and raising instead would be wrong in both
+        # directions at once: generation demotes this very pair, and
+        # autoflow turns a repair exception into `repair_generation_error`
+        # and asks again, so an unusable pair would spend every remaining
+        # repair on an answer that cannot change. That retry loop is the
+        # thing this check was added to stop.
+        #
+        # Defence in depth, and nothing more than that. There is no
+        # `cvelab repair` subcommand -- cli.py registers build, source,
+        # source-all, auto, doctor, upload, run, closed, field, manual,
+        # demo-target, closed-auto and all -- so the only callers are
+        # autoflow's two, and run_auto_workflow always generates first. The
+        # plan read here was therefore written by a generation that already
+        # applied this very predicate, which leaves exactly one way in: a
+        # lab generated before the predicate existed and repaired by a
+        # later version. That is worth catching and is not worth describing
+        # as a route anyone can take today.
+        #
+        # The filesystem work waits for the answer, as it does in
+        # generation: the plan rewritten just below is in memory until the
+        # end of this function, so a model that never answers must leave
+        # the differential lab on disk whole.
+        progress.step(f"demoted to a vulnerable-only lab: {demotion}")
+        fixed = None
+        vulnerable_only = True
+        listing = _fix_listing(repository, vulnerable, vulnerable)
+        plan["lab_type"] = "VULNERABLE_ONLY_REPRODUCTION"
+        plan["revisions"] = {**recorded, "patched": None}
+        plan["demotion"] = {"rejected_fixed": recorded.get("patched"), "reason": demotion}
+        plan["fix_status"] = "PUBLIC_FIX_NOT_IDENTIFIED"
+        plan["patched_tested"] = False
+        plan["safety"] = {
+            **plan.get("safety", {}),
+            "limitations": _vulnerable_only_limitation(demotion),
+        }
     brief = None
     if mode != "off":
         saved = research.load(lab_dir)
@@ -2066,17 +2781,23 @@ def repair_source_lab(
             rounds=min(2, research.research_rounds()), situation=diagnostic,
             prior=saved if research.matches(saved, cve, vulnerable, fixed, hint) else None,
         )
+    recorded_releases = plan.get("published_releases") or []
     context = _prompt_context(
         repository, vulnerable, fixed or vulnerable, dossier, hint, listing, brief,
         30000 if local_provider else research.prompt_budget(False) * 5 // 8,
+        lab_dir=lab_dir,
+        ecosystems=[item.get("ecosystem") for item in recorded_releases],
     )
-    context += releases.render(plan.get("published_releases") or [])
+    context += releases.render(recorded_releases)
     current = json.dumps(
         _repair_material(lab_dir, 24000 if local_provider else 120000), ensure_ascii=True, indent=2
     )
     variant_contract = (
         "This is vulnerable-only: do not create a patched image or service. Emit patched_tested=false, "
-        "differential_confirmed=false, and fix_status=PUBLIC_FIX_NOT_IDENTIFIED."
+        "differential_confirmed=false, and fix_status=PUBLIC_FIX_NOT_IDENTIFIED. With no patched build "
+        "there is no comparison to show up a loose effect predicate, so it may not rest on status "
+        "alone, every text it looks for must be non-empty, and a body_regex that matches the empty "
+        "string is refused before the build."
         if vulnerable_only
         else
         "Send the identical patch-derived regression input to vulnerable and patched services. Success requires the effect on "
@@ -2097,14 +2818,20 @@ def repair_source_lab(
                 "vendor source. Prefer the actual vendor service or binary. "
                 "Build contexts are fixed: vulnerable and patched build from the lab directory, where the vendor "
                 "snapshots are source/vulnerable and source/patched and adapter/ holds only the adapter files you "
-                "return; the validator builds from validator/ alone, so its Dockerfile can copy only validator.py and "
-                "requirements.txt. Every COPY source must exist in its context. vulnerable/Dockerfile and "
+                "return; the validator builds from validator/ alone, which holds validator.py and the plan.json the CLI "
+                "writes there. requirements.txt is copyable only if you also return validator/requirements.txt "
+                "in this answer; a COPY of it without that file is rejected before the build. "
+                "Every COPY source must exist in its context. vulnerable/Dockerfile and "
                 "patched/Dockerfile, and their Compose services, must be identical except for the snapshot they "
                 "copy, labels carrying their own name, package versions and commit ids; the adapter runs unchanged "
                 "in both and must never compare against the variant name. "
                 "Use source_component only if launching the product is genuinely impractical, vendor_service when the real "
                 "service starts with simulated surrounding components, and product_end_to_end only when the complete "
-                "security-relevant product path executes. Disclose every simulated component. Compose must use an internal "
+                "security-relevant product path executes. The level and vendor_product_started must agree, and the "
+                "answer is rejected before the build when they do not: source_component requires "
+                "vendor_product_started false, because its whole meaning is that the product was not started, while "
+                "vendor_service and product_end_to_end both require it true. Decide which is honest first and let the "
+                "level follow, rather than naming a level and then describing something else. Disclose every simulated component. Compose must use an internal "
                 "network, no host ports or mounts, services named vulnerable, patched where applicable, and validator, and "
                 "list all extra services in support_services. Run containers non-root with no-new-privileges. The automatic "
                 "validator must deliver the same patch-derived regression input, derive its booleans from raw observations, print one JSON document with "
@@ -2116,6 +2843,7 @@ def repair_source_lab(
                 "evidence shows it is technically wrong. Keep all interaction inside the internal Docker network, accept "
                 "only fixed service names, use harmless canary data, and add no host integration, elevated permissions, "
                 "sensitive-data access, external connectivity, or lasting system changes. "
+                + _EFFECT_CONTRACT
                 + variant_contract
             ),
             input_text=(
@@ -2154,7 +2882,14 @@ def repair_source_lab(
         generated_files.extend(_adapter_files(generation["adapter_files"]))
         _validate_generated(generated_files, vulnerable_only=vulnerable_only)
         _check_build_inputs(generated_files, lab_dir, vulnerable_only=vulnerable_only)
+        _check_base_images(generated_files)
         _validate_fidelity(generation["fidelity"])
+        # The repair rewrites plan["exploit_contract"] from this answer, so a
+        # repair is as able to install an unmeasurable predicate as a
+        # generation is, and is held to the same check.
+        _validate_effect_predicate(
+            generation["exploit_contract"], vulnerable_only=vulnerable_only
+        )
         _validate_support_services(generation["support_services"], compose)
         return generated_files
 
@@ -2164,6 +2899,11 @@ def repair_source_lab(
     for item in generated_files:
         write_text(lab_dir / item["path"], item["content"])
     _enforce_compose_policy(lab_dir)
+    if demotion:
+        # The demoted plan is written at the end of this function, so this is
+        # the matching point for the deletion: before it, every raise above
+        # left the lab and its plan agreeing with each other.
+        _discard_patched_half(lab_dir)
 
     history = plan.get("generation", {}).get("repair_history", [])
     history.append({

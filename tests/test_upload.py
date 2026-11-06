@@ -383,3 +383,98 @@ class SharingRequirementTests(unittest.TestCase):
             "documents": [{"name": "PoC.py", "text": "print(1)", "truncated": False}],
         }
         self.assertIn("will be refused", upload.describe(payload))
+
+
+class ADeclineIsNotAFailureTests(unittest.TestCase):
+    """What the control plane stores for a CVE that needs a vendor artifact.
+
+    `sourcegen` answers VENDOR_ARTIFACT_REQUIRED beside ARTIFACT_REQUIRED, for
+    the narrower reason that the affected product is proprietary -- an
+    appliance, an operating system, a licensed binary. Both say the same
+    thing: there is no public source to build a lab from, and nothing about
+    the request can change that. Absent from STATUS, the narrower one fell
+    through the default to "failed" while the broader one was filed as the
+    decline it is, so a batch's failure rate counted every proprietary product
+    in it as something that had gone wrong.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        # One lab for the whole class: make_lab() creates its directories, so
+        # calling it twice under one root fails before anything is collected.
+        self.lab = make_lab(self.root)
+
+    def filed_as(self, outcome: str) -> str:
+        payload = upload.collect(
+            self.lab,
+            {"ok": False, "cve": "CVE-2024-12345", "status": outcome},
+            provider=None,
+            model=None,
+            include_poc=True,
+        )
+        self.assertEqual(payload["outcome"], outcome)
+        return payload["status"]
+
+    def test_a_vendor_artifact_is_filed_as_a_decline(self) -> None:
+        self.assertEqual(self.filed_as("VENDOR_ARTIFACT_REQUIRED"), "declined")
+
+    def test_it_is_filed_the_same_way_as_the_status_beside_it(self) -> None:
+        self.assertEqual(
+            self.filed_as("VENDOR_ARTIFACT_REQUIRED"),
+            self.filed_as("ARTIFACT_REQUIRED"),
+        )
+
+    def test_the_map_is_exactly_what_the_package_can_produce(self) -> None:
+        """Pinned whole, because the defect was an omission and the comment
+        above STATUS says an unknown status is reported as failed rather than
+        guessed at. The same rule applies to additions: a status belongs here
+        only once it has been read at the place that returns it.
+
+        POC_NOT_VERIFIED, from deliverables.create_deliverables, is the other
+        status that reaches collect() without being listed. It is left out on
+        purpose: it means the lab did not prove, so the default is the right
+        answer for it.
+
+        UNSUPPORTED was added under this rule rather than against it: it is in
+        the closed-image planner's status enum and is returned verbatim from
+        the branch that fires whenever the plan is not READY, so it reaches
+        collect() the same way ARTIFACT_REQUIRED does from that planner.
+
+        A closed lab that ran and whose predicate did not hold is deliberately
+        NOT listed. Its result carries no status key at all, so it takes the
+        default, and "failed" is the truthful answer there: real images were
+        started and the effect did not appear. That is a failure to reproduce,
+        not a judgement that it could not be tried.
+        """
+        self.assertEqual(
+            upload.STATUS,
+            {
+                "VALIDATED": "succeeded",
+                "ARTIFACT_REQUIRED": "declined",
+                "VENDOR_ARTIFACT_REQUIRED": "declined",
+                "UNSUPPORTED": "declined",
+                "GENERATION_NOT_AVAILABLE": "declined",
+                "PROVIDER_DECLINED": "declined",
+                "AUTO_GENERATION_FAILED": "failed",
+                "AUTO_REPAIR_EXHAUSTED": "failed",
+            },
+        )
+
+    def test_a_plan_that_cannot_be_reproduced_is_declined_not_failed(self) -> None:
+        """The closed-image planner judging a product unreproducible is an
+        answer, not a crash. Filed as a failure it would read as the tool
+        having broken on a CVE it actually assessed and reported on.
+        """
+        self.assertEqual(self.filed_as("UNSUPPORTED"), "declined")
+        self.assertEqual(self.filed_as("UNSUPPORTED"), self.filed_as("ARTIFACT_REQUIRED"))
+
+    def test_a_declined_run_does_not_claim_to_be_shared(self) -> None:
+        payload = upload.collect(
+            self.lab,
+            {"ok": False, "cve": "CVE-2024-12345",
+             "status": "VENDOR_ARTIFACT_REQUIRED"},
+            provider=None, model=None, include_poc=True,
+        )
+        self.assertNotIn("shared database", upload.describe(payload))

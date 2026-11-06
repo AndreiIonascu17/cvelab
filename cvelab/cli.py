@@ -548,6 +548,29 @@ def _run_command(args: argparse.Namespace) -> int:
                 args.output_root, provider, model, api_key, base_url,
                 args.offline, args.json,
             )
+        if args.command in {"auto", "source", "source-all"}:
+            # The same silence closed-auto was given a guard for below, on the
+            # three subcommands that actually build from source. resolve_source
+            # honours `repo` only together with `fixed_ref`, and
+            # generate_source_lab honours it alone only with `--vulnerable-ref`
+            # for a vulnerable-only lab, so `--repo` by itself was accepted,
+            # dropped, and the CVE record's own commit used instead -- which
+            # may belong to a different repository than the one that was named.
+            #
+            # Not the symmetric check closed-auto uses: `--vulnerable-ref`
+            # alone is honoured here, against whichever repository the record
+            # resolves, so only the two combinations that are dropped refuse.
+            if args.repo and not (args.fixed_ref or args.vulnerable_ref):
+                raise ValueError(
+                    "--repo names a repository to take a revision from: pass it with "
+                    "--fixed-ref, or with --vulnerable-ref for a vulnerable-only lab, "
+                    "or pass neither and let the CVE record resolve both"
+                )
+            if args.fixed_ref and not args.repo:
+                raise ValueError(
+                    "--fixed-ref names a revision in a repository: pass --repo with it, "
+                    "or pass neither and let the CVE record resolve both"
+                )
         if args.command == "build":
             result = build_lab(
                 args.cve, args.output_root, args.cwe, args.ai,

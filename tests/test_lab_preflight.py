@@ -192,6 +192,33 @@ class LabPreflightTests(unittest.TestCase):
         }) if item["path"] != "patched/Dockerfile"]
         _check_build_inputs(files, self.lab, vulnerable_only=True)
 
+    def test_a_vulnerable_only_lab_may_not_copy_a_patched_snapshot(self) -> None:
+        """The disk must not vouch for a tree the lab is about to lose.
+
+        For an ordinary vulnerable-only lab source/patched was never
+        extracted, so the fallback to the filesystem answered no by itself.
+        A demoted lab is different: the patched snapshot is still there while
+        this answer is checked, because it is removed only once the demoted
+        plan is about to be written, so that a model which never answers
+        leaves the lab intact. Without this the disk would approve a COPY of
+        a tree on its way out and the build would fail on it instead.
+        """
+        files = [item for item in self.files(**{
+            "vulnerable/Dockerfile": TARGET.format(variant="vulnerable")
+            + "COPY source/patched/ /opt/fixed/\n",
+        }) if item["path"] != "patched/Dockerfile"]
+        self.assertTrue((self.lab / "source" / "patched").is_dir())
+
+        message = self.refused(files, vulnerable_only=True)
+
+        self.assertIn("vulnerable/Dockerfile copies source/patched/", message)
+        self.assertIn("this lab has no patched snapshot", message)
+        self.assertIn("Build source/vulnerable alone", message)
+
+    def test_a_differential_lab_still_copies_both_snapshots(self) -> None:
+        """The guard belongs to vulnerable-only labs and must not reach a pair."""
+        _check_build_inputs(self.files(), self.lab, vulnerable_only=False)
+
 
 if __name__ == "__main__":
     unittest.main()

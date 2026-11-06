@@ -325,8 +325,8 @@ class BriefTests(unittest.TestCase):
 
 VALIDATOR = " ".join([
     "attack_executed", "proof_quality", "observable_effect", "evidence_type", "vulnerable",
-    "patched", "differential_confirmed", "confirmed", "blocked", "CVELAB_MANUAL_ACTION",
-    "CVELAB_TARGET", "exploit", "verify",
+    "patched", "differential_confirmed", "confirmed", "blocked", "observations",
+    "CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "exploit", "verify",
 ])
 COMPOSE = """services:
   vulnerable:
@@ -357,6 +357,7 @@ def generation(adapter: list[dict]) -> dict:
         "exploit_contract": {
             "attack_summary": "a", "preconditions": [], "observable_effect": "e",
             "evidence_type": "data_exposure",
+            "effect_predicate": {"body_contains": "session-token"},
         },
         "docker_compose": COMPOSE, "dockerignore": "", "vulnerable_dockerfile": "FROM scratch\n",
         "patched_dockerfile": "FROM scratch\n", "validator_dockerfile": "FROM scratch\n",
@@ -413,6 +414,11 @@ class SourceLabResearchTests(unittest.TestCase):
             mock.patch.object(sourcegen, "resolve_source", return_value=(self.URL, self.fixed)),
             mock.patch.object(sourcegen, "_enforce_compose_policy"),
             mock.patch.object(sourcegen.releases, "find_releases", return_value=[]),
+            # Every pair is verified now, and the affected-version half of
+            # that reads GitHub's advisory and lists the repository's tags.
+            # This suite builds its repository in a temp directory and must
+            # not reach the network for it.
+            mock.patch.object(sourcegen.revisions, "release_pair", return_value=None),
             mock.patch.object(sourcegen, "structured_response", side_effect=self.model),
             mock.patch.object(research, "structured_response", side_effect=self.model),
         ]

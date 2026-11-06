@@ -126,8 +126,8 @@ networks:
 """
 VALIDATOR = " ".join([
     "attack_executed", "proof_quality", "observable_effect", "evidence_type", "vulnerable",
-    "patched", "differential_confirmed", "confirmed", "blocked", "CVELAB_MANUAL_ACTION",
-    "CVELAB_TARGET", "exploit", "verify",
+    "patched", "differential_confirmed", "confirmed", "blocked", "observations",
+    "CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "exploit", "verify",
 ])
 REQUIRED = [
     {"path": "docker-compose.yml", "content": COMPOSE},

@@ -66,6 +66,7 @@ class GeneratedValidatorContractTests(unittest.TestCase):
         validator = " ".join([
             "attack_executed", "proof_quality", "observable_effect", "evidence_type",
             "vulnerable", "patched", "differential_confirmed", "confirmed", "blocked",
+            "observations",
         ])
         with self.assertRaisesRegex(RuntimeError, "manual PoC contract"):
             _validate_generated(generated_files(validator))
@@ -74,7 +75,7 @@ class GeneratedValidatorContractTests(unittest.TestCase):
         validator = " ".join([
             "attack_executed", "proof_quality", "observable_effect", "evidence_type",
             "vulnerable", "patched", "differential_confirmed", "confirmed", "blocked",
-            "CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "exploit", "verify",
+            "observations", "CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "exploit", "verify",
         ])
         _validate_generated(generated_files(validator))
 
@@ -415,6 +416,27 @@ class GitRevisionTests(unittest.TestCase):
         self.assertEqual(source.count('"fetch", "--force", "--end-of-options", "origin"'), 2)
         self.assertEqual(source.count('"rev-parse", "--verify", "--end-of-options"'), 3)
 
+    def test_the_pair_verification_ends_its_options_too(self) -> None:
+        """The same inventory for the module that reads history, not trees.
+
+        The guarantee is the package's and not one file's: `revisions` is the
+        first place in the package to run `rev-list`, `merge-base` and a
+        second `diff --name-only`, each handed a revision that came from a
+        merge, a model, a tag listing or the command line, and an inventory
+        that stopped at sourcegen.py would have let all four in unreviewed.
+        """
+        source = (Path(__file__).resolve().parent.parent / "cvelab" / "revisions.py").read_text(
+            encoding="utf-8"
+        )
+        for call in ('"rev-parse", "--verify", "--end-of-options"',
+                     '"merge-base", "--is-ancestor", "--end-of-options"',
+                     '"rev-list", "--parents", "-n", "1", "--end-of-options"',
+                     '"diff", "--name-only", "--end-of-options"'):
+            with self.subTest(call=call):
+                self.assertIn(call, source)
+        # Every git invocation in the module, so a new one is reviewed here.
+        self.assertEqual(source.count('_git(repository, ['), 4)
+
     def test_a_discovered_revision_is_validated(self) -> None:
         from unittest import mock
 
@@ -488,3 +510,48 @@ class ValidatorVerdictInEitherShapeTests(unittest.TestCase):
                      {"vulnerable_confirmed": 1}):
             with self.subTest(held=held):
                 self.assertIs(core._validator_said(held, "vulnerable", "confirmed"), False)
+
+
+class SiblingModulesAreLinkedToTheTreeTests(unittest.TestCase):
+    """A monorepo's inter-module link is often not in the repository.
+
+    Go's go.work is conventionally gitignored -- mattermost ignores it at
+    both .gitignore:55 and server/.gitignore:26 -- so a checkout of such a
+    repository cannot build as it stands: server/go.mod requires
+    server/public v0.1.12 and the tree beside it is newer, so the build
+    fails on symbols the checkout plainly contains.
+
+    Measured on CVE-2026-6961 over three runs, where it cost every one:
+
+        channels/audit/audit.go:43:18: undefined: model.AuditKeyError
+        einterfaces/pap.go:24:64: undefined: model.CELExpressionError
+
+    Verified on 2026-11-04 in golang:1.25-bookworm against that lab's own
+    checkout. Without a workspace `go list -m` answers
+    "server/public v0.1.12", the published module missing both symbols;
+    with `go work init . ./public` it answers "server/public" and no
+    version, which is how a local directory reports, and the two packages
+    then compile. One of the three runs had already written the workspace
+    itself and lost the build to a module download instead, which is why
+    the generator is told the rule and a failed fetch is retried rather
+    than repaired.
+    """
+
+    def setUp(self) -> None:
+        self.source = (
+            Path(__file__).resolve().parent.parent / "cvelab" / "sourcegen.py"
+        ).read_text(encoding="utf-8")
+
+    def test_the_generator_is_told_what_a_checkout_does_not_carry(self) -> None:
+        self.assertIn("go.work, which is conventionally gitignored", self.source)
+        self.assertIn("requires another from the same repository", self.source)
+
+    def test_it_is_told_how_to_check_that_the_link_took(self) -> None:
+        """The symptom is a missing symbol, which points at the source.
+
+        `go list -m` is what tells a resolved sibling from a published one,
+        so the rule names it rather than leaving the build to find out at
+        the compile step.
+        """
+        self.assertIn("go list -m <module>", self.source)
+        self.assertIn("names no version when it resolved to a local directory", self.source)
