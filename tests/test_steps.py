@@ -66,20 +66,48 @@ class TheModuleStandsAloneTests(unittest.TestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, source)
 
-    def test_the_runner_stayed_with_the_mode_that_can_run_it(self) -> None:
+    def test_the_delivery_stayed_with_the_mode_that_can_deliver_it(self) -> None:
         """Running the steps needs a route to the lab, and that differs.
 
         A single-target proof reaches one container's network namespace; a
-        generated lab has an internal compose network and no container id to
-        hand. The grammar is shared, the runner is not.
+        generated lab has an internal Compose network and no container id to
+        hand. So the DELIVERY is each mode's own, and that is what has to
+        stay out of here: nothing in this module starts a container or
+        decides where one stands.
+
+        The program the container runs is a different thing, and it is here.
+        It is a string: it imports nothing when this module is imported,
+        speaks to nothing until something else delivers it, and it is the
+        part of running the steps that does not vary by mode. This test
+        asserted its absence until the Compose path needed one, and the
+        absence was never the property worth protecting -- the import graph
+        is, and the two assertions below are it.
         """
         source = Path(steps.__file__).read_text(encoding="utf-8")
-        for absent in ("docker", "subprocess", "urllib", "CVELAB_"):
+        outside = source.replace(steps.SETUP_RUNNER, "")
+        for absent in ("docker", "subprocess", "urllib"):
             with self.subTest(absent=absent):
-                self.assertNotIn(absent, source)
+                self.assertNotIn(absent, outside)
+        # The program is a literal and nothing else in the module is like
+        # it: compiled here rather than at import, and never executed.
+        compile(steps.SETUP_RUNNER, "<setup runner>", "exec")
+        self.assertNotIn("exec(", source)
+        self.assertNotIn("eval(", source)
         ran = inspect.getsource(field._run_setup)
         self.assertIn("container:", ran)
         self.assertIn("CVELAB_SETUP", field._SETUP_RUNNER)
+
+    def test_every_extractor_the_grammar_accepts_has_a_branch_in_this_runner(self) -> None:
+        """The defect that cost a lab its spec, asserted on the second runner.
+
+        field's runner dispatched on three of the four extractors while
+        validate_setup accepted all four, so a spec declaring extract.header
+        validated clean and died at run time on "nothing to bind from the
+        response". A second runner is a second chance to do it again.
+        """
+        for name in steps.EXTRACTORS:
+            with self.subTest(extractor=name):
+                self.assertIn(f'"{name}" in extract', steps.SETUP_RUNNER)
 
 
 class FieldReadsTheSameGrammarTests(unittest.TestCase):

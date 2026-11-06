@@ -23,7 +23,14 @@ from pathlib import Path
 from . import progress, usage
 from .ai import ProviderDeclined, ai_is_configured, provider_supports_web_search
 from .closed_auto import run_closed_auto
-from .core import AfterValidation, CVERecordNotFound, normalize_cve, run_lab, write_text
+from .core import (
+    SETUP_FAILURE_MARKER,
+    AfterValidation,
+    CVERecordNotFound,
+    normalize_cve,
+    run_lab,
+    write_text,
+)
 from .deliverables import create_deliverables
 from .sourcegen import generate_source_lab, repair_source_lab
 
@@ -66,13 +73,49 @@ _STARTUP_MARKERS = (
 )
 
 
+def _setup_failure(message: str) -> bool:
+    """Whether CVELab's own setup steps did not put the lab into state.
+
+    `core.run_setup` raises with SETUP_FAILURE_MARKER in the message, and
+    the marker is imported rather than spelled again here: core owns the
+    sentence and this only recognises it, so the two cannot drift apart.
+
+    It sits between a startup failure and an unproved effect, and it is
+    narrower than either. By the time the steps run, the build has produced
+    its images and the services have passed the health gate the lab's own
+    validator declares -- the setup service waits on exactly that
+    `depends_on` -- so a message carrying this marker is never a build that
+    failed and never a service that did not come up, whatever the
+    diagnostics appended to it say.
+    """
+    return SETUP_FAILURE_MARKER.lower() in message.lower()
+
+
 def _startup_failure(message: str) -> bool:
     """Whether a run ended because the lab's services never came up.
 
     The validator only runs once its targets are healthy, so these runs say
     nothing about the PoC. They are repaired on their own, without spending
     a validation attempt or one of the repairs meant for the exploit.
+
+    A message carrying the setup marker is never one of these, whatever else
+    it carries, and the guard is here rather than only in the branch order
+    below. `run_lab` wraps every exception it raises with `docker compose ps
+    -a` and `docker compose logs`, which report the state of every service
+    in the project: one unrelated container sitting at `Up (unhealthy)`, or
+    one log line quoting the phrase, puts `is unhealthy` into the text of a
+    failure that happened after the health gate had already opened.
+
+    Measured on 2026-11-06, by calling this on both: the bare marker reads
+    False and the same marker with compose diagnostics appended reads True.
+    So a setup failure would have been handed STARTUP_HINT and spent the
+    startup budget rewriting a build and healthchecks that had both worked.
+    Ordering the branches alone does not fix that -- once the setup budget is
+    spent the loop falls through to this test, which would then take the
+    startup budget for the same failure by the back door.
     """
+    if _setup_failure(message):
+        return False
     lowered = message.lower()
     return any(marker in lowered for marker in _STARTUP_MARKERS)
 
@@ -80,6 +123,22 @@ def _startup_failure(message: str) -> bool:
 def startup_repair_limit() -> int:
     """Startup-only repairs allowed per run (CVELAB_STARTUP_REPAIRS, 0 to 5)."""
     raw = os.getenv("CVELAB_STARTUP_REPAIRS", "").strip()
+    try:
+        value = int(raw) if raw else 2
+    except ValueError:
+        value = 2
+    return max(0, min(value, 5))
+
+
+def setup_repair_limit() -> int:
+    """Setup-only repairs allowed per run (CVELAB_SETUP_REPAIRS, 0 to 5).
+
+    Its own budget, spent the way `startup_repair_limit`'s is and not the way
+    `effect_repair_limit`'s is. The validator never started, so nothing was
+    measured and nothing is known about the vulnerability; the effect budget
+    is for a lab whose validator ran and observed the wrong thing.
+    """
+    raw = os.getenv("CVELAB_SETUP_REPAIRS", "").strip()
     try:
         value = int(raw) if raw else 2
     except ValueError:
@@ -337,10 +396,19 @@ DEPENDENCY_HINT = (
 def _runtime_failure(message: str) -> dict:
     """What a build or run exception becomes, with a hint where one is known.
 
-    The order of these three is load-bearing, because one log can match more
-    than one of them. A compose build runs every target, so a log can carry
-    an archived pool from one target and an unresolvable tag from another,
-    and `not found` appears in both.
+    The setup is tested first because it is the only one of the four whose
+    message says what already worked: the steps run after the build produced
+    its images, and each of the other three requires the build stage's own
+    failure line, which this message cannot carry. It is also the only one
+    matched on a sentence of CVELab's own rather than on a tool's output, so
+    nothing a diagnostics tail carries can divert it. SETUP_HINT is defined
+    beside PRECONDITION_HINT below, where the two shapes of an undelivered
+    attack can be read against each other.
+
+    The order of the remaining three is load-bearing, because one log can
+    match more than one of them. A compose build runs every target, so a log
+    can carry an archived pool from one target and an unresolvable tag from
+    another, and `not found` appears in both.
 
     The archived pool is first because it is the narrowest test -- three
     tokens that have to co-occur -- and because it is the one whose remedy
@@ -357,6 +425,8 @@ def _runtime_failure(message: str) -> dict:
     serialises this dict and cuts it to fit the prompt, so insertion order is
     what decides whether the hint survives a long build log.
     """
+    if _setup_failure(message):
+        return {"hint": SETUP_HINT, "kind": "setup_not_established", "error": message}
     if _archived_suite_failure(message):
         return {"hint": ARCHIVE_HINT, "kind": "archived_suite", "error": message}
     if _unknown_base_image(message):
@@ -509,7 +579,11 @@ PRECONDITION_HINT = (
     "Settle what state the service needs before the input can reach the code the fix "
     "changes -- a session, an authenticated account, a record seeded for the attack to "
     "act on, a CSRF or anti-forgery token taken from the page that issues it -- then "
-    "establish it in the validator in that order and declare it in "
+    "establish it in that order. Where the state can be reached over HTTP, declare "
+    "the steps in exploit_contract.setup and let CVELab run them before the validator "
+    "starts: a value minted fresh each boot is bound there and arrives as CVELAB_BOUND, "
+    "which is what no fixed lab value can replace. Write it into the validator only "
+    "where setup cannot express it. Either way name the state in "
     "exploit_contract.preconditions, so a run that loses it says which step it lost. "
     "Read what each setup step returned rather than its status code: a login can "
     "answer 200 and hand back the form again instead of a cookie, and a step checked "
@@ -518,6 +592,54 @@ PRECONDITION_HINT = (
     "cause, and the observation cannot be the cause of a failure that happened before "
     "anything was observed: leave the regression input's expected effect, the "
     "validator's evidence logic and the revision pair as they are."
+)
+
+
+#: The mechanical half of the same failure, and the one the hint above can
+#: only describe in prose. There the validator reached the services and
+#: stopped before delivering the attack, and why is a question for the model.
+#: Here CVELab's own setup steps did not complete and the reason is already
+#: in hand: which step it was, and what it could not reach or could not bind.
+#:
+#: The two must read distinctly, because the remedies are in different files.
+#: PRECONDITION_HINT sends a repair to the validator; this one sends it to
+#: `exploit_contract.setup` and says the validator cannot be the cause,
+#: because `core.run_setup` raises before the validator is started.
+#:
+#: What the hint does NOT say, and must not: that a step failed because its
+#: route answered 4xx. The runner reads a refusal as an answer -- `send`
+#: catches HTTPError and returns the code -- so the steps carry on past a
+#: 4xx, and the only two things that stop them are a route that cannot be
+#: reached at all and an extractor that bound nothing. A 4xx reaches the
+#: error as the `status` recorded beside such a binding, which is why the
+#: hint tells the repair to read that status before touching the extractor.
+#: Nor does it mention a step ordered before the one that binds what it
+#: uses: `steps.validate_setup` refuses that shape at generation time, in
+#: repair as well, so it cannot be what a run failed on.
+SETUP_HINT = (
+    "The lab built, its services started and became healthy, and then CVELab's own "
+    "setup steps did not complete, so the validator never ran: the attack was not "
+    "attempted even once and nothing is yet known about the vulnerability. The error "
+    "below is the step runner's own. It names the step by its index in "
+    "exploit_contract.setup, with whichever of these the failure had: the path it "
+    "could not reach, or the name its extractor was to bind and the status the "
+    "response carried. "
+    "Change exploit_contract.setup, and nothing else. "
+    "Two things, and only two, stop the steps. One is a route that could not be "
+    "reached at all after waiting; where that is the first step, check "
+    "exploit_contract.setup_port, since the steps are sent to that port inside the "
+    "service's own container. The other, and the usual one, is a binding step whose "
+    "extractor found nothing: either it reads a JSON key, a response header or a "
+    "pattern the answer does not carry, or the route answered something else "
+    "entirely and the value was never in the body. Read the status recorded beside "
+    "the binding before rewriting the extractor -- a 401, a 403 or a 404 there says "
+    "the request is wrong and the extractor is not. A refusal does not stop the "
+    "steps on its own: it is read as an answer and the next step is sent, so a 4xx "
+    "shows up only as that status. "
+    "Leave the rest alone. The regression input's expected effect, the effect "
+    "predicate, the validator's evidence logic, the revision pair and both "
+    "Dockerfiles are not the cause: the build and the services worked, and nothing "
+    "downstream of the setup ran at all."
 )
 
 
@@ -561,6 +683,24 @@ def _validation_digest(report: dict) -> dict:
         "effect_predicate": (report.get("proof_contract") or {}).get("effect_predicate"),
         "effect_evidence": report.get("effect_evidence"),
         "attack_executed": validation.get("attack_executed"),
+        # The names each build's setup bound, and never their values: a
+        # binding is a session or a token read out of this run's own lab, and
+        # core writes only the names into the report for that reason.
+        #
+        # It is here for the `attack_executed: false` case directly above,
+        # which is the one place it changes what a repair can conclude. A
+        # validator reporting no session while the setup reported success is
+        # two different labs: one that declares no setup at all, where the
+        # remedy is to declare it, and one whose setup bound a name the
+        # validator then did not use, where the remedy is in the validator's
+        # reading of CVELAB_BOUND. The full report carries this too, but the
+        # report is the last key and the first thing the prompt's limit cuts.
+        #
+        # It does nothing for a setup that failed, despite being the obvious
+        # place to look for it: `core.run_setup` raises before any report is
+        # written, so that failure arrives through the exception path, where
+        # this function is never called and SETUP_HINT carries the error.
+        "setup_bindings": report.get("setup_bindings"),
         "observable_effect": validation.get("observable_effect"),
         "vulnerable": _compact(validation.get("vulnerable")),
         "patched": _compact(validation.get("patched")),
@@ -886,6 +1026,7 @@ def run_auto_workflow(
     pending_failure: dict | None = None
     repair_calls = 0
     startup_repairs = 0
+    setup_repairs = 0
     transient_retries = 0
     provider_stalls = 0
     effect_repairs = 0
@@ -1017,6 +1158,85 @@ def run_auto_workflow(
                     time.sleep(pause)
                 continue
             if (
+                _setup_failure(str(exc))
+                and not _infrastructure_failure(str(exc))
+                and not scripted_runner
+                and setup_repairs < setup_repair_limit()
+            ):
+                # Before the startup test below, which is where this failure
+                # used to end up: `run_lab` appends compose diagnostics to
+                # every exception, and those carry `is unhealthy` from any
+                # service in the project. `_startup_failure` now refuses a
+                # message carrying the marker, so the ordering here is only
+                # the second lock on the same door -- but it is the lock that
+                # holds while the setup budget lasts, and the predicate's is
+                # the one that holds after it runs out.
+                #
+                # The attempt is given back, as a startup failure's is. The
+                # validator was never started, so this attempt measured
+                # nothing and learned nothing about the vulnerability; the
+                # effect budget, which is for a lab whose validator ran, is
+                # deliberately not what pays for this.
+                validation_attempt -= 1
+                setup_repairs += 1
+                attempts.append({
+                    "phase": "setup",
+                    "attempt": setup_repairs,
+                    "ok": False,
+                    "error": str(exc)[:24000],
+                })
+                _record(lab_dir, attempts)
+                announce(
+                    f"{cve}: the setup did not put the lab in the state the attack "
+                    f"needs; repairing the steps "
+                    f"({setup_repairs}/{setup_repair_limit()}) without spending a repair"
+                )
+                try:
+                    repaired = repair_source_lab(
+                        cve,
+                        output_root,
+                        # The same dict the ordinary path would build, rather
+                        # than a second copy of it assembled here: one
+                        # classifier means the hint and the kind cannot
+                        # differ between the budgeted path and the fallback
+                        # below.
+                        _runtime_failure(str(exc)),
+                        repair_calls,
+                        api_key,
+                        model,
+                        provider,
+                        base_url,
+                        research_mode=research_mode,
+                    )
+                except Exception as repair_error:
+                    attempts.append({
+                        "phase": "setup_repair",
+                        "attempt": setup_repairs,
+                        "ok": False,
+                        "error": str(repair_error)[:16000],
+                    })
+                    _record(lab_dir, attempts)
+                    if isinstance(repair_error, ProviderDeclined):
+                        return _declined(cve, lab_dir, attempts, repair_error, announce)
+                    if _infrastructure_failure(str(repair_error)):
+                        break
+                    # Fall back to the ordinary path, as the startup branch
+                    # does: the next loop repairs from this failure and
+                    # counts it.
+                    validation_attempt += 1
+                    pending_failure = _runtime_failure(str(exc))
+                    continue
+                attempts.append({
+                    "phase": "setup_repair",
+                    "attempt": setup_repairs,
+                    "ok": True,
+                    "status": repaired.get("status"),
+                })
+                plan = repaired.get("plan", plan)
+                pending_failure = None
+                _record(lab_dir, attempts)
+                continue
+            if (
                 _startup_failure(str(exc))
                 and not _infrastructure_failure(str(exc))
                 and not scripted_runner
@@ -1098,6 +1318,7 @@ def run_auto_workflow(
                     "max_attempts": max_attempts,
                     "effect_repairs": effect_repairs,
                     "startup_repairs": startup_repairs,
+                    "setup_repairs": setup_repairs,
                     "transient_retries": transient_retries,
                     "provider_stalls": provider_stalls,
                     "attempts": attempts,
@@ -1180,6 +1401,7 @@ def run_auto_workflow(
         "max_attempts": max_attempts,
         "effect_repairs": effect_repairs,
         "startup_repairs": startup_repairs,
+        "setup_repairs": setup_repairs,
         "transient_retries": transient_retries,
         "provider_stalls": provider_stalls,
         "failure": reason,

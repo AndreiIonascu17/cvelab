@@ -309,13 +309,27 @@ def _anthropic_compatible_schema(schema: dict) -> dict:
         "patternProperties", "dependentRequired", "dependentSchemas", "oneOf", "not",
         "if", "then", "else", "unevaluatedProperties", "unevaluatedItems",
     }
+    # Under these, the keys are names the answer will carry, not JSON Schema
+    # keywords, so they must never be filtered against the set above. A schema
+    # declaring a property called "contains" -- which the header form of an
+    # effect predicate does -- had that property deleted and a description
+    # string left in the properties map in its place, and the API refused the
+    # whole request because a property's schema is not a string. The constraint
+    # names and the answer's own field names share one namespace in JSON
+    # Schema; only the position tells them apart.
+    name_maps = {"properties", "$defs", "definitions"}
     transformed = {}
     removed = []
     for key, value in schema.items():
         if key in unsupported or (key == "minItems" and value not in {0, 1}):
             removed.append(f"{key}={value!r}")
             continue
-        if isinstance(value, dict):
+        if key in name_maps and isinstance(value, dict):
+            transformed[key] = {
+                name: _anthropic_compatible_schema(entry) if isinstance(entry, dict) else entry
+                for name, entry in value.items()
+            }
+        elif isinstance(value, dict):
             transformed[key] = _anthropic_compatible_schema(value)
         elif isinstance(value, list):
             transformed[key] = [

@@ -402,3 +402,182 @@ def validate_setup(value: Any, inputs: Sequence[str]) -> list[dict[str, Any]]:
             "this long is the workflow the bound refuses"
         )
     return out
+
+
+def bound_names(value: Sequence[dict[str, Any]]) -> list[str]:
+    """The names these steps bind, in the order they bind them.
+
+    A mode that mounts the grammar needs this twice: to say in a refusal
+    which names a validator will be handed, and to tell a step that uses a
+    declared input apart from one that uses a value setup read out of a
+    response. The membership test alone cannot, because a bound name is also
+    a declared input.
+    """
+    return [str(step["bind"]) for step in value if "bind" in step]
+
+
+#: Where the runner reads its work from. Named here rather than spelled in
+#: each mode that mounts it, because the program below and the mode that sets
+#: these have to agree and there is nothing at run time to notice if they
+#: stop agreeing: an unset variable reads as empty, and an empty spec is a
+#: setup that did nothing.
+SETUP_SPEC_VARIABLE = "CVELAB_SETUP"
+SETUP_INPUTS_VARIABLE = "CVELAB_SETUP_INPUTS"
+SETUP_TARGET_VARIABLE = "CVELAB_SETUP_TARGET"
+SETUP_PORT_VARIABLE = "CVELAB_SETUP_PORT"
+SETUP_WAIT_VARIABLE = "CVELAB_SETUP_WAIT"
+
+#: What the runner's bindings are called when they are carried on to whatever
+#: has to use them. One variable holding a mapping per build, rather than one
+#: per name: a session established on the affected build is not the session
+#: on the fixed one, and the two have to be distinguishable by whoever reads
+#: them.
+SETUP_BOUND_VARIABLE = "CVELAB_BOUND"
+
+#: How long the runner will wait for a service that is not listening yet.
+#: Setup runs before the first thing in a lab that waits for health, so a
+#: product still compiling assets on its first boot answers a connection
+#: with a refusal rather than with anything at all.
+SETUP_CONNECT_WAIT = 120
+
+#: The program that runs the steps, and nothing about how it is delivered.
+#:
+#: WHY THERE IS A SECOND ONE OF THESE
+#:
+#: field.py has a runner too, and it cannot be the one a generated source lab
+#: uses: it is handed a container id and joins that container's network
+#: namespace, because a single-target lab is one container with nothing on a
+#: Compose network. A generated lab is a Compose project with an internal
+#: network and several services on it, and there is no one container whose
+#: namespace is the right place to stand. So the route differs; what the
+#: steps mean does not, and this is the part that does not.
+#:
+#: It is a string because it travels in `command`, which is the only way a
+#: program can reach a container whose Compose service CVELab writes itself:
+#: a lab's policy allows no volumes and no build context of CVELab's, so
+#: there is nowhere to put a file. Everything it uses is in the standard
+#: library of the base image.
+#:
+#: It differs from field's in three ways that are not about delivery. It
+#: names its target by service rather than by a base URL, because the two
+#: builds are two names on one network. It refuses a substitution nothing
+#: filled instead of sending `{{name}}` as literal text, which is what
+#: field's does -- a declared input the operator supplies has no value here,
+#: and sending its spelling to the lab would seed something named `{{user}}`
+#: and report success. And it waits out a connection refusal, because it
+#: runs before the health gate rather than after it.
+SETUP_RUNNER = r'''
+import json, os, re, sys, time, urllib.error, urllib.request
+
+target = os.environ.get("CVELAB_SETUP_TARGET", "").strip()
+port = os.environ.get("CVELAB_SETUP_PORT", "").strip()
+if not target or not port:
+    print(json.dumps({"error": "no build was named for this setup run"}))
+    sys.exit(2)
+base = "http://%s:%s" % (target, port)
+given = json.loads(os.environ.get("CVELAB_SETUP_INPUTS") or "{}")
+given = dict(given, target="%s:%s" % (target, port), targetHost=target)
+plan = json.loads(os.environ.get("CVELAB_SETUP") or "[]")
+deadline = time.time() + float(os.environ.get("CVELAB_SETUP_WAIT") or 120)
+UNFILLED = re.compile(r"\{\{[A-Za-z][A-Za-z0-9_]*\}\}")
+cookies, done, bound = {}, [], {}
+
+
+def fill(request, values):
+    text = json.dumps(request)
+    for name, value in values.items():
+        text = text.replace("{{%s}}" % name, json.dumps(str(value))[1:-1])
+    left = UNFILLED.search(text)
+    if left:
+        raise ValueError("nothing supplies " + left.group(0) + " for this step")
+    return json.loads(text)
+
+
+def send(request):
+    headers = {str(k): str(v) for k, v in (request.get("headers") or {}).items()}
+    if cookies and not any(name.lower() == "cookie" for name in headers):
+        headers["Cookie"] = "; ".join("%s=%s" % pair for pair in sorted(cookies.items()))
+    body = request.get("body")
+    call = urllib.request.Request(
+        base + request["path"],
+        data=None if body is None else str(body).encode(),
+        headers=headers,
+        method=request.get("method", "GET"))
+    while True:
+        try:
+            with urllib.request.urlopen(call, timeout=60) as answer:
+                taken = (answer.status,
+                         answer.read(1048576).decode("utf-8", "replace"),
+                         dict(answer.headers.items()))
+                for header in answer.headers.get_all("Set-Cookie") or []:
+                    pair = str(header).split(";", 1)[0].strip()
+                    if "=" in pair:
+                        name, _, value = pair.partition("=")
+                        cookies[name.strip()] = value.strip()
+                return taken
+        except urllib.error.HTTPError as refused:
+            return (refused.code,
+                    refused.read(1048576).decode("utf-8", "replace"),
+                    dict(refused.headers.items() if refused.headers else []))
+        except urllib.error.URLError:
+            if time.time() >= deadline:
+                raise
+            time.sleep(1)
+
+
+def taken(extract, status, body, headers):
+    if "regex" in extract:
+        hit = re.search(extract["regex"], body)
+        if not hit:
+            return None
+        return hit.group(1) if hit.groups() else hit.group(0)
+    if "json_values" in extract:
+        try:
+            held = json.loads(body)
+        except ValueError:
+            return None
+        stack = [held]
+        while stack:
+            node = stack.pop(0)
+            if isinstance(node, dict):
+                if extract["json_values"] in node:
+                    return node[extract["json_values"]]
+                stack.extend(node.values())
+            elif isinstance(node, list):
+                stack.extend(node)
+        return None
+    if "header" in extract:
+        want = extract["header"].lower()
+        return next((value for name, value in headers.items()
+                     if name.lower() == want and str(value)), None)
+    if "status" in extract:
+        return status
+    return None
+
+
+for index, step in enumerate(plan):
+    status, body, headers = None, "", {}
+    for request in (step["query"] if "bind" in step else [step]):
+        try:
+            request = fill(request, dict(given, **bound))
+        except ValueError as unfillable:
+            print(json.dumps({"step": index, "error": str(unfillable)}))
+            sys.exit(1)
+        try:
+            status, body, headers = send(request)
+        except Exception as error:
+            print(json.dumps({"step": index, "path": request["path"],
+                              "error": str(error)[:300]}))
+            sys.exit(1)
+        done.append({"method": request.get("method", "GET"),
+                     "path": request["path"], "status": status})
+    if "bind" in step:
+        found = taken(step["extract"], status, body, headers)
+        if found is None or found == "":
+            print(json.dumps({"step": index, "bind": step["bind"],
+                              "status": status,
+                              "error": "nothing to bind from the response"}))
+            sys.exit(1)
+        bound[step["bind"]] = str(found)
+print(json.dumps({"requests": done, "bound": bound}))
+'''
