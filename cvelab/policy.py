@@ -500,3 +500,99 @@ def limits_override(model: dict, limits: dict[str, object]) -> dict:
         if added:
             services[name] = added
     return {"services": services}
+
+
+#: The one service CVELab adds to a lab's own Compose project.
+#:
+#: Hyphenated, and checked against the lab's own names rather than trusted to
+#: be unusual: Compose merges two definitions of one service key across `-f`
+#: files instead of refusing them, so a lab that happened to declare a
+#: service of this name would have CVELab's image, command and environment
+#: merged into it -- and the lab would then be running something nobody
+#: wrote, with the lab's own build still in place. Refused instead, by
+#: `setup_override`, and refused earlier still at generation time where the
+#: support-service names are checked.
+SETUP_SERVICE = "cvelab-setup"
+
+
+def setup_override(
+    model: dict,
+    *,
+    image: str,
+    program: str,
+    environment: dict[str, str],
+    limits: dict[str, object] | None = None,
+    service: str = SETUP_SERVICE,
+    beside: str = "validator",
+) -> dict:
+    """A Compose override that adds the service CVELab puts the lab in state with.
+
+    WHY A COMPOSE SERVICE AND NOT A SIDECAR
+
+    The single-target path runs its setup from `docker run --network
+    container:<id>`, which is available to it because a field lab is one
+    container. A generated source lab is a Compose project: an internal
+    network, two builds of the product on it under the names the validator
+    resolves, and no single container whose namespace is the right place to
+    stand. The route that does exist is the one CVELab already uses for the
+    runtime limits -- a JSON Compose file appended with a second `-f`, which
+    Compose merges -- so the setup travels the same way.
+
+    WHAT IT MAY ASK FOR
+
+    Only keys in SERVICE_KEYS, so the injected service is held to the policy
+    the lab is held to: no volumes, no ports, no build context of CVELab's.
+    That is why the program travels in `command` rather than as a file; there
+    is nowhere to put a file, and a lab that allowed one would allow a lab to
+    mount one too.
+
+    `networks` and `depends_on` are read from the resolved model rather than
+    invented. The networks because a service that joins none lands on the
+    default bridge and the policy refuses it; the dependencies because the
+    setup runs before the first thing in a lab that waits for health, and the
+    lab's own validator already declares exactly the wait that is wanted.
+    """
+    services = model.get("services") or {}
+    if service in services:
+        raise PolicyError(
+            f"Compose policy refused this lab:\n  - service '{service}' is CVELab's own, "
+            "and a lab may not declare it: Compose would merge the two definitions "
+            "rather than refuse them"
+        )
+    alongside = services.get(beside) or {}
+    attached = alongside.get("networks")
+    if not isinstance(attached, dict) or not attached:
+        attached = {
+            name: None
+            for held in services.values()
+            for name in (held.get("networks") or {})
+            if isinstance(held, dict)
+        }
+    if not attached:
+        raise PolicyError(
+            "Compose policy refused this lab:\n  - no internal network for the setup "
+            "service to join; the lab's services declare none"
+        )
+    # The names only. An endpoint can carry a fixed address or an alias, and
+    # a second service claiming either is a Compose conflict rather than a
+    # setup that ran.
+    definition: dict[str, object] = {
+        "image": image,
+        # Left out of `up -d <startup services>` exactly as the validator is,
+        # so a lab with a setup still starts the same services it starts
+        # today and this one runs only when CVELab asks for it by name.
+        "profiles": ["tools"],
+        "networks": dict.fromkeys(attached),
+        "environment": dict(environment),
+        "command": ["python", "-c", program],
+        "security_opt": ["no-new-privileges:true"],
+        "cap_drop": ["ALL"],
+    }
+    depends_on = alongside.get("depends_on")
+    if isinstance(depends_on, dict) and depends_on:
+        definition["depends_on"] = depends_on
+    # limits_override is built from the resolved model, which cannot contain
+    # a service that is being added to it, so the ceilings are applied here.
+    for key, value in (limits or {}).items():
+        definition.setdefault(key, value)
+    return {"services": {service: definition}}

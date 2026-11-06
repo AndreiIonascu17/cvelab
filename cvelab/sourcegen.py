@@ -33,7 +33,7 @@ from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
-from . import baseimages, policy, predicate, progress, releases, research, revisions
+from . import baseimages, policy, predicate, progress, releases, research, revisions, steps
 from .ai import (
     ai_is_configured,
     provider_supports_web_search,
@@ -153,7 +153,7 @@ SOURCE_SCHEMA = {
             "additionalProperties": False,
             "required": [
                 "attack_summary", "preconditions", "observable_effect", "evidence_type",
-                "effect_predicate",
+                "effect_predicate", "setup", "setup_port", "inputs",
             ],
             "properties": {
                 "attack_summary": {"type": "string"},
@@ -162,6 +162,37 @@ SOURCE_SCHEMA = {
                 # The prose above says what the effect is for a reader; this
                 # says it in the terms CVELab can decide for itself.
                 "effect_predicate": EFFECT_PREDICATE_SCHEMA,
+                # The steps that put the lab in the state the attack needs,
+                # and the port they are sent to. See SETUP_SCHEMA_NOTE for
+                # why the steps travel as JSON text rather than as JSON.
+                "setup": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "A JSON array of at most ten seeding requests, as text. An entry "
+                        "is {\"method\", \"path\", \"headers\", \"body\"}, or {\"bind\": "
+                        "\"<name>\", \"query\": [requests], \"extract\": {one of "
+                        "json_values, regex, header, status}} to read a value out of a "
+                        "response and fill it into the steps that follow as {{name}}. "
+                        "null when the lab needs no seeding."
+                    ),
+                },
+                "setup_port": {
+                    "type": ["integer", "null"],
+                    "description": (
+                        "The port the vulnerable and patched services listen on inside "
+                        "their containers, which the setup requests are sent to. null "
+                        "when there is no setup."
+                    ),
+                },
+                "inputs": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string"},
+                    "description": (
+                        "Names of values this lab cannot know and whoever reproduces it "
+                        "supplies. Every name setup binds must be declared here. null "
+                        "when there are none."
+                    ),
+                },
                 "evidence_type": {
                     "type": "string",
                     "enum": [
@@ -1776,8 +1807,170 @@ def _vulnerable_only_substance(declared: dict) -> None:
         )
 
 
+#: What a precondition that the lab itself has to establish sounds like.
+#:
+#: A heuristic over prose, and it is one deliberately rather than for want of
+#: something better. `preconditions` cannot change shape: the report renders
+#: its strings as bullets and the repair prompt sends them as prose, so a
+#: structured precondition -- each entry naming the step that establishes it
+#: -- would be the right design and is not available from here. What is
+#: available is to tell the two kinds of precondition apart. "Docker and
+#: docker compose installed" is a fact about the machine and nothing in a
+#: lab can establish it; "an authenticated victim session exists" is lab
+#: state, and a lab that writes that down and ships no setup has written the
+#: sentence the measured failure was made of. Only the second kind is held to
+#: the rule.
+_SETUP_STATE = re.compile(
+    r"session|logged[ -]?in|log[ -]?in\b|sign[ -]?in|authenticat|credential|password"
+    r"|\baccount|\buser\b|\badmin|\btoken|api[ -]?key|\bcookie|csrf|anti[ -]?forgery"
+    r"|seed|\bexists?\b|\bcreated\b|pre-?creat|registered|enrol|\brecord\b|\bdocument\b"
+    r"|\bupload|populat|provision|\btenant|\bproject\b|\bsubscription",
+    re.IGNORECASE,
+)
+
+
+def _validate_setup_contract(
+    contract: dict, compose: str = "", validator_py: str = ""
+) -> list[dict]:
+    """Refuse a contract whose preconditions nothing establishes, before any build.
+
+    WHY THIS FIELD WAS WORTH CHECKING
+
+    `preconditions` has been in the contract from the start and no proof
+    check has ever read it: its only consumers render its strings as report
+    bullets and send them as prose to a repair. So the state an attack needs
+    -- a session, an account, a record for it to act on -- was ordinary
+    Python each validator rewrote from scratch, and when one of them got it
+    wrong there was nothing in the lab that could say so. Measured on
+    2026-11-06: a mobile security framework lab reported
+    `RuntimeError('victim session not established')` against both services
+    while the login it had already made answered 200, spent all four attempts
+    on it, and recorded attack_executed false -- an attack that was never
+    delivered, which is indistinguishable in the evidence from a fixed build
+    refusing one.
+
+    `setup` is where that state is said in data instead. The steps are
+    `steps.validate_setup`'s grammar, CVELab runs them itself per build, and
+    a step that does not complete stops the run rather than letting the
+    attack go to an unseeded instance.
+
+    WHAT IS REFUSED
+
+    A precondition naming lab state, with no setup step and no declared
+    input: the sentence the measurement was made of. A setup that uses a
+    declared input nothing binds, because CVELab has no value to put in it
+    and the runner would otherwise send `{{name}}` as text. An upload in a
+    setup request, which the grammar accepts and this runner does not build
+    -- refused here, for one model call, rather than at run time after a
+    build. And a setup that binds names while the lab's validator has no way
+    to receive them.
+
+    Returns the parsed steps and writes them back into the contract, so
+    plan.json records exactly what will run.
+    """
+    declared = contract.get("setup")
+    inputs = steps.validate_inputs(contract.get("inputs"))
+    if inputs:
+        contract["inputs"] = inputs
+    else:
+        contract.pop("inputs", None)
+    parsed: list[dict] = []
+    if isinstance(declared, str) and declared.strip():
+        try:
+            held = json.loads(declared)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                f"exploit_contract.setup must be a JSON array of steps, as text: {error}"
+            ) from None
+        try:
+            parsed = steps.validate_setup(held, inputs)
+        except ValueError as refused:
+            raise RuntimeError(f"exploit_contract.setup is not usable: {refused}") from None
+    elif declared is not None and not isinstance(declared, str):
+        raise RuntimeError(
+            "exploit_contract.setup must be a JSON array of steps written as text, or null"
+        )
+    bound = set(steps.bound_names(parsed))
+    if parsed:
+        port = contract.get("setup_port")
+        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+            raise RuntimeError(
+                "exploit_contract.setup names steps, so exploit_contract.setup_port must "
+                "be the port the vulnerable and patched services listen on inside their "
+                "containers; the steps are sent there"
+            )
+        contract["setup_port"] = port
+        for index, step in enumerate(parsed):
+            for request in step["query"] if "bind" in step else [step]:
+                if request.get("upload") is not None:
+                    raise RuntimeError(
+                        f"exploit_contract.setup[{index}] sends an upload, which a "
+                        "generated lab's setup cannot build; seed through a route that "
+                        "takes a body, or have the validator place the file itself"
+                    )
+        # Only a bound name has a value during the run. A declared input is
+        # whoever reproduces this lab supplying their own, and there is
+        # nobody to ask here, so a step that uses one would send its
+        # spelling: an account literally named {{user}}, seeded, reported as
+        # success. The runner refuses the unfilled substitution too; this
+        # says so before the build.
+        used = steps.substitutions(json.dumps(parsed)) - set(steps.TARGET_TOKENS)
+        unsupplied = sorted(used - bound)
+        if unsupplied:
+            raise RuntimeError(
+                f"exploit_contract.setup uses {unsupplied}, which it never binds: CVELab "
+                "has no value for an input whoever reproduces the lab would supply, so a "
+                "setup step may use only a name an earlier step bound. Bind it from a "
+                "response, or write the lab's own value into the step"
+            )
+        if bound:
+            # The bindings are read from this run's own lab and reach the
+            # validator as one environment variable holding a mapping per
+            # build. A lab that binds and cannot receive them has seeded a
+            # session nothing uses, which measures as the attack never
+            # having been delivered -- the failure this field exists to fix.
+            for where, text in (("docker_compose", compose), ("validator_py", validator_py)):
+                if text and steps.SETUP_BOUND_VARIABLE not in text:
+                    raise RuntimeError(
+                        f"exploit_contract.setup binds {sorted(bound)}, so "
+                        f"{steps.SETUP_BOUND_VARIABLE} must appear in {where}: the "
+                        "validator service declares it as ${" + steps.SETUP_BOUND_VARIABLE
+                        + ":-} and the validator reads this run's bindings out of it, as "
+                        "a JSON object of build name to a mapping of bound name to value"
+                    )
+        contract["setup"] = parsed
+    else:
+        # Dropped rather than recorded as null, so a lab that needs no
+        # seeding has exactly the plan.json it had before this field existed
+        # and takes exactly the path it took.
+        contract.pop("setup", None)
+        contract.pop("setup_port", None)
+    unestablished = [
+        text for text in contract.get("preconditions") or []
+        if isinstance(text, str) and _SETUP_STATE.search(text)
+    ]
+    if unestablished and not parsed and not inputs:
+        raise RuntimeError(
+            "exploit_contract.preconditions names state the lab has to be in before the "
+            f"attack -- {unestablished[0]!r} -- and nothing in this answer establishes "
+            "it. Put the requests that establish it in exploit_contract.setup, with "
+            "exploit_contract.setup_port, so a run that loses that state says which step "
+            "it lost; or declare the value in exploit_contract.inputs when it is "
+            "something only whoever reproduces the lab can supply; or drop the "
+            "precondition if the image already satisfies it. A precondition no step and "
+            "no input stands behind is prose, and no proof check can read it."
+        )
+    return parsed
+
+
 def _validate_support_services(services: list[str], compose: str) -> None:
-    reserved = {"vulnerable", "patched", "validator"}
+    # policy.SETUP_SERVICE is CVELab's own, added to the lab's Compose project
+    # from an override. Compose merges two definitions of one service key
+    # instead of refusing them, so a lab declaring this name would have
+    # CVELab's image and command merged into its own build. policy refuses it
+    # again when the override is built; here it costs one model call rather
+    # than a run.
+    reserved = {"vulnerable", "patched", "validator", policy.SETUP_SERVICE}
     if len(services) != len(set(services)) or reserved.intersection(services):
         raise RuntimeError("Support service names must be unique and cannot use reserved names")
     for service in services:
@@ -1992,13 +2185,15 @@ def _prompt_context(
 #: tests/test_sourcegen_contract.py splits this file on "the literal keys
 #: attack_executed", requires exactly two blocks, and requires the sentence
 #: "Measure confirmed the same way on both sides" inside the first 2000
-#: characters of each. Measured: the vulnerable-only block has 1657
-#: characters of room ahead of that sentence and the differential block has
-#: 361. Instruction text added ahead of it in the differential block would
-#: push the sentence out of the window and fail that test rather than
-#: anything about this contract -- so this goes after it, in both, and in the
-#: repair prompt, which the split does not reach because it names the keys
-#: differently.
+#: characters of each. Measured: the sentence sits 299 characters into the
+#: vulnerable-only block and 1595 into the differential one, so there are
+#: 1701 and 405 characters of room respectively AHEAD of it, and 1657 and 361
+#: after it within the window. Instruction text added ahead of it in the
+#: differential block would push the sentence out of the window and fail that
+#: test rather than anything about this contract -- so this goes after it, in
+#: both, and in the repair prompt, which the split does not reach because it
+#: names the keys differently. Text appended after the sentence moves no
+#: offset at all, which is why both this and _SETUP_CONTRACT are appended.
 _EFFECT_CONTRACT = (
     "Declare in exploit_contract.effect_predicate what would count as the security "
     "effect, before anything is built, using only these kinds: status (a list of whole "
@@ -2018,6 +2213,86 @@ _EFFECT_CONTRACT = (
     "body (the response text) and headers (a mapping of header name to value), read from "
     "that same response. proof_quality stays your own label and no longer decides "
     "anything, so label it honestly rather than optimistically. "
+)
+
+
+#: How a lab says, in data, what state its attack needs before it can be
+#: delivered -- and a worked example of the one shape that has never arrived.
+#:
+#: WHY THE EXAMPLE IS NOT OPTIONAL
+#:
+#: The binding form has never appeared in a model's answer under `setup`. Of
+#: the nine specs recorded under tests/fixtures/, exactly one declares setup
+#: at all and it is a bare POST to the lab's own seeding route; `bind` shows
+#: up only under `discover`, which is a different field in a different mode
+#: asked for in different words. So a schema entry on its own would measure
+#: zero and read as "preconditions were not the problem after all", when what
+#: it would really have measured is that nobody was ever shown the form. The
+#: sequence below is a real one: read a token out of the response that issues
+#: it, bind it, spend it on the request that creates the victim.
+#:
+#: Appended after the pinned sentence in all three prompts, for the reason
+#: recorded above _EFFECT_CONTRACT.
+_SETUP_CONTRACT = (
+    "Where the attack can only be delivered against a lab that is already in some state "
+    "-- a logged-in session, an account for the attack to act on, a seeded record, a "
+    "document, a setting -- declare that state in exploit_contract.setup instead of "
+    "writing the same requests into the validator by hand. CVELab runs those steps "
+    "itself, once against the vulnerable build and once against the patched build, after "
+    "the services are healthy and before the validator is started, and a step that does "
+    "not complete stops the run and says which one. That matters because an attack that "
+    "was never delivered looks exactly like an attack a fixed build refused: both show no "
+    "effect. "
+    "setup is a JSON array written as text, at most ten requests. A step is "
+    "{\"method\": \"POST\", \"path\": \"/x\", \"headers\": {}, \"body\": null} -- a body "
+    "may be a JSON object written as itself -- or "
+    "{\"bind\": \"<name>\", \"query\": [requests], \"extract\": {one of \"json_values\": "
+    "\"<key>\", \"regex\": \"<pattern>\", \"header\": \"<name>\", \"status\": true}}, "
+    "which runs its requests and binds what the extractor pulls out of the last response. "
+    "Later steps fill a bound name in as {{name}}, and a step may use only a name an "
+    "earlier step bound. Cookies the lab sets are carried across the steps, so a login is "
+    "written as the requests it really is. Every name setup binds must also be listed in "
+    "exploit_contract.inputs, which is the list of values this lab cannot know and "
+    "whoever reproduces it supplies their own of; setup supplies the lab's, for this "
+    "proof only. exploit_contract.setup_port is the port the vulnerable and patched "
+    "services listen on inside their containers. Paths name no host, {{marker}} and "
+    "{{callback}} are not available in setup, and a setup request cannot carry an upload. "
+    "Set setup, setup_port and inputs to null when the attack needs no state established. "
+    "A worked example, for a lab whose weakness needs a victim account that only an "
+    "authenticated administrator can create, where the login form issues a one-time "
+    "anti-forgery token in a response header: inputs is [\"csrfToken\"] and setup is the "
+    "text of "
+    "[{\"bind\": \"csrfToken\", "
+    "\"query\": [{\"method\": \"GET\", \"path\": \"/admin/login\", \"headers\": {}, "
+    "\"body\": null}], "
+    "\"extract\": {\"header\": \"X-CSRF-Token\"}}, "
+    "{\"method\": \"POST\", \"path\": \"/admin/login\", "
+    "\"headers\": {\"X-CSRF-Token\": \"{{csrfToken}}\", "
+    "\"Content-Type\": \"application/x-www-form-urlencoded\"}, "
+    "\"body\": \"username=admin&password=labadmin\"}, "
+    "{\"method\": \"POST\", \"path\": \"/admin/users\", "
+    "\"headers\": {\"X-CSRF-Token\": \"{{csrfToken}}\", "
+    "\"Content-Type\": \"application/json\"}, "
+    "\"body\": {\"username\": \"victim\", \"password\": \"labvictim\", \"role\": \"user\"}}]. "
+    "Three requests: the token is read out of a header, bound, and spent on the login and "
+    "then on the creation. A value the lab generates fresh on every boot can be reached "
+    "no other way -- no fixed value can be written down for it -- which is what the "
+    "binding form is for. "
+    "Whatever setup binds reaches the validator in the environment variable CVELAB_BOUND, "
+    "as a JSON object of build name to a mapping of bound name to the value read from "
+    "that build: {\"vulnerable\": {\"csrfToken\": \"...\"}, \"patched\": {\"csrfToken\": "
+    "\"...\"}}. Declare it on the validator service as CVELAB_BOUND: \"${CVELAB_BOUND:-}\" "
+    "beside the manual-action variables, and read the entry for the build being tested. "
+    "Use the build's own entry and never the other's: a session established on one build "
+    "is not a session on the other, and crossing them compares two different things. "
+    "Setup establishes the precondition and the validator still delivers the attack; a "
+    "setup that performs the attack proves nothing, because it runs identically on both "
+    "builds. "
+    "Finally, exploit_contract.preconditions is no longer prose that nothing reads. Every "
+    "precondition naming state the lab has to be in must be established by a setup step "
+    "or declared as an inputs name, and an answer whose preconditions have neither behind "
+    "them is refused before anything is built. Say nothing there that no step and no "
+    "input stands behind. "
 )
 
 
@@ -2344,6 +2619,7 @@ def generate_source_lab(
                     "that refuses the input is the expected outcome; recording that as a confirmation "
                     "inverts the proof. "
                     + _EFFECT_CONTRACT
+                    + _SETUP_CONTRACT
                     + "This lab has no patched build, so the comparison cannot show up a loose "
                     "predicate here: the predicate may not rest on status alone, every text it "
                     "looks for must be non-empty, and a body_regex that matches the empty string "
@@ -2381,6 +2657,10 @@ def generate_source_lab(
             _check_base_images(generated_files)
             _validate_fidelity(generation["fidelity"])
             _validate_effect_predicate(generation["exploit_contract"], vulnerable_only=True)
+            _validate_setup_contract(
+                generation["exploit_contract"],
+                generation["docker_compose"], generation["validator_py"],
+            )
             _validate_support_services(generation["support_services"], generation["docker_compose"])
             return generated_files
 
@@ -2527,6 +2807,7 @@ def generate_source_lab(
                 "that refuses the input is the expected outcome; recording that as a confirmation "
                 "inverts the proof. "
                 + _EFFECT_CONTRACT
+                + _SETUP_CONTRACT
                 + "Source archives have no .git directory, so initialize a local repository without "
                 "a remote only if build logic requires it. Healthchecks and the validator must use the final application "
                 "scheme, port, and route, and redirects must not count as healthy. "
@@ -2566,6 +2847,10 @@ def generate_source_lab(
         _check_base_images(generated_files)
         _validate_fidelity(generation["fidelity"])
         _validate_effect_predicate(generation["exploit_contract"])
+        _validate_setup_contract(
+            generation["exploit_contract"],
+            generation["docker_compose"], generation["validator_py"],
+        )
         _validate_support_services(generation["support_services"], generation["docker_compose"])
         return generated_files
 
@@ -2844,6 +3129,7 @@ def repair_source_lab(
                 "only fixed service names, use harmless canary data, and add no host integration, elevated permissions, "
                 "sensitive-data access, external connectivity, or lasting system changes. "
                 + _EFFECT_CONTRACT
+                + _SETUP_CONTRACT
                 + variant_contract
             ),
             input_text=(
@@ -2889,6 +3175,12 @@ def repair_source_lab(
         # generation is, and is held to the same check.
         _validate_effect_predicate(
             generation["exploit_contract"], vulnerable_only=vulnerable_only
+        )
+        # And the same for the setup: the repair rewrites the contract from
+        # its own answer, so it can install a precondition nothing
+        # establishes exactly as a generation can.
+        _validate_setup_contract(
+            generation["exploit_contract"], compose, generation["validator_py"]
         )
         _validate_support_services(generation["support_services"], compose)
         return generated_files

@@ -283,3 +283,52 @@ class AIProviderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AFieldNameIsNotAConstraintTests(unittest.TestCase):
+    """The constraint keywords and the answer's own field names share one
+    namespace in JSON Schema; only position tells them apart.
+
+    Measured: the header form of an effect predicate declares a property
+    called "contains", which is also a keyword the shim strips. The property
+    was deleted and a description string was left in the properties map in
+    its place, so the API refused the whole request -- a property's schema is
+    not a string -- and every generation on the Anthropic path failed before
+    a single model call. The smoke entry caught it in five seconds.
+    """
+
+    def test_a_property_named_like_a_keyword_survives(self) -> None:
+        schema = {
+            "type": "object",
+            "properties": {"contains": {"type": "string"}, "name": {"type": "string"}},
+        }
+        out = _anthropic_compatible_schema(schema)
+        self.assertEqual(out["properties"], schema["properties"])
+
+    def test_nothing_is_added_to_a_properties_map(self) -> None:
+        """The corruption was an injected key, not only a deleted one."""
+        out = _anthropic_compatible_schema(
+            {"type": "object", "properties": {"contains": {"type": "string"}}}
+        )
+        self.assertEqual(set(out["properties"]), {"contains"})
+        self.assertNotIn("description", out["properties"])
+
+    def test_a_real_constraint_is_still_stripped_and_noted(self) -> None:
+        out = _anthropic_compatible_schema({"type": "string", "minLength": 4})
+        self.assertNotIn("minLength", out)
+        self.assertIn("minLength=4", out["description"])
+
+    def test_a_constraint_inside_a_property_is_still_stripped(self) -> None:
+        out = _anthropic_compatible_schema(
+            {"type": "object", "properties": {"a": {"type": "array", "maxItems": 3}}}
+        )
+        self.assertNotIn("maxItems", out["properties"]["a"])
+        self.assertIn("maxItems=3", out["properties"]["a"]["description"])
+
+    def test_the_effect_predicate_schema_survives_the_shim(self) -> None:
+        """The schema that found the defect, end to end."""
+        from cvelab.sourcegen import EFFECT_PREDICATE_SCHEMA
+
+        out = _anthropic_compatible_schema(EFFECT_PREDICATE_SCHEMA)
+        for name in out["properties"]["header"]["required"]:
+            self.assertIn(name, out["properties"]["header"]["properties"])

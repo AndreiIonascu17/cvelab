@@ -188,6 +188,9 @@ export CVELAB_TRANSIENT_RETRIES=2    # builds retried unchanged when a download 
 export CVELAB_TRANSIENT_PAUSE=15     # seconds before such a retry
 export CVELAB_PROVIDER_RETRIES=4     # times a busy provider is asked again
 export CVELAB_EFFECT_REPAIRS=2       # extra repairs when the lab runs but the effect does not show
+export CVELAB_SETUP_REPAIRS=2        # repairs for seeding that did not establish the state, not
+                                     # counted against the exploit's own attempts
+export CVELAB_BASE_IMAGES=on         # off: do not ask a registry whether a FROM tag is published
 export CVELAB_CONTRACT_RETRIES=2     # answers refused before the build, asked for again
 export CVELAB_PUBLISHED_RELEASES=on  # off: never offer an npm or PyPI release pair
 

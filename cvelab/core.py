@@ -28,7 +28,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
-from . import policy, predicate, progress
+from . import policy, predicate, progress, sidecar, steps
 from .ai import ai_is_configured, plan_with_ai
 from .providers import PROVIDERS
 from .templates import APP_PY, DOCKERFILE, VALIDATOR_DOCKERFILE, VALIDATOR_PY, compose_yaml
@@ -921,7 +921,36 @@ def evidence_label(
     return base + ", manual PoC proven" if manual_poc else base
 
 
-def prepare_compose(lab_dir: Path) -> tuple[str, dict[str, str], list[str], Path]:
+#: What a lab's contract has to carry before CVELab will seed anything, and
+#: the name of the state it establishes. Read from plan.json rather than
+#: asked for again: the steps were validated against the grammar before the
+#: lab was built, and the plan is what records them.
+def setup_contract(plan: dict) -> tuple[list[dict], int] | None:
+    """The validated seeding steps and the port they are sent to, or None.
+
+    None for every lab generated before this existed and every lab that
+    needs no seeding, which is what keeps those labs running exactly as they
+    did: nothing is injected, nothing is started, and the validator is
+    reached by the same call with the same arguments.
+    """
+    contract = plan.get("exploit_contract")
+    if not isinstance(contract, dict):
+        return None
+    declared = contract.get("setup")
+    port = contract.get("setup_port")
+    if not isinstance(declared, list) or not declared:
+        return None
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise RuntimeError(
+            "exploit_contract.setup names steps but exploit_contract.setup_port does "
+            "not name the port they are sent to"
+        )
+    return declared, port
+
+
+def prepare_compose(
+    lab_dir: Path, setup: tuple[list[dict], int] | None = None
+) -> tuple[str, dict[str, str], list[str], Path]:
     """Vet a lab's Compose definition and build the command that runs it.
 
     Every path that starts a lab's containers goes through here, because
@@ -930,9 +959,15 @@ def prepare_compose(lab_dir: Path) -> tuple[str, dict[str, str], list[str], Path
     generated and one copied from someone else alike, while there is still
     nothing to tear down.
 
+    `setup` is the validated seeding steps and their port, when the lab's
+    contract declares any. The service that runs them is added to the same
+    override as the runtime limits, because that override is already a
+    deterministic Compose file of CVELab's that Compose merges over the
+    lab's; there is no second mechanism to invent.
+
     Returns the docker executable, the environment both it and Compose need,
-    the Compose command with the runtime-limits override appended, and the
-    scratch directory holding that override, which the caller removes.
+    the Compose command with the override appended, and the scratch
+    directory holding that override, which the caller removes.
     """
     docker = docker_executable()
     environment = docker_environment(docker)
@@ -943,6 +978,32 @@ def prepare_compose(lab_dir: Path) -> tuple[str, dict[str, str], list[str], Path
     grace = policy.startup_grace_override(model, startup_grace())
     for name, extra in grace["services"].items():
         limits.setdefault("services", {}).setdefault(name, {}).update(extra)
+    if setup is not None:
+        declared, port = setup
+        injected = policy.setup_override(
+            model,
+            image=sidecar.BASE_IMAGE,
+            program=steps.SETUP_RUNNER,
+            environment={
+                steps.SETUP_SPEC_VARIABLE: json.dumps(declared),
+                steps.SETUP_PORT_VARIABLE: str(port),
+                steps.SETUP_WAIT_VARIABLE: str(steps.SETUP_CONNECT_WAIT),
+                # CVELab has no value for an input the operator would
+                # supply, and sending one's spelling to the lab would seed
+                # an account named {{user}} and call it done. The runner
+                # refuses an unfilled substitution, and generation refuses a
+                # setup step that uses an input nothing binds, so this is
+                # empty by contract rather than by accident.
+                steps.SETUP_INPUTS_VARIABLE: "{}",
+                # Which build this run seeds. Interpolated rather than baked,
+                # because one override file serves both runs and `up` has no
+                # equivalent of -e; the manual actions already travel this
+                # way.
+                steps.SETUP_TARGET_VARIABLE: "${" + steps.SETUP_TARGET_VARIABLE + ":-}",
+            },
+            limits=runtime_limits(),
+        )
+        limits.setdefault("services", {}).update(injected["services"])
     # Outside the lab directory, which is the lab's to shape: a symlink
     # there would turn this write into one anywhere.
     scratch = Path(tempfile.mkdtemp(prefix="cvelab-limits-"))
@@ -960,15 +1021,17 @@ AfterValidation = Callable[
 ]
 
 
-def run_validator(
+def _run_tool_service(
     compose: list[str],
     docker: str,
     environment: dict[str, str],
     lab_dir: Path,
+    service: str,
     extra: dict[str, str] | None = None,
     wait_for_services: bool = True,
+    force_recreate: bool = True,
 ) -> tuple[int, str, str]:
-    """Run the validator to completion and return its exit code and output.
+    """Run one of the lab's `profiles: ["tools"]` services to completion.
 
     Started with `up`, not `run`, because a one-off `compose run` container
     does not get the aliases its service declares on the network. A validator
@@ -981,7 +1044,9 @@ def run_validator(
     resolution" and "Not reproduced", three runs running. The same lab
     started with `up` reports differential_confirmed, with the canary
     receiving Authorization: Bearer and the injected Host. Every lab built
-    around a named stand-in was failing this way.
+    around a named stand-in was failing this way. The lesson applies
+    identically to the setup service, which reaches the product by the same
+    service name on the same network.
 
     The dependencies are waited for unless the caller says they are already
     up. A validator declares `depends_on: {vulnerable: {condition:
@@ -989,12 +1054,19 @@ def run_validator(
     and a product that has not finished booting. Skipping it cost a batch:
     the validator started first and reported "targets not ready", which
     reads as a lab that failed to reproduce.
+
+    `force_recreate` is the setting the setup service turns off, and the
+    reason is the whole point of running it: `up --force-recreate` applies to
+    everything that `up` brings up, dependencies included, so recreating this
+    container would restart the product and discard the state the previous
+    setup run had just established.
     """
     launched = subprocess.run(
         compose + [
-            "--profile", "tools", "up", "-d", "--force-recreate",
+            "--profile", "tools", "up", "-d",
+            *(["--force-recreate"] if force_recreate else []),
             *([] if wait_for_services else ["--no-deps"]),
-            "validator",
+            service,
         ],
         cwd=lab_dir,
         capture_output=True,
@@ -1003,14 +1075,14 @@ def run_validator(
     )
     if launched.returncode != 0:
         detail = (launched.stderr or launched.stdout).strip()
-        raise RuntimeError(f"Validator startup failed: {detail}")
+        raise RuntimeError(f"{service} startup failed: {detail}")
     found = subprocess.run(
-        compose + ["--profile", "tools", "ps", "-aq", "validator"],
+        compose + ["--profile", "tools", "ps", "-aq", service],
         cwd=lab_dir, capture_output=True, text=True, env=environment,
     )
     container_id = (found.stdout or "").strip().splitlines()[-1:] or [""]
     if not container_id[0]:
-        raise RuntimeError("The validator started but no container id came back")
+        raise RuntimeError(f"{service} started but no container id came back")
     waited = subprocess.run(
         [docker, "wait", container_id[0]],
         capture_output=True, text=True, env=environment, check=True,
@@ -1023,6 +1095,81 @@ def run_validator(
         [docker, "rm", "-f", container_id[0]], capture_output=True, env=environment,
     )
     return int(waited.stdout.strip() or 1), logged.stdout, logged.stderr.strip()
+
+
+def run_validator(
+    compose: list[str],
+    docker: str,
+    environment: dict[str, str],
+    lab_dir: Path,
+    extra: dict[str, str] | None = None,
+    wait_for_services: bool = True,
+) -> tuple[int, str, str]:
+    """Run the validator to completion and return its exit code and output.
+
+    The mechanics, and why they are what they are, are in
+    `_run_tool_service`: the validator and the setup service are the same
+    kind of thing -- a service behind the `tools` profile, run once, read
+    from its logs -- and were the same forty lines twice.
+    """
+    launched = _run_tool_service(
+        compose, docker, environment, lab_dir, "validator", extra, wait_for_services
+    )
+    return launched
+
+
+#: What a run says when the lab's setup could not put it in the state the
+#: attack needs. A failure class of its own, distinct from a build that did
+#: not compile, a service that never became healthy, and an effect that was
+#: measured and did not hold: here the attack was never delivered and the
+#: mechanical reason is known, which is the one case where a repair can be
+#: told exactly what to fix.
+SETUP_FAILURE_MARKER = "lab setup did not establish the state the attack needs"
+
+
+def run_setup(
+    compose: list[str],
+    docker: str,
+    environment: dict[str, str],
+    lab_dir: Path,
+    target: str,
+    wait_for_services: bool = True,
+) -> dict[str, str]:
+    """Put one build into the state its attack needs, and return what it bound.
+
+    Run once per build, because a session on the affected build is not a
+    session on the fixed one: a single run whose bindings were used for both
+    would hand the fixed build a token the affected build issued, and the
+    comparison that is the whole proof would be between two different things.
+    `_check_variant_parity` cannot catch that -- the setup is CVELab's and
+    never passes through it -- so the separation is kept here instead.
+
+    A setup that does not complete stops the run. An unseeded instance
+    answers the attack with nothing to show, which is indistinguishable from
+    a fixed build refusing it, so carrying on would report the unseeded
+    behaviour for both and call it a differential.
+    """
+    code, out, err = _run_tool_service(
+        compose, docker, environment, lab_dir, policy.SETUP_SERVICE,
+        {steps.SETUP_TARGET_VARIABLE: target},
+        wait_for_services=wait_for_services,
+        force_recreate=False,
+    )
+    tail = (out or "").strip().splitlines()[-1:] or [""]
+    try:
+        reported = json.loads(tail[0])
+    except json.JSONDecodeError:
+        reported = None
+    if code != 0 or not isinstance(reported, dict):
+        detail = reported if isinstance(reported, dict) else (err or out or "").strip()[-600:]
+        raise RuntimeError(
+            f"{SETUP_FAILURE_MARKER} on the {target} build: {detail}"
+        )
+    return {
+        # Read from this build during this run, for this proof only.
+        str(name): str(value)
+        for name, value in (reported.get("bound") or {}).items()
+    }
 
 
 def _validator_said(validation: dict[str, object], build: str, answer: str) -> bool:
@@ -1218,7 +1365,8 @@ def run_lab(
         missing = [str(path) for path in required if not path.exists()]
         if missing:
             raise RuntimeError("Generated lab preflight failed; missing: " + ", ".join(missing))
-    docker, environment, compose, scratch = prepare_compose(lab_dir)
+    declared_setup = setup_contract(plan)
+    docker, environment, compose, scratch = prepare_compose(lab_dir, declared_setup)
     validated_run = False
     try:
         with progress.stage("building lab images"):
@@ -1237,8 +1385,42 @@ def run_lab(
                 environment=environment,
                 cwd=lab_dir,
             )
+        vulnerable_only = plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION"
+        # Between the services starting and the first attack, which is the
+        # position closed.py has always applied its fixture in: after the
+        # lab is up and before anything is measured. A non-zero exit aborts
+        # the run rather than letting the attack be sent to an unseeded
+        # instance, because an unseeded instance and a fixed one answer the
+        # same way.
+        bound: dict[str, dict[str, str]] = {}
+        validator_extra: dict[str, str] = {}
+        if declared_setup is not None:
+            builds = ["vulnerable"] if vulnerable_only else ["vulnerable", "patched"]
+            for index, build in enumerate(builds):
+                progress.step(f"putting the {build} build in state")
+                bound[build] = run_setup(
+                    compose, docker, environment, lab_dir, build,
+                    # The first run waits on the setup service's own
+                    # depends_on, which is the lab's validator's; after that
+                    # the services are up and healthy, and bringing the
+                    # dependencies up again for the second build would
+                    # recreate the first build's container and lose what was
+                    # just seeded into it.
+                    wait_for_services=index == 0,
+                )
+            validator_extra[steps.SETUP_BOUND_VARIABLE] = json.dumps(
+                bound, ensure_ascii=True, sort_keys=True
+            )
         progress.step("running the validator")
-        validator_exit, out, err = run_validator(compose, docker, environment, lab_dir)
+        validator_exit, out, err = run_validator(
+            compose, docker, environment, lab_dir,
+            validator_extra or None,
+            # The setup already waited for the lab to be healthy, and
+            # `--force-recreate` would restart the builds it seeded. A lab
+            # with no setup takes neither branch and is reached by the same
+            # call it always was.
+            wait_for_services=declared_setup is None,
+        )
         try:
             validation = json.loads(out)
         except json.JSONDecodeError:
@@ -1247,7 +1429,6 @@ def run_lab(
         patched_confirmed = _validator_said(validation, "patched", "confirmed")
         patched_blocked = _validator_said(validation, "patched", "blocked")
         proof_contract = plan.get("exploit_contract", {})
-        vulnerable_only = plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION"
         effect_held, effect_evidence = effect_observed(
             validation, proof_contract, vulnerable_only
         )
@@ -1309,10 +1490,18 @@ def run_lab(
                 for action in ("exploit", "verify"):
                     code, said, complained = run_validator(
                         compose, docker, environment, lab_dir,
-                        # The compose file declares both as ${...}, so they
+                        # The compose file declares these as ${...}, so they
                         # travel in the environment rather than as -e flags,
-                        # which `up` has no equivalent of.
-                        {"CVELAB_MANUAL_ACTION": action, "CVELAB_TARGET": target},
+                        # which `up` has no equivalent of. The bindings go
+                        # with them: a manual action sends the attack again,
+                        # so it needs the same state the automatic proof
+                        # had, and without them a lab whose session came
+                        # from setup would fail its own handed-over script.
+                        {
+                            "CVELAB_MANUAL_ACTION": action,
+                            "CVELAB_TARGET": target,
+                            **validator_extra,
+                        },
                         # The services are up and were just proved against.
                         wait_for_services=False,
                     )
@@ -1403,6 +1592,14 @@ def run_lab(
             ),
             "manual_poc_field": manual_poc_field,
             "validator_exit_code": validator_exit,
+            # The names each build bound and not their values. A repair that
+            # has to see what the setup established needs to know which
+            # names reached the validator; the values are a session and a
+            # token read out of this run's own lab, and a report is written
+            # to disk and shipped beside a deliverable.
+            "setup_bindings": {
+                build: sorted(values) for build, values in sorted(bound.items())
+            },
             "real_poc_verified": real_source_proof,
             "evidence_label": evidence_label(
                 str(plan.get("lab_type") or ""), real_source_proof,
