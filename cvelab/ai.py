@@ -415,6 +415,14 @@ def _validate_schema(value: object, schema: dict, path: str = "$") -> None:
 #: asked of two providers, was being sampled under two different regimes and
 #: nothing said so.
 #:
+#: THE MESSAGES DIALECT TAKES NONE OF THIS
+#:
+#: Anthropic's Messages API removed `temperature`: a request carrying one is
+#: refused with HTTP 400 "`temperature` is deprecated for this model." on
+#: every current model. `_anthropic_response` therefore sends none, and the
+#: comment there says why. This setting reaches the responses dialect
+#: (OpenAI) and chat-completions (DeepSeek, local), which do accept it.
+#:
 #: WHY THE DEFAULT IS ZERO
 #:
 #: Safe with the re-asks, which was the first worry and was wrong: nothing in
@@ -590,7 +598,6 @@ def _anthropic_response(
     max_output_tokens: int,
     tools: list[dict] | None,
     timeout_seconds: int | None = None,
-    temperature: float | None = None,
     input_suffix: str = "",
 ) -> dict:
     compatible_schema = _anthropic_compatible_schema(schema)
@@ -609,8 +616,16 @@ def _anthropic_response(
             "format": {"type": "json_schema", "schema": compatible_schema},
         },
     }
-    if temperature is not None:
-        body["temperature"] = temperature
+    # No temperature, and not an omission: this API removed the parameter.
+    # A request carrying one is refused outright --
+    #   HTTP 400 invalidparameter: "`temperature` is deprecated for this model."
+    # -- on every current model, documented for the Messages API from
+    # 2026-10-21. Sampling depth is controlled by output_config.effort
+    # instead. This was added here once, on the reasonable-sounding grounds
+    # that two dialects named no temperature while a third pinned zero, and
+    # it broke every Anthropic request in the five seconds it took the
+    # benchmark's smoke entry to reach the provider. The asymmetry was the
+    # API's, not an oversight.
     if tools:
         body["tools"] = [
             {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
@@ -805,8 +820,7 @@ def structured_response(
         if provider.dialect == MESSAGES:
             return _anthropic_response(
                 api_key or "", which, instructions, input_text, schema,
-                budget, tools, seconds, temperature=chosen,
-                input_suffix=input_suffix,
+                budget, tools, seconds, input_suffix=input_suffix,
             )
         if provider.dialect == CHAT_COMPLETIONS:
             return _chat_completions_response(

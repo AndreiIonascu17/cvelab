@@ -192,10 +192,10 @@ export CVELAB_SETUP_REPAIRS=2        # repairs for seeding that did not establis
                                      # counted against the exploit's own attempts
 export CVELAB_BASE_IMAGES=on         # off: do not ask a registry whether a FROM tag is published
 export CVELAB_CONTRACT_RETRIES=2     # answers refused before the build, asked for again
-export CVELAB_TEMPERATURE=0          # the default; =default sends none and gives each provider
-                                     # its own sampling back. Safe with the re-asks above: each
-                                     # already carries the refusal it got, so none depends on a
-                                     # different sample from the same prompt
+export CVELAB_TEMPERATURE=0          # openai and local/deepseek only, where the default is 0;
+                                     # =default sends none. Anthropic's Messages API refuses the
+                                     # parameter outright, so nothing is sent there whatever this
+                                     # says -- use effort for that provider instead
 export CVELAB_PROMPT_CACHE=on        # off: do not mark the repeated half of a request cacheable
 export CVELAB_PUBLISHED_RELEASES=on  # off: never offer an npm or PyPI release pair
 
