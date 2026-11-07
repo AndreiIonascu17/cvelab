@@ -196,7 +196,9 @@ export CVELAB_TEMPERATURE=0          # openai and local/deepseek only, where the
                                      # =default sends none. Anthropic's Messages API refuses the
                                      # parameter outright, so nothing is sent there whatever this
                                      # says -- use effort for that provider instead
-export CVELAB_PROMPT_CACHE=on        # off: do not mark the repeated half of a request cacheable
+export CVELAB_PROMPT_CACHE=on        # off by default: measured at a 0.9% saving, because the
+                                     # calls of one lab span three different prompts and only
+                                     # re-asks within one phase share a prefix
 export CVELAB_PUBLISHED_RELEASES=on  # off: never offer an npm or PyPI release pair
 
 # How much of a large fix the model may read before writing a lab (GUIDE, section 5):

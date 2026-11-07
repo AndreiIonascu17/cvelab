@@ -449,19 +449,32 @@ TEMPERATURE_VARIABLE = "CVELAB_TEMPERATURE"
 
 #: Whether to mark the stable half of a request as cacheable.
 #:
-#: Caching here is a prefix match, so it pays only where two requests share a
-#: prefix within the entry's lifetime. CVELab's do: `_answer_until_valid` and
-#: every repair re-ask the same lab, appending their feedback to the END of
-#: the user turn while the context in front of it -- the dossier, the fix's
-#: diff, the file excerpts, which is the great bulk of the tokens -- stays
-#: byte-identical. Measured over 205 archived labs: a median of 9 model calls
-#: each, and only 14% made a single call.
+#: OFF BY DEFAULT, BECAUSE IT WAS MEASURED AND IT BARELY PAYS
 #:
-#: At a 5-minute TTL a write costs 1.25x and a read 0.1x, so two calls break
-#: even and the median lab pays 1.25 + 8x0.1 = 2.05 instead of 9.0 -- a 77%
-#: cut on input tokens, which are most of the bill: on one measured entry
-#: 33,005 input against 12,365 output. The 14% that ask once pay 25% more on
-#: the cheapest requests there are.
+#: Caching is a prefix match, so it pays where two requests share a prefix
+#: inside the entry's lifetime. The estimate that justified turning this on
+#: was built from a median of 9 model calls per lab across 205 archived labs,
+#: and reasoned that one write plus eight reads would cost 2.05 against 9.0 --
+#: a 77% cut on input tokens, which are most of the bill.
+#:
+#: That was wrong about the workload. The nine calls are not nine asks of one
+#: prompt: they span generation, validation and repair, which are three
+#: different prompts with different instructions and different contexts. Only
+#: the re-asks inside one phase share a prefix. Measured on one lab that
+#: VALIDATED in six calls on a single model:
+#:
+#:   uncached input    17,079
+#:   written to cache 151,499      at 1.25x
+#:   read from cache   44,140      at 0.1x
+#:
+#: which is 210,867 input-equivalents against 212,718 uncached -- a saving of
+#: 0.9%, with writes outnumbering reads 3.4 to 1 where a stable prefix would
+#: give about one write per five reads. And a lab that asks once, which 14%
+#: of them do, pays 25% more.
+#:
+#: So the mechanism stays, tested and ready, and the default does not. The
+#: 77% is still there to be had, but it lives in giving the three phases a
+#: shared prefix, not in a breakpoint placed over prompts that differ.
 #:
 #: The 5-minute TTL rather than the hour: entries of a batch run two at a
 #: time and each call starts minutes after the last, so every read refreshes
@@ -477,7 +490,7 @@ CACHE_VARIABLE = "CVELAB_PROMPT_CACHE"
 
 def prompt_cache_enabled() -> bool:
     """Whether a cache breakpoint is placed on the stable half of the turn."""
-    return os.getenv(CACHE_VARIABLE, "").strip().lower() not in ("off", "0", "no", "false")
+    return os.getenv(CACHE_VARIABLE, "").strip().lower() in ("on", "1", "yes", "true")
 
 
 #: Values that mean "send no temperature at all", as every dialect but
