@@ -39,9 +39,28 @@ class LocalPathTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_manual_guide_names_no_absolute_path(self) -> None:
+        """The guide must not say where, or as whom, the lab was generated.
+
+        `cd CVE-.../artifacts` was asserted here as the way of saying so,
+        and that line was a defect rather than evidence of one: the guide
+        says to run the block from the lab's `artifacts/` directory, and
+        from `artifacts/` that cd has nowhere to go. It was the first
+        command of the documented demo in every lab. What this test is for
+        is the absence of a host path, which is asserted directly below; the
+        cd is asserted gone, because a relative path that does not resolve
+        is no improvement on an absolute one that does.
+
+        The document is read under its own name, `LAB-POC.md`: the lab guide
+        was renamed out of a case-insensitive collision with the
+        single-instance script's `Manual-PoC.md`, so reading the old name here
+        would assert nothing about the file this lab actually ships.
+        """
         deliverables._write_generic_manual_assets(CVE, self.lab, self.lab / "artifacts", False)
-        guide = (self.lab / "artifacts" / "MANUAL-POC.md").read_text(encoding="utf-8")
-        self.assertIn(f"cd {CVE}/artifacts", guide)
+        guide = (
+            self.lab / "artifacts" / deliverables.LAB_POC_GUIDE_NAME
+        ).read_text(encoding="utf-8")
+        self.assertNotIn(f"cd {CVE}/artifacts", guide)
+        self.assertNotIn("cd ", guide)
         self.assertNotIn(str(self.home), guide)
         self.assertNotIn("alice", guide)
 
@@ -68,7 +87,9 @@ class LocalPathTests(unittest.TestCase):
     def test_uploaded_payload_carries_no_local_path(self) -> None:
         artifacts = self.lab / "artifacts"
         (self.lab / "plan.json").write_text(json.dumps({"repository": "https://github.com/acme/widget"}))
-        (artifacts / "MANUAL-POC.md").write_text(f'cd "{artifacts}"\nbash manual.sh setup vulnerable\n')
+        (artifacts / deliverables.LAB_POC_GUIDE_NAME).write_text(
+            f'cd "{artifacts}"\nbash manual.sh setup vulnerable\n'
+        )
         (artifacts / "EVIDENCE.json").write_text(json.dumps({
             "automation": {"attempts": [{"error": f"Compose preflight failed: validating {self.lab}/docker-compose.yml"}]},
         }))
@@ -79,7 +100,9 @@ class LocalPathTests(unittest.TestCase):
         payload = upload.collect(self.lab, result, provider="anthropic", model="m", include_poc=True)
 
         names = {document["name"] for document in payload["documents"]}
-        self.assertTrue({"MANUAL-POC.md", "EVIDENCE.json", "REPORT.md"} <= names)
+        self.assertTrue(
+            {deliverables.LAB_POC_GUIDE_NAME, "EVIDENCE.json", "REPORT.md"} <= names
+        )
         serialized = json.dumps(payload)
         self.assertNotIn(str(self.home), serialized)
         self.assertNotIn("alice", serialized)

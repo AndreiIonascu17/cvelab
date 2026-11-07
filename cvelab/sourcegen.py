@@ -129,7 +129,8 @@ SOURCE_SCHEMA = {
             "additionalProperties": False,
             "required": [
                 "execution_level", "vendor_product_started",
-                "exercised_vendor_components", "simulated_components", "rationale",
+                "exercised_vendor_components", "simulated_components",
+                "trigger_source", "rationale",
             ],
             "properties": {
                 "execution_level": {
@@ -146,6 +147,22 @@ SOURCE_SCHEMA = {
                 "simulated_components": {
                     "type": "array", "items": {"type": "string"},
                 },
+                # Asked for, not derived. The absence of a disclaimer in the
+                # rationale is not evidence that the documented trigger was
+                # reproduced, so a marker CVELab inferred would overclaim on
+                # every answer that simply said nothing. Only the answer can
+                # assert this; _validate_fidelity holds the assertion to the
+                # prose beside it.
+                "trigger_source": {
+                    "type": "string",
+                    "enum": ["documented", "substituted"],
+                    "description": (
+                        "documented: the regression input is the configuration and "
+                        "request the evidence names as triggering the weakness. "
+                        "substituted: it reaches the same condition by another route, "
+                        "which belongs in simulated_components."
+                    ),
+                },
                 "rationale": {"type": "string"},
             },
         },
@@ -154,7 +171,7 @@ SOURCE_SCHEMA = {
             "additionalProperties": False,
             "required": [
                 "attack_summary", "preconditions", "observable_effect", "evidence_type",
-                "effect_predicate", "setup", "setup_port", "inputs",
+                "effect_predicate", "service_port", "setup", "setup_port", "inputs",
             ],
             "properties": {
                 "attack_summary": {"type": "string"},
@@ -163,6 +180,40 @@ SOURCE_SCHEMA = {
                 # The prose above says what the effect is for a reader; this
                 # says it in the terms CVELab can decide for itself.
                 "effect_predicate": EFFECT_PREDICATE_SCHEMA,
+                # WHY THIS IS ASKED FOR RATHER THAN READ BACK
+                #
+                # Nothing in a generated lab states the port the product
+                # listens on. Measured over 89 archived labs, every place it
+                # could be recovered from is incidental and none of them
+                # covers the archive: a healthcheck command mentions it in
+                # 53%, `expose` in 15%, a module-level `PORT = N` constant in
+                # the validator in 15%, and `exploit_contract.setup_port` in
+                # 2% -- and that last one exists only when the lab declares
+                # setup steps and means the port those requests are sent to,
+                # which is a statement about the seeding rather than a
+                # declaration about the product. Three of the four are string
+                # parsing, all four are absent more often than present, and
+                # the one place that needs the number -- publishing it so the
+                # PoC can be handed an address on the host -- cannot ask a
+                # person standing in front of a client to go and find it.
+                #
+                # So it is declared. `policy.manual_port_override` says the
+                # same thing from the other end: it takes the port as an
+                # argument because the resolved Compose model does not
+                # reliably say, and names a declared port in the generation
+                # contract as the durable fix. This is that field.
+                "service_port": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 65535,
+                    "description": (
+                        "The TCP port the product listens on INSIDE the vulnerable and "
+                        "patched containers -- the one the validator's own requests go "
+                        "to, and the one the healthcheck probes. Not a host port, and "
+                        "never null: every lab has one, and CVELab publishes it on "
+                        "loopback for manual mode so the PoC can be given an address."
+                    ),
+                },
                 # The steps that put the lab in the state the attack needs,
                 # and the port they are sent to. See SETUP_SCHEMA_NOTE for
                 # why the steps travel as JSON text rather than as JSON.
@@ -1461,6 +1512,34 @@ def _validate_generated(
                     "Validator is missing the manual PoC contract: "
                     + ", ".join(sorted(missing_manual))
                 )
+            # The operator entry point, checked by the one token it cannot be
+            # written without. Measured over 89 archived labs: not one of
+            # their PoC scripts reads sys.argv at all -- every one is driven
+            # entirely by CVELAB_MANUAL_ACTION, CVELAB_TARGET and
+            # CVELAB_BOUND, and addresses its target by Compose service name,
+            # which resolves only inside the lab's internal network. So a
+            # script that can be handed an address is a shape none of them
+            # has, and the absence of this token is exactly the measurement
+            # that said so.
+            #
+            # Deliberately only this. The requirement is a positional
+            # argument holding host:port, and what a validator must do with
+            # it -- one session across the whole run, its own setup when
+            # CVELAB_BOUND is absent -- has no single spelling: a lab that
+            # speaks a binary protocol holds its session in a socket, an
+            # HTTP one in a cookie jar, and pinning either symbol would
+            # refuse the other for being written correctly. The prose in
+            # _OPERATOR_CONTRACT states the behaviour; this catches the
+            # script that never looks at its arguments at all.
+            if "sys.argv" not in item["content"]:
+                raise RuntimeError(
+                    "Validator reads no positional argument: it must accept an "
+                    "optional <host>:<port> as sys.argv[1] and send its requests "
+                    "there instead of to the Compose service name, so the same "
+                    "script an operator reads is one they can run against an "
+                    "instance. With no argument it must behave exactly as it does "
+                    "now, from CVELAB_MANUAL_ACTION, CVELAB_TARGET and CVELAB_BOUND."
+                )
             # Only the fields the contract says must be computed. The same
             # instruction defines attack_executed as "the regression input
             # was actually delivered", which the validator knows for a fact
@@ -1644,10 +1723,52 @@ def _path_remedy(path: str) -> str:
 
 
 def _validate_fidelity(fidelity: dict) -> None:
+    """Refuse a fidelity record that contradicts itself, before any build.
+
+    WHY `trigger_source` WAS WORTH ASKING FOR
+
+    Every other field here says what the lab *runs*. None said whether what
+    the lab *triggers* is what the evidence says triggers the weakness, and
+    that is a separate question with a separate failure: a route written to
+    produce the weakness's precondition on demand reaches the same symptom as
+    the weakness without going near it, and a fixed build driven the same way
+    reaches it too. The symptom is then recorded as the effect and the lab
+    reads as a reproduction.
+
+    Measured on 2026-11-07, on the 577 archived labs under benchmarks/labs:
+    three of the 674 distinct fidelity prose strings say in so many words
+    that the lab does not reproduce the weakness -- one whose route reaches
+    the fault condition directly rather than through the context the advisory
+    names, one whose adapter stands in for the listener the weakness lives in
+    and so "does not reproduce" it, and one whose fixed-side check "is not
+    reached" and therefore "does not prove" anything. All three were accepted
+    and shipped as reproductions. The sentence was in the record; nothing
+    read it.
+
+    WHAT IS REFUSED, AND WHAT IS NOT
+
+    Not the substitution. A lab that cannot reach the documented trigger is
+    still worth having, and refusing it outright would teach the next answer
+    to stop saying so -- the prose above is the only reason this defect is
+    visible at all, and a check that punishes writing it down buys silence.
+    So `substituted` is a passing answer: it ships, it names the substitute
+    among the simulated components, and it may not claim
+    `product_end_to_end`, which is the level `product_e2e_verified` is gated
+    on. The marker travels in the fidelity record into plan.json and
+    report.json, so a downstream step reads "reproduced the documented
+    trigger" and "reached the same condition another way" apart instead of
+    inferring one from the other.
+
+    What is refused is the one answer that cannot be true: `documented`
+    asserted over prose that disclaims the reproduction. That costs one model
+    call and no build, and it is the same move `_READ_NOT_RUN` already makes
+    below -- hold the claim to the words the same answer wrote.
+    """
     level = fidelity.get("execution_level")
     product_started = fidelity.get("vendor_product_started")
     exercised = fidelity.get("exercised_vendor_components")
     simulated = fidelity.get("simulated_components")
+    trigger_source = fidelity.get("trigger_source")
     if level == "source_component" and product_started is not False:
         raise RuntimeError("source_component fidelity cannot claim that the vendor product started")
     if level == "vendor_service" and product_started is not True:
@@ -1666,6 +1787,79 @@ def _validate_fidelity(fidelity: dict) -> None:
             "Fidelity says the vendor code is read, not run: " + "; ".join(read_not_run[:3])
             + ". An exercised component is code the regression input executes."
         )
+    if trigger_source not in _TRIGGER_SOURCES:
+        raise RuntimeError(
+            "Fidelity must set trigger_source to "
+            + " or ".join(sorted(_TRIGGER_SOURCES))
+            + ": documented when the regression input is the configuration and request "
+            "the evidence names as triggering the weakness, substituted when it reaches "
+            "the same condition by another route. A lab that triggers the weakness's "
+            "precondition on demand reaches the same symptom a fixed build reaches, so "
+            "which of the two this is cannot be left unsaid."
+        )
+    disclaimed = [
+        str(item) for item in [*simulated, str(fidelity.get("rationale") or "")]
+        if _TRIGGER_DISCLAIMED.search(str(item))
+    ]
+    if trigger_source == "documented" and disclaimed:
+        raise RuntimeError(
+            "Fidelity claims trigger_source documented while saying the lab does not "
+            "reproduce the weakness: " + "; ".join(text[:200] for text in disclaimed[:2])
+            + ". Both cannot hold. Either the regression input is the trigger the "
+            "evidence names, or it is substituted -- say which, and keep the sentence."
+        )
+    if trigger_source == "substituted":
+        if not simulated:
+            raise RuntimeError(
+                "Fidelity says trigger_source substituted, so simulated_components must "
+                "name the route that stands in for the documented trigger. A substitution "
+                "nothing names cannot be told apart from a reproduction by anything that "
+                "reads this record."
+            )
+        if level == "product_end_to_end":
+            raise RuntimeError(
+                "Fidelity says trigger_source substituted and execution_level "
+                "product_end_to_end. End to end is the product's own path from the "
+                "documented trigger to the effect; a lab that substitutes the trigger has "
+                "not run that path, whatever else it ran. Use vendor_service or "
+                "source_component, or reproduce the documented trigger."
+            )
+
+
+#: The two answers to "is what this lab triggers what the evidence says
+#: triggers the weakness". Deliberately two and not three: "unknown" would be
+#: where every answer that did not want to choose would go, and an answer that
+#: cannot tell whether it reproduced the trigger has already told us.
+_TRIGGER_SOURCES = frozenset({"documented", "substituted"})
+
+#: A fidelity record disclaiming its own reproduction, in the words the
+#: records actually use.
+#:
+#: Narrow on purpose, and measured rather than guessed. The first draft of
+#: this matched `harness`, `proxy`, `stands in for` and `substitut`, and hit
+#: 66 of 236 distinct rationales across benchmarks/labs -- almost all of them
+#: honest descriptions of a surrounding wrapper, which is what
+#: `simulated_components` is for and is no defect at all. Nothing general can
+#: be read out of those words. What can be read is an answer negating the
+#: reproduction itself, and that is rare and unambiguous: these alternatives
+#: match 3 of the 674 distinct rationale and simulated-component strings in
+#: that corpus, with no false positive among them.
+#:
+#: It is a heuristic over prose and it is one deliberately. The claim it
+#: guards is `trigger_source`, which is structured and is what anything
+#: downstream should read; this only stops that field being set to the one
+#: value the prose beside it rules out. A record that says nothing passes,
+#: because silence is not evidence either way -- so this is a check on
+#: self-contradiction and never a measurement of fidelity.
+_TRIGGER_DISCLAIMED = re.compile(
+    r"(?:is|was|are)\s+not\s+(?:a\s+)?"
+    r"(?:faithful\s+|true\s+|full\s+|complete\s+|direct\s+)?reproduction"
+    r"|do(?:es)?\s+not\s+reproduce"
+    r"|(?:was|were|could)\s+not\s+(?:be\s+)?identified"
+    r"|cannot\s+be\s+(?:identified|derived)"
+    r"|do(?:es)?\s+not\s+(?:show|prove|demonstrate|establish)\b",
+    re.I,
+)
 
 
 _READ_NOT_RUN = re.compile(
@@ -1675,7 +1869,9 @@ _READ_NOT_RUN = re.compile(
 )
 
 
-def _validate_effect_predicate(contract: dict, vulnerable_only: bool = False) -> dict:
+def _validate_effect_predicate(
+    contract: dict, vulnerable_only: bool = False, marker: str | None = None
+) -> dict:
     """Refuse a predicate that cannot measure, before a single image is built.
 
     WHY THIS IS MANDATORY AND NOT ADVISORY
@@ -1704,7 +1900,8 @@ def _validate_effect_predicate(contract: dict, vulnerable_only: bool = False) ->
     fails it. Substance is enforced by the comparison rather than by a
     blocklist of degenerate patterns, which is what makes the check hard to
     write around. `_vulnerable_only_substance` covers the one shape that has
-    no patched side to compare against.
+    no patched side to compare against, and `marker` is the canary that lab
+    planted, which is what it holds the declaration to.
 
     Returns the predicate with the kinds it does not declare dropped, and
     writes that back into the contract, so plan.json records exactly what
@@ -1773,12 +1970,12 @@ def _validate_effect_predicate(contract: dict, vulnerable_only: bool = False) ->
                 "name and the text it contains, both as text"
             )
     if vulnerable_only:
-        _vulnerable_only_substance(cleaned)
+        _vulnerable_only_substance(cleaned, marker)
     contract["effect_predicate"] = cleaned
     return cleaned
 
 
-def _vulnerable_only_substance(declared: dict) -> None:
+def _vulnerable_only_substance(declared: dict, marker: str | None) -> None:
     """The syntactic minimum a lab with nothing to compare against needs.
 
     On a differential lab the comparison does this work: a predicate loose
@@ -1791,7 +1988,7 @@ def _vulnerable_only_substance(declared: dict) -> None:
     lab would be a blocklist of degenerate patterns, which is the kind of
     check a model that wants to pass writes around.
 
-    Two rules, both about the declaration and neither about a result:
+    Three rules, all about the declaration and none about a result:
 
     1. A status clause may narrow the proof but may not be the whole of it.
        "The service answered 200" is how the thing behaves on every build,
@@ -1809,6 +2006,78 @@ def _vulnerable_only_substance(declared: dict) -> None:
        string and therefore hold against any body whatever, while a pattern
        that requires at least one character cannot. A blocklist of the
        spellings would have missed four of those five.
+
+    3. At least one clause must quote the canary this lab planted.
+
+       WHAT RULES 1 AND 2 LET THROUGH, MEASURED
+
+       They are both about looseness, and a predicate can be perfectly tight
+       and still measure nothing. Of the three vulnerable-only labs in the
+       archive, one declared
+
+           {"body_regex": "Allowed memory size of [0-9]+ bytes exhausted"}
+
+       which names a specific text, is not a status clause, and cannot match
+       the empty string, so rules 1 and 2 both pass it -- and it is a message
+       the runtime emits for any script at all that exceeds its configured
+       limit. That lab validated, carried PUBLIC_FIX_NOT_IDENTIFIED, and had
+       a full deliverable set written for it. The only step that noticed was
+       the manual-PoC drafter, which refused to write a script for it: "the
+       confirmed effect is only a proxy". The automatic path accepted it. The
+       giveaway is that the same text is checked in under the vendor's own
+       test suite as the expected output of an ordinary allocation failure,
+       so what the predicate matched was the product behaving as documented.
+
+       WHY THE CANARY IS THE LINE, AND NOT SOMETHING FINER
+
+       A differential lab answers "would this have happened anyway?" by
+       running the attack against a build where it must not. With no such
+       build the declaration has to carry the distinction itself, which it
+       can only do by naming a value that got there because of the attack:
+       a canary the lab planted, a payload it reflected, an address it
+       spoofed. CVELab knows exactly one such value by its content -- the
+       marker it issues per lab and already instructs the generation to use
+       as its canary data -- so that is what is required. Three alternatives
+       were considered and are worse:
+
+       - Requiring the text to appear in the lab's own generated files, which
+         is the more general form of "something the lab introduced". It is
+         circular: a validator searching for a text necessarily contains it.
+         The lab that this rule refuses holds the refused pattern verbatim in
+         its validator.py, so its own files would have vouched for it.
+       - Reading exploit_contract.inputs as the values the attack supplies.
+         Those are names an operator fills in the shipped PoC, never present
+         in the lab, and nothing substitutes {{name}} into a predicate -- so
+         accepting one would accept a clause that can never hold.
+       - Judging the text itself, by length, by specificity, by whether it
+         reads like an error message. Every version of that is a blocklist
+         about wording, which is both per-product in effect and exactly the
+         kind of check a model inclined to pass writes around.
+
+       WHAT IT COSTS, SAID PLAINLY
+
+       A vulnerable-only lab whose effect genuinely has no text the lab can
+       plant -- a crash, a hang, an allocation failure -- cannot satisfy this
+       and will be refused before the build. That is the intended outcome
+       rather than a casualty of it: such a lab has no way to show that what
+       it observed was the vulnerability and not the product's ordinary
+       behaviour under stress, and the declaration cannot tell a distinctive
+       crash signature from a generic one with nothing to compare against.
+       The ceiling is worth stating too: this cannot catch a lab that echoes
+       its own canary unconditionally, because that is a fact about the
+       adapter's control flow rather than about the declaration. The sound
+       archived lab sits on the same ceiling, which is why the rule stops
+       here rather than pretending to more.
+
+       Measured against the archive before it was written: of the three
+       vulnerable-only labs, it accepts the one whose predicate quotes its
+       marker, refuses the allocation-failure text above, and the third
+       declared no predicate at all and was already refused by the
+       at-least-one-kind rule further up. Differential labs do not reach
+       this function, and must not: 43 of the 53 archived differential
+       predicates name an attacker-supplied value or an adapter-computed
+       field rather than the marker -- a spoofed address, a reflected
+       payload, a traversal path -- and the comparison is what judges those.
     """
     kinds = set(predicate.declared_kinds(declared))
     if not kinds - {"status"}:
@@ -1842,6 +2111,37 @@ def _vulnerable_only_substance(declared: dict) -> None:
             "contains; an empty value holds against any response at all, and a "
             "vulnerable-only lab has no patched build to expose that."
         )
+    # Last of the three, so that an empty clause is told it is empty rather
+    # than told it does not quote the canary: the first message names the
+    # thing a repair can act on, and the checks above are the cheaper read of
+    # the same declaration.
+    if not str(marker or "").strip():
+        # Not reachable from a lab CVELab generated -- every source plan it
+        # writes carries a marker, and all three archived vulnerable-only
+        # plans do. Refused rather than skipped anyway: passing an absent
+        # canary would turn the rule off for exactly the plan that reached
+        # this function without one, and silently.
+        raise RuntimeError(
+            "A vulnerable-only lab is generated with a canary marker and this one "
+            "records none, so there is nothing its effect predicate can be held to. "
+            "Regenerate the lab rather than revalidating this plan."
+        )
+    if not predicate.quotes(declared, marker):
+        raise RuntimeError(
+            "A vulnerable-only lab has no patched build to show that its "
+            "exploit_contract.effect_predicate matched something the system would "
+            f"emit anyway, so at least one of {', '.join(predicate.QUOTING)} must "
+            f"quote the canary this lab planted, {marker}. None of them does, so the "
+            "declared effect may be ordinary behaviour of the product under the input "
+            "rather than the weakness: an error message, a limit being enforced or a "
+            "default reply all read the same way here. Put the canary where the effect "
+            "surfaces -- carry it in the payload the attack sends, seed it in the "
+            "record the attack reaches, reflect it in the header it forges -- and name "
+            "it, written out in full, in the clause that looks for it; nothing "
+            "substitutes a placeholder into a predicate. Where the effect is a crash, "
+            "a hang or an allocation failure, there is no text to plant and no fixed "
+            "build to compare against, so this lab cannot prove itself automatically."
+        )
 
 
 #: What a precondition that the lab itself has to establish sounds like.
@@ -1864,6 +2164,55 @@ _SETUP_STATE = re.compile(
     r"|\bupload|populat|provision|\btenant|\bproject\b|\bsubscription",
     re.IGNORECASE,
 )
+
+
+def _validate_service_port(contract: dict) -> int:
+    """Refuse an answer that did not declare the port the product listens on.
+
+    WHY IT IS A SEPARATE CHECK AND NOT PART OF THE SETUP ONE
+
+    `setup_port` is conditional -- it exists only for a lab that declares
+    seeding, and it is validated beside the steps it belongs to. This is
+    unconditional: every lab has a port, every lab must say it, and a lab
+    with no seeding at all still needs it, because the port is what
+    `manual.sh` publishes so the PoC can be handed an address on the host.
+    Folding the two together would also have made this answerable only
+    through the setup path, which is 2% of the archive.
+
+    WHAT HAPPENS WHEN THE TWO DISAGREE
+
+    Nothing is reconciled. Both are declared, both describe the same
+    containers, and one answer saying 8080 in one field and 3000 in the other
+    has not described a lab that exists: whichever is wrong, either the
+    seeding or the PoC goes to a closed port. That is refused here for one
+    model call rather than discovered after a build, and the message names
+    both numbers so the repair has somewhere to go.
+
+    Returns the declared port, so a caller that wants it does not re-read it.
+    """
+    port = contract.get("service_port")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise RuntimeError(
+            "exploit_contract.service_port must be the port the product listens on "
+            "inside the vulnerable and patched containers, as an integer from 1 to "
+            f"65535; this answer declared {port!r}. It is not optional: CVELab "
+            "publishes that port on loopback for manual mode, and nothing else in a "
+            "generated lab states it."
+        )
+    setup_port = contract.get("setup_port")
+    if (
+        isinstance(setup_port, int)
+        and not isinstance(setup_port, bool)
+        and setup_port != port
+    ):
+        raise RuntimeError(
+            f"exploit_contract.setup_port ({setup_port}) and "
+            f"exploit_contract.service_port ({port}) disagree about the port the "
+            "vulnerable and patched containers listen on. They describe the same "
+            "containers, so one of them sends its requests to a closed port; declare "
+            "the port the product really binds in both."
+        )
+    return port
 
 
 def _validate_setup_contract(
@@ -2360,6 +2709,105 @@ _SETUP_CONTRACT = (
 )
 
 
+#: The second entry point: the same file, run by a person, against an address.
+#:
+#: WHY THE GENERATED SCRIPT NEEDED ONE AT ALL
+#:
+#: `artifacts/PoC.py` is `validator/validator.py` with a six-line docstring
+#: prepended -- byte-identical otherwise, in all 89 archived labs, the diff
+#: literally `0a1,6`. So the artifact the documentation calls the manual PoC
+#: is the validator's own source, copied out to be read: the guide says
+#: `sed -n '1,260p' PoC.py` and then `bash manual.sh exploit`, which starts
+#: the validator inside the Compose network. Measured on the same 89: none of
+#: them reads sys.argv, every one is driven by CVELAB_MANUAL_ACTION,
+#: CVELAB_TARGET and CVELAB_BOUND, and every one addresses its target by
+#: Compose service name, which resolves nowhere else. `policy` refuses
+#: `ports` for every lab, so there was no host address to point anything at
+#: either. A tester carrying these labs to a client has a script they can
+#: read and cannot run.
+#:
+#: WHY IT IS THE SAME FILE AND NOT A SECOND ARTIFACT
+#:
+#: Because the two were already the same file. A second generated script
+#: would be a second thing to keep in step with the first, and the 1260 tests
+#: and every archived lab rest on the automatic differential the first one
+#: performs. One file with two entry points keeps the thing the operator
+#: reads and the thing CVELab measured identical, which is the whole reason
+#: the copy was worth reading.
+#:
+#: WHY THE NO-ARGUMENT PATH IS SPELLED OUT AS UNCHANGED
+#:
+#: It is the path the automatic differential takes, and the differential is
+#: what proves every lab. An instruction that read as "make the script take a
+#: target" invites a rewrite of the whole script around argument parsing;
+#: saying which path must not move is what keeps the change additive.
+#:
+#: Appended after the pinned sentence in all three prompts, for the reason
+#: recorded above _EFFECT_CONTRACT.
+_OPERATOR_CONTRACT = (
+    "Declare exploit_contract.service_port: the TCP port the product listens on inside "
+    "the vulnerable and patched containers. It is the port your own requests go to and "
+    "the port the healthcheck probes, it is an integer and never null, and where this "
+    "lab also declares setup it must be the same number as exploit_contract.setup_port. "
+    "Nothing else in a generated lab states it, and CVELab publishes it on loopback so "
+    "the script below can be handed an address. "
+    "validator.py has two entry points and must have exactly two. "
+    "FIRST, with no positional argument -- sys.argv[1] absent -- it behaves exactly as "
+    "described above and nowhere else: it reads CVELAB_MANUAL_ACTION, CVELAB_TARGET and "
+    "CVELAB_BOUND, addresses the build by its Compose service name, prints the same JSON "
+    "or the same verdict word, and exits with the same status. This is the path the "
+    "automatic differential takes and the path every proof rests on. Add the second "
+    "entry point beside it; do not restructure this one around it, do not require a "
+    "flag or a subcommand to reach it, and do not make any output or exit status depend "
+    "on whether the new code is present. "
+    "SECOND, with one positional argument, sys.argv[1] is the address of one already "
+    "running instance, written as <host>:<port> -- the shape an exploit-db script takes, "
+    "and the only shape to accept. Send every request this script makes to that address "
+    "instead of to a service name, and use the port given there rather than "
+    "service_port; a bare host with no colon means service_port. Accept a bracketed IPv6 "
+    "literal. Nothing else changes: the same regression input, the same observation, the "
+    "same verdict word, the same exit status. "
+    "Two things that the service-name path gets for free have to be done by the script "
+    "itself on this path. ONE: hold one session for the whole run. Internally each "
+    "manual action is a fresh container that exits, so nothing can outlive one "
+    "invocation and nothing needs to; run by hand it is one process from the first "
+    "request to the verdict, and a login, a cookie, a CSRF token or an open connection "
+    "established early must still be in force when the regression input is sent. Build "
+    "the session once at the top -- one urllib opener with an HTTPCookieProcessor over a "
+    "http.cookiejar.CookieJar for an HTTP product, one socket for a product that speaks "
+    "its own protocol -- and send everything through it. TWO: establish the state the "
+    "attack needs, by performing exploit_contract.setup's own steps in order, including "
+    "reading out and reusing anything it binds. CVELAB_BOUND does not exist on this "
+    "path: CVELab runs those steps and sets that variable, and a person running this "
+    "script by hand has neither. A script that waits for CVELAB_BOUND here sends the "
+    "attack to an instance with nothing to act on, which looks exactly like a fixed "
+    "build refusing it. Where the lab declares no setup there is nothing to do. "
+    "Print what it found on stdout -- the observation, then the verdict word -- and exit "
+    "0 when the effect was observed and 1 when it was not, which is the convention the "
+    "service-name path already uses. Name the address it is about to use on stderr "
+    "before the first request, so the run is visible in whatever captured it. "
+    "Standard library only, on both paths: urllib, json, os, sys, time, http, re, "
+    "hashlib, socket, uuid and base64 are available and nothing else is. Whoever runs "
+    "this must not have to install a package, so never import requests. "
+    "Where exploit_contract.evidence_type is code_execution, and only there, accept an "
+    "optional SECOND positional argument: one command to run on the target. Deliver it "
+    "through the same weakness the lab proves, print its output verbatim under a line "
+    "saying it is the command's output, and exit 0 when the command ran. With the "
+    "address given and no command, run the lab's own harmless canary command, so the "
+    "two-argument form adds what the operator asks for without changing what one "
+    "argument does. For every other evidence_type there is no second argument: a command "
+    "has nothing to mean, and a script that invents one is refused. "
+    "A third positional argument is never accepted: print how to call the script and "
+    "exit 2. "
+    "None of this changes the lab. docker-compose.yml still declares internal: true, "
+    "still publishes no host port and mounts no host path, and the containers still "
+    "reach nothing outside the lab's own network -- every instruction above about "
+    "staying inside the lab stands, and applies to the fixture. The address in "
+    "sys.argv[1] is reached by a person running this one file on their own machine, "
+    "outside the lab entirely, which is why it is an argument and not a service name. "
+)
+
+
 def contract_retries() -> int:
     """How often an answer refused before the build is asked for again (CVELAB_CONTRACT_RETRIES).
 
@@ -2700,10 +3148,26 @@ def generate_source_lab(
                     "inverts the proof. "
                     + _EFFECT_CONTRACT
                     + _SETUP_CONTRACT
+                    + _OPERATOR_CONTRACT
                     + "This lab has no patched build, so the comparison cannot show up a loose "
                     "predicate here: the predicate may not rest on status alone, every text it "
                     "looks for must be non-empty, and a body_regex that matches the empty string "
                     "is refused before the build. "
+                    # Said before it is enforced, as the two sentences above
+                    # are: the rule it states is _vulnerable_only_substance's
+                    # third, and the lab it was written for declared a text
+                    # that was tight, specific and emitted by the runtime for
+                    # any script that exceeded its limit.
+                    + "With no fixed build to contradict it, the declared effect must be "
+                    "something the attack introduced rather than something the product emits "
+                    "anyway, so at least one of body_contains, body_regex or header must quote "
+                    f"the canary {marker}, written out in full -- a placeholder is not "
+                    "substituted into a predicate. Carry the canary in the payload the attack "
+                    "sends, seed it in the record the attack reaches, or reflect it in the "
+                    "header it forges, and name it in the clause that looks for it. An error "
+                    "message, a limit being enforced or a default reply is refused before the "
+                    "build, however exactly it is spelled: it reads the same whether or not the "
+                    "weakness is present. "
                     + f"Use only harmless canary data ({marker}) inside the containers. Everything the "
                     "fixture does stays inside the lab: the two service names above, the lab's own internal "
                     "network, default container privileges, and no change that outlives compose down. "
@@ -2745,7 +3209,10 @@ def generate_source_lab(
             _check_build_inputs(generated_files, lab_dir, vulnerable_only=True)
             _check_base_images(generated_files)
             _validate_fidelity(generation["fidelity"])
-            _validate_effect_predicate(generation["exploit_contract"], vulnerable_only=True)
+            _validate_effect_predicate(
+                generation["exploit_contract"], vulnerable_only=True, marker=marker
+            )
+            _validate_service_port(generation["exploit_contract"])
             _validate_setup_contract(
                 generation["exploit_contract"],
                 generation["docker_compose"], generation["validator_py"],
@@ -2899,6 +3366,7 @@ def generate_source_lab(
                 "inverts the proof. "
                 + _EFFECT_CONTRACT
                 + _SETUP_CONTRACT
+                + _OPERATOR_CONTRACT
                 + "Source archives have no .git directory, so initialize a local repository without "
                 "a remote only if build logic requires it. Healthchecks and the validator must use the final application "
                 "scheme, port, and route, and redirects must not count as healthy. "
@@ -2946,6 +3414,7 @@ def generate_source_lab(
         _check_base_images(generated_files)
         _validate_fidelity(generation["fidelity"])
         _validate_effect_predicate(generation["exploit_contract"])
+        _validate_service_port(generation["exploit_contract"])
         _validate_setup_contract(
             generation["exploit_contract"],
             generation["docker_compose"], generation["validator_py"],
@@ -3180,7 +3649,13 @@ def repair_source_lab(
         "differential_confirmed=false, and fix_status=PUBLIC_FIX_NOT_IDENTIFIED. With no patched build "
         "there is no comparison to show up a loose effect predicate, so it may not rest on status "
         "alone, every text it looks for must be non-empty, and a body_regex that matches the empty "
-        "string is refused before the build."
+        "string is refused before the build. The declared effect must also be something the attack "
+        "introduced rather than something the product emits anyway, so at least one of body_contains, "
+        f"body_regex or header must quote the canary {plan.get('marker')}, written out in full; a "
+        "placeholder is not substituted into a predicate. Carry the canary in the payload the attack "
+        "sends, seed it in the record the attack reaches, or reflect it in the header it forges. An "
+        "error message, a limit being enforced or a default reply is refused before the build, however "
+        "exactly it is spelled."
         if vulnerable_only
         else
         "Send the identical patch-derived regression input to vulnerable and patched services. Success requires the effect on "
@@ -3227,11 +3702,12 @@ def repair_source_lab(
                 "prints REPRODUCED or BLOCKED only after evaluating a fresh request. Never hard-code a "
                 "successful result or treat canary reflection alone as proof. Reading, searching or comparing the vendor source text is not evidence either: the verdict must come from executing the affected code. Preserve the regression contract unless runtime "
                 "evidence shows it is technically wrong. Keep all interaction inside the internal Docker network, accept "
-                "only fixed service names, use harmless canary data, and keep everything it does inside the "
+                "only fixed service names on the no-argument path, use harmless canary data, and keep everything it does inside the "
                 "lab: the lab's own internal network, default container privileges, and no change that "
                 "outlives compose down. "
                 + _EFFECT_CONTRACT
                 + _SETUP_CONTRACT
+                + _OPERATOR_CONTRACT
                 + variant_contract
             ),
             input_text=context,
@@ -3281,11 +3757,17 @@ def repair_source_lab(
         # repair is as able to install an unmeasurable predicate as a
         # generation is, and is held to the same check.
         _validate_effect_predicate(
-            generation["exploit_contract"], vulnerable_only=vulnerable_only
+            generation["exploit_contract"], vulnerable_only=vulnerable_only,
+            # The marker belongs to the lab, not to the answer: a repair
+            # reuses the canary the generation planted, including on a pair
+            # being demoted here, because the differential plan it is demoted
+            # from recorded the same one.
+            marker=plan.get("marker"),
         )
         # And the same for the setup: the repair rewrites the contract from
         # its own answer, so it can install a precondition nothing
         # establishes exactly as a generation can.
+        _validate_service_port(generation["exploit_contract"])
         _validate_setup_contract(
             generation["exploit_contract"], compose, generation["validator_py"]
         )

@@ -31,6 +31,7 @@ the soundness regression.
 
 from __future__ import annotations
 
+import ast
 import json
 import subprocess
 import sys
@@ -44,6 +45,11 @@ from cvelab import core, sourcegen
 
 FORKED_VALIDATOR = Path(__file__).parent / "fixtures" / "self_certifying_validator.py"
 
+#: The canary the lab plants, and the value plan.json records as `marker`.
+#: The two are the same string here on purpose: a vulnerable-only lab has no
+#: patched build, so its predicate has to quote the canary it planted, and a
+#: fixture whose plan recorded one canary while its contract named another
+#: would be testing the mismatch rather than the rule.
 CANARY = "cvelab-e2e-secret"
 
 #: What the contract commits to before anything is built: the owner's note
@@ -112,6 +118,11 @@ class _LabRun(unittest.TestCase):
                 "cwe": "CWE-639",
                 "lab_type": lab_type,
                 "startup_services": sides,
+                # Every source plan CVELab writes carries one, and the
+                # vulnerable-only branch of the effect check reads it: with
+                # no patched build it is the only thing in the plan that says
+                # what the lab itself put into the response.
+                "marker": CANARY,
                 "exploit_contract": contract,
             }),
             encoding="utf-8",
@@ -306,6 +317,115 @@ class VulnerableOnlyMeasurementTests(_LabRun):
         )
         self.assertIs(report["proof_checks"]["security_effect_observed"], False)
 
+    #: A body that holds the lab's canary and a text the product prints by
+    #: itself, so one predicate can be measured against the other with the
+    #: observation held fixed. Both clauses hold here; only one of them says
+    #: anything about the weakness.
+    AMBIGUOUS = {
+        "vulnerable": {
+            "status": 200, "headers": {"Server": "x"},
+            "body": f"Allowed memory size of 8388608 bytes exhausted {CANARY}",
+        },
+        "patched": {"status": 403, "headers": {"Server": "x"}, "body": "forbidden"},
+    }
+
+    def test_a_predicate_the_product_satisfies_by_itself_no_longer_passes(self) -> None:
+        """The soundness regression for a lab with nothing to compare against.
+
+        This is 109618 replayed through run_lab: the predicate holds on the
+        only build there is, every other proof check passes, and before this
+        change the lab reproduced on the strength of a message the runtime
+        prints for any script that exceeds its configured limit.
+        """
+        report = self.report(
+            self._said(self.AMBIGUOUS),
+            contract={
+                **self.CONTRACT,
+                "effect_predicate": {
+                    "body_regex": r"Allowed memory size of [0-9]+ bytes exhausted"
+                },
+            },
+            lab_type="VULNERABLE_ONLY_REPRODUCTION",
+        )
+
+        self.assertIs(report["proof_checks"]["security_effect_observed"], False)
+        self.assertIs(report["real_poc_verified"], False)
+        self.assertIs(report["ok"], False)
+        # And the effect check is the only one that failed, so this proves
+        # what it claims rather than passing on an unrelated refusal.
+        self.assertEqual(
+            sorted(
+                name for name, passed in report["proof_checks"].items()
+                if passed is False
+            ),
+            ["security_effect_observed"],
+        )
+
+    def test_the_evidence_keeps_the_measurement_and_adds_the_reason(self) -> None:
+        """Both lines, because the predicate did hold.
+
+        The refused lab's whole evidence record read "body_regex='Allowed
+        memory size of [0-9]+ bytes exhausted' passed=True", which is true
+        and left a reader of the report nothing to go on. Dropping that line
+        in favour of the refusal would make the same mistake the other way
+        round.
+        """
+        report = self.report(
+            self._said(self.AMBIGUOUS),
+            contract={
+                **self.CONTRACT,
+                "effect_predicate": {
+                    "body_regex": r"Allowed memory size of [0-9]+ bytes exhausted"
+                },
+            },
+            lab_type="VULNERABLE_ONLY_REPRODUCTION",
+        )
+        evidence = "\n".join(report["effect_evidence"])
+
+        self.assertIn("vulnerable: body_regex=", evidence)
+        self.assertIn("passed=True", evidence)
+        self.assertIn(f"no clause quotes the canary {CANARY} this lab planted", evidence)
+        self.assertIn("not something the attack introduced", evidence)
+
+    def test_the_same_predicate_still_passes_a_differential_lab(self) -> None:
+        """The change is confined to the branch that has no comparison.
+
+        Same contract, same observation on the vulnerable side, a patched
+        side that does not produce the effect -- and the lab reproduces. A
+        differential lab's predicate is judged by the comparison, which is
+        the stronger test and the one that cannot be written around; 43 of
+        the 53 archived differential predicates quote no marker and must go
+        on being measured that way.
+        """
+        report = self.report(
+            run_forked_validator(self.AMBIGUOUS),
+            contract={
+                **self.CONTRACT,
+                "effect_predicate": {
+                    "body_regex": r"Allowed memory size of [0-9]+ bytes exhausted"
+                },
+            },
+        )
+
+        self.assertIs(report["proof_checks"]["security_effect_observed"], True)
+        self.assertIs(report["ok"], True)
+        self.assertNotIn("canary", "\n".join(report["effect_evidence"]))
+
+    def test_a_plan_with_no_canary_measures_nothing(self) -> None:
+        """A vulnerable-only plan that records no marker fails the gate.
+
+        Refused at generation, so reaching run_lab means the plan was
+        edited, or was written before the rule existed -- which is how the
+        measured case holds a VALIDATED report to this day. Failing closed
+        is what makes revalidating such a lab not reproduce it.
+        """
+        held, evidence = core.effect_observed(
+            json.loads(self._said(REAL_EFFECT)), self.CONTRACT, True, None
+        )
+
+        self.assertIs(held, False)
+        self.assertIn("this plan records no canary", "\n".join(evidence))
+
 
 class DeclarationRefusedBeforeAnyBuildTests(unittest.TestCase):
     """A predicate that cannot measure is refused for one model call.
@@ -436,7 +556,7 @@ class VulnerableOnlySubstanceTests(unittest.TestCase):
 
     def check(self, **predicate: object) -> dict:
         return sourcegen._validate_effect_predicate(
-            self.declared(**predicate), vulnerable_only=True
+            self.declared(**predicate), vulnerable_only=True, marker=CANARY
         )
 
     def test_status_alone_cannot_carry_a_vulnerable_only_proof(self) -> None:
@@ -450,8 +570,8 @@ class VulnerableOnlySubstanceTests(unittest.TestCase):
 
     def test_status_may_narrow_a_proof_it_does_not_carry(self) -> None:
         self.assertEqual(
-            self.check(status=[200], body_contains="owner-note"),
-            {"status": [200], "body_contains": "owner-note"},
+            self.check(status=[200], body_contains=f"owner-note {CANARY}"),
+            {"status": [200], "body_contains": f"owner-note {CANARY}"},
         )
 
     def test_an_empty_needle_is_refused(self) -> None:
@@ -473,7 +593,7 @@ class VulnerableOnlySubstanceTests(unittest.TestCase):
                     self.check(body_regex=pattern)
 
     def test_a_pattern_that_requires_a_character_is_accepted(self) -> None:
-        for pattern in (".+", "owner-note", r"note\":\s*\"\w+"):
+        for pattern in (CANARY, rf"note\":\s*\"{CANARY}", f"{CANARY}-[0-9]+"):
             with self.subTest(pattern=pattern):
                 self.assertEqual(self.check(body_regex=pattern), {"body_regex": pattern})
 
@@ -481,8 +601,8 @@ class VulnerableOnlySubstanceTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "holds against any response"):
             self.check(header={"name": "X-Tok", "contains": ""})
         self.assertEqual(
-            self.check(header={"name": "X-Tok", "contains": "owner"}),
-            {"header": {"name": "X-Tok", "contains": "owner"}},
+            self.check(header={"name": "X-Tok", "contains": f"owner-{CANARY}"}),
+            {"header": {"name": "X-Tok", "contains": f"owner-{CANARY}"}},
         )
 
     def test_a_differential_lab_keeps_its_loose_predicates(self) -> None:
@@ -495,6 +615,153 @@ class VulnerableOnlySubstanceTests(unittest.TestCase):
         for declared in ({"body_contains": ""}, {"body_regex": ".*"}, {"status": [200, 500]}):
             with self.subTest(predicate=declared):
                 sourcegen._validate_effect_predicate(self.declared(**declared))
+
+
+class VulnerableOnlyAnchorTests(VulnerableOnlySubstanceTests):
+    """The declared effect has to be something the attack introduced.
+
+    THE DEFECT THESE PIN, MEASURED
+
+    Looseness was the only thing the substance rules looked at, and a
+    predicate can be perfectly tight and still measure nothing. The archived
+    lab that showed it declared
+
+        {"body_regex": "Allowed memory size of [0-9]+ bytes exhausted"}
+
+    which names a specific text, is not a status clause and cannot match the
+    empty string, so both earlier rules passed it -- and the runtime prints
+    that text for any script at all that exceeds its configured limit, on a
+    fixed build as readily as on this one. The lab validated, recorded
+    PUBLIC_FIX_NOT_IDENTIFIED, and had PoC.py, MANUAL-POC.md, REPORT.md and
+    EVIDENCE.json written for it. Only the manual-PoC drafter objected, and
+    it objected in prose, to a human, after the automatic path had passed.
+
+    The subclass inherits the earlier rules deliberately: they still have to
+    hold, and a refusal must still name the cheapest thing wrong with the
+    declaration rather than reaching for this one first.
+    """
+
+    #: What the vulnerable-only labs in the archive declared, and the verdict
+    #: each must get. Written out rather than described: these three are the
+    #: entire measured population, two of them are the reason this rule
+    #: exists, and the third is the one lab that must keep passing.
+    ARCHIVED = (
+        ("quotes its canary", {"status": [200], "body_contains": CANARY}, True),
+        ("a runtime's own limit message", {"body_regex": r"Allowed memory size of [0-9]+ bytes exhausted"}, False),
+        ("no predicate at all", {}, False),
+    )
+
+    def test_the_three_archived_vulnerable_only_predicates(self) -> None:
+        """Accept one, refuse two, and refuse them for the right reasons."""
+        for description, declared, accepted in self.ARCHIVED:
+            with self.subTest(predicate=description):
+                if accepted:
+                    self.assertEqual(self.check(**declared), declared)
+                elif declared:
+                    with self.assertRaisesRegex(RuntimeError, "must quote the canary"):
+                        self.check(**declared)
+                else:
+                    # Refused further up, by the rule that a contract
+                    # declaring no kind measures nothing, and left there:
+                    # the earlier message is the one that tells a repair
+                    # what to write.
+                    with self.assertRaisesRegex(RuntimeError, "must declare at least one of"):
+                        self.check(**declared)
+
+    def test_a_tight_text_that_names_nothing_the_attack_introduced_is_refused(self) -> None:
+        """Specificity is not substance, which is what 109618 cost to learn.
+
+        Each of these is non-empty, cannot match the empty string and is not
+        a status clause, so every earlier rule accepts it. None of them says
+        anything the attack put there.
+        """
+        for declared in (
+            {"body_regex": ".+"},
+            {"body_contains": "Internal Server Error"},
+            {"body_regex": r"Fatal error: [a-z ]+ exhausted"},
+            {"status": [500], "body_contains": "Traceback (most recent call last)"},
+            {"header": {"name": "X-Powered-By", "contains": "PHP/"}},
+        ):
+            with self.subTest(predicate=declared):
+                with self.assertRaisesRegex(RuntimeError, "must quote the canary"):
+                    self.check(**declared)
+
+    def test_the_canary_may_sit_inside_the_text_the_clause_names(self) -> None:
+        """Containment, not equality.
+
+        A clause naming only the canary and nothing else would be the only
+        legal shape under equality, and that would be worse rather than
+        stricter: the stronger declaration is the one that says where in the
+        response the canary has to appear.
+        """
+        for declared in (
+            {"body_contains": f'{{"note": "{CANARY}"}}'},
+            {"body_regex": rf'"note":\s*"{CANARY}"'},
+            {"header": {"name": "Set-Cookie", "contains": f"session={CANARY}"}},
+        ):
+            with self.subTest(predicate=declared):
+                self.assertEqual(self.check(**declared), declared)
+
+    def test_a_header_name_is_not_a_value(self) -> None:
+        """Only what was observed can carry what the attack introduced.
+
+        The name says which header is read. A canary in the name would be a
+        canary in the question rather than in the answer, and a lab could
+        satisfy it by asking about a header that is never sent.
+        """
+        with self.assertRaisesRegex(RuntimeError, "must quote the canary"):
+            self.check(header={"name": CANARY, "contains": "something"})
+
+    def test_a_placeholder_is_refused_because_nothing_fills_it(self) -> None:
+        """`inputs` cannot be what a predicate quotes, and this is why.
+
+        `exploit_contract.inputs` names values an operator supplies to the
+        shipped PoC; they are never present in the lab, and no code path
+        substitutes {{name}} into a predicate. Accepting one would accept a
+        clause that can never hold against any response.
+        """
+        with self.assertRaisesRegex(RuntimeError, "must quote the canary"):
+            self.check(body_contains="{{marker}}")
+
+    def test_a_lab_with_no_canary_is_refused_rather_than_exempted(self) -> None:
+        """Otherwise an absent marker would switch the rule off silently.
+
+        Not reachable from a lab CVELab generated -- every source plan it
+        writes records a marker, and all three archived vulnerable-only
+        plans do -- which is exactly why it must not read as permission.
+        """
+        for absent in (None, "", "   "):
+            with self.subTest(marker=repr(absent)):
+                with self.assertRaisesRegex(RuntimeError, "records none"):
+                    sourcegen._validate_effect_predicate(
+                        self.declared(body_contains=CANARY),
+                        vulnerable_only=True,
+                        marker=absent,
+                    )
+
+    def test_a_differential_lab_is_not_held_to_the_canary(self) -> None:
+        """The comparison judges those, and it judges them better.
+
+        Of the 53 predicates the archived differential labs recorded, 43
+        name an attacker-supplied value or a field the adapter computes
+        rather than the marker -- a spoofed address, a reflected payload, a
+        traversal path, a boolean the harness prints. Holding a differential
+        lab to this rule would refuse four out of five of them for no gain,
+        because a predicate that does not describe the effect already fails
+        by holding on the patched side.
+        """
+        for declared in (
+            {"body_contains": '"client_ip":"20.20.20.20"'},
+            {"body_contains": "onerror=alert(1)"},
+            {"body_regex": r'"name"\s*:\s*"\.\./'},
+            {"body_contains": "EVENT_LOOP_BLOCKED"},
+            {"header": {"name": "Location", "contains": "%5C@attacker"}},
+        ):
+            with self.subTest(predicate=declared):
+                self.assertEqual(
+                    sourcegen._validate_effect_predicate(self.declared(**declared)),
+                    declared,
+                )
 
 
 class ContractPlumbingTests(unittest.TestCase):
@@ -527,21 +794,53 @@ class ContractPlumbingTests(unittest.TestCase):
         The repair rewrites plan["exploit_contract"] from its own answer, so
         it can install an unmeasurable predicate exactly as a generation
         can.
+
+        Read off the parsed module rather than off three literal spellings of
+        the call. The spellings were what this asserted, and they broke on a
+        reformatting that changed nothing about which answers are checked --
+        so the test failed where the property it names still held, which is
+        the one way a guard like this can mislead.
         """
-        self.assertEqual(
-            self.SOURCE.count('_validate_effect_predicate(generation["exploit_contract"]'),
-            2,
-        )
-        self.assertEqual(
-            self.SOURCE.count("_validate_effect_predicate(\n            generation"), 1
-        )
+        checked = [
+            node
+            for node in ast.walk(ast.parse(self.SOURCE))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_validate_effect_predicate"
+        ]
+        self.assertEqual(len(checked), 3)
+        for call in checked:
+            argument = call.args[0] if call.args else None
+            self.assertIsInstance(argument, ast.Subscript, ast.dump(call))
+            self.assertEqual(argument.value.id, "generation")
         self.assertEqual(self.SOURCE.count('plan["exploit_contract"] = generation'), 1)
+
+    def test_every_vulnerable_only_check_is_given_the_canary(self) -> None:
+        """Otherwise the rule would refuse the lab instead of its predicate.
+
+        `_vulnerable_only_substance` holds the declaration to the marker the
+        lab planted, and refuses outright when no marker reaches it -- the
+        honest answer, since nothing then says what the lab put there. That
+        makes a call site which forgets to pass one a refusal of every
+        vulnerable-only lab rather than of an unanchored predicate, and the
+        failure would read as the rule being wrong.
+        """
+        for call in [
+            node
+            for node in ast.walk(ast.parse(self.SOURCE))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_validate_effect_predicate"
+        ]:
+            named = {keyword.arg for keyword in call.keywords}
+            if "vulnerable_only" in named:
+                self.assertIn("marker", named, ast.dump(call))
 
     def test_the_validator_must_print_its_observations(self) -> None:
         validator = " ".join([
             "attack_executed", "proof_quality", "observable_effect", "evidence_type",
             "vulnerable", "patched", "differential_confirmed", "confirmed", "blocked",
-            "CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "exploit", "verify",
+            "CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "exploit", "verify", "sys.argv",
         ])
         from tests.test_sourcegen_contract import generated_files
 

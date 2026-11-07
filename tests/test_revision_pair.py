@@ -31,6 +31,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -61,6 +62,9 @@ _VALIDATOR = " ".join([
     "vulnerable", "patched", "patched_tested", "fix_status",
     "differential_confirmed", "confirmed", "blocked", "observations",
     "CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "exploit", "verify",
+    # The operator entry point: _validate_generated requires the token a
+    # script that reads its arguments cannot be written without.
+    "sys.argv",
 ])
 
 _VULNERABLE_ONLY_COMPOSE = """services:
@@ -96,7 +100,15 @@ networks:
 """
 
 
-def _generation(vulnerable_only: bool) -> dict:
+#: The canary the prompt hands the model, which a vulnerable-only answer has
+#: to name in its predicate. Read out of the instructions rather than written
+#: down here, because it is a fresh uuid per lab: a fixture cannot predict it
+#: and the real model learns it the same way, from the prompt.
+_MARKER = re.compile(r"CVELAB-[0-9a-f]{32}")
+
+
+def _generation(vulnerable_only: bool, instructions: str = "") -> dict:
+    planted = _MARKER.search(instructions)
     answer = {
         "cwe": "CWE-78",
         "confidence": 0.6,
@@ -106,16 +118,26 @@ def _generation(vulnerable_only: bool) -> dict:
             "vendor_product_started": False,
             "exercised_vendor_components": ["app/shellexec.go"],
             "simulated_components": [],
+            "trigger_source": "documented",
             "rationale": "r",
         },
         "exploit_contract": {
             "attack_summary": "a", "preconditions": [], "observable_effect": "e",
             "evidence_type": "code_execution",
+            # exploit_contract.service_port: the port the product
+            # listens on inside its container, which every answer must
+            # declare -- nothing else in a generated lab states it.
+            "service_port": 8080,
             # One answer serves the differential and the vulnerable-only
             # schema alike, so the predicate has to satisfy the stricter of
             # the two: a vulnerable-only lab has no patched build to show up
-            # a status clause standing on its own.
-            "effect_predicate": {"body_contains": "shell-ran"},
+            # a status clause standing on its own, and nothing but the canary
+            # it planted tells its effect apart from ordinary behaviour.
+            "effect_predicate": {
+                "body_contains": (
+                    f"shell-ran {planted.group()}" if planted else "shell-ran"
+                )
+            },
         },
         "docker_compose": (
             _VULNERABLE_ONLY_COMPOSE if vulnerable_only else _DIFFERENTIAL_COMPOSE
@@ -265,7 +287,10 @@ class _PairLab:
 
     def model(self, **kwargs) -> dict:
         self.schemas.append(kwargs["schema_name"])
-        return _generation(kwargs["schema"] is sourcegen.VULNERABLE_ONLY_SCHEMA)
+        return _generation(
+            kwargs["schema"] is sourcegen.VULNERABLE_ONLY_SCHEMA,
+            kwargs.get("instructions", ""),
+        )
 
     def commit_url(self, revision: str) -> str:
         return f"https://github.com/example/widget/commit/{revision}"

@@ -22,7 +22,13 @@ import unittest
 from pathlib import Path
 
 from cvelab import upload
-from cvelab.deliverables import create_deliverables
+from cvelab.deliverables import (
+    LAB_POC_GUIDE_NAME,
+    MANUAL_POC_GUIDE_NAME,
+    MANUAL_POC_NAME,
+    _write_generic_manual_assets,
+    create_deliverables,
+)
 
 
 class DeliverableContractTests(unittest.TestCase):
@@ -47,6 +53,7 @@ class DeliverableContractTests(unittest.TestCase):
                     "vendor_product_started": False,
                     "exercised_vendor_components": ["vendor parser"],
                     "simulated_components": ["downstream"],
+                    "trigger_source": "substituted",
                     "rationale": "The parser is real and the downstream is simulated.",
                 },
                 "safety": {"target_scope": "internal_docker_network_only"},
@@ -95,6 +102,13 @@ class DeliverableContractTests(unittest.TestCase):
             self.assertIn('"status": 200', report)
             self.assertIn("Fidelity level: `source_component`", report)
             self.assertIn("Product E2E verified: `False`", report)
+            # A substituted trigger has to be legible to whoever reads the
+            # documents, not only to a step that parses report.json: the two
+            # boundary bullets read the same either way.
+            walkthrough = (lab / "artifacts" / "WALKTHROUGH.md").read_text(encoding="utf-8")
+            for document in (report, walkthrough):
+                self.assertIn("- Trigger: **substituted**", document)
+                self.assertIn("not the one the evidence names", document)
             evidence = json.loads((lab / "artifacts" / "EVIDENCE.json").read_text())
             self.assertEqual(evidence["schema_version"], 1)
             self.assertEqual(evidence["validation"], validation)
@@ -335,23 +349,14 @@ class ADemotedLabsReportSaysNothingFalseTests(unittest.TestCase):
 _CURATED = "separate curated runner"
 
 
-class TheManualPocLineSaysWhatHappenedTests(unittest.TestCase):
-    """The rendered REPORT.md line, and the status EVIDENCE.json keeps.
+class _DeliveredLabHarness(unittest.TestCase):
+    """One validated lab, delivered, for the two classes below to read.
 
-    `core.run_lab` runs the handed-over actions only behind `if
-    automatic_proof`, so a run that did not prove never reaches them. That
-    non-verdict used to be folded into proof_checks["manual_poc_verified"] as
-    False; the key is now absent, and the three states are recorded in
-    report.manual_poc_status beside the checks. Reading the old key alone fell
-    through to this line's default and printed a curated runner for a lab that
-    has none and ran nothing.
-
-    The reports here are built by hand, because that is what the rendering
-    takes as input. Which of the four shapes `cvelab run` can hand it is a
-    separate question and not this line's job: create_deliverables refuses to
-    render anything at all unless the run proved, so "failed" arrives only
-    from a report.json loaded by another tool -- the verdict still has to read
-    as a failure when it does.
+    Holds no tests of its own, so it collects nothing. It is a class rather
+    than a module function because both classes below want `self.CVE` and
+    `self.addCleanup`, and because the second was briefly a subclass of the
+    first -- which ran the first's five tests a second time under the second's
+    name for no added coverage.
     """
 
     CVE = "CVE-2099-1002"
@@ -418,10 +423,34 @@ class TheManualPocLineSaysWhatHappenedTests(unittest.TestCase):
         delivered = create_deliverables(self.CVE, lab, {"ok": True, "report": report})
         self.assertTrue(delivered["ok"], delivered)
         artifacts = lab / "artifacts"
+        # Kept for the reach tests, which read the other documents this call
+        # wrote rather than only the two returned here.
+        self.lab = lab
+        self.delivered = delivered
         return (
             (artifacts / "REPORT.md").read_text(encoding="utf-8"),
             json.loads((artifacts / "EVIDENCE.json").read_text(encoding="utf-8")),
         )
+
+
+class TheManualPocLineSaysWhatHappenedTests(_DeliveredLabHarness):
+    """The rendered REPORT.md line, and the status EVIDENCE.json keeps.
+
+    `core.run_lab` runs the handed-over actions only behind `if
+    automatic_proof`, so a run that did not prove never reaches them. That
+    non-verdict used to be folded into proof_checks["manual_poc_verified"] as
+    False; the key is now absent, and the three states are recorded in
+    report.manual_poc_status beside the checks. Reading the old key alone fell
+    through to this line's default and printed a curated runner for a lab that
+    has none and ran nothing.
+
+    The reports here are built by hand, because that is what the rendering
+    takes as input. Which of the four shapes `cvelab run` can hand it is a
+    separate question and not this line's job: create_deliverables refuses to
+    render anything at all unless the run proved, so "failed" arrives only
+    from a report.json loaded by another tool -- the verdict still has to read
+    as a failure when it does.
+    """
 
     def test_a_run_that_never_reached_the_actions_says_so(self) -> None:
         report, _evidence = self.deliver({
@@ -495,6 +524,187 @@ class TheManualPocLineSaysWhatHappenedTests(unittest.TestCase):
         self.assertIn("EVIDENCE.json", upload.ALWAYS)
         self.assertIn("EVIDENCE.json", upload.REQUIRED_TO_SHARE)
         self.assertNotIn("EVIDENCE.json", upload.EXPLOIT)
+
+
+class TheLabDocumentStatesItsReachTests(_DeliveredLabHarness):
+    """What LAB-POC.md says about how far it reaches, and what it cannot show.
+
+    The defect this covers was never a crash. A reader opened a file called
+    "Manual PoC", followed it, watched it work, and learned nothing about
+    whether any of it could be pointed at the client's server -- and for most
+    labs it cannot, because the single-instance script was refused. The
+    drafter's own reason for refusing was already written, and is often the
+    best sentence in the whole record, but it lived only in report.json, which
+    nobody reads before a client meeting. These tests are about whether the
+    document the reader actually opens says it.
+
+    The harness is shared with the class above: the same hand-built reports,
+    because report.manual_poc_field is what the rendering takes as input, and
+    create_deliverables is handed the very dict core.run_lab returns -- which
+    is why none of this needed a change to core.py.
+    """
+
+    def guide(self, report_extra: dict, plan_extra: dict | None = None) -> str:
+        self.deliver(report_extra, plan_extra)
+        return (
+            self.lab / "artifacts" / LAB_POC_GUIDE_NAME
+        ).read_text(encoding="utf-8")
+
+    @staticmethod
+    def flat(text: str) -> str:
+        """The document with its line wrapping collapsed.
+
+        The emitted Markdown is hard-wrapped at about 80 columns, so a
+        sentence this file asserts on is split across a newline wherever the
+        wrap happened to land. The contract is the sentence, not the column
+        it broke at; asserting on the wrapped form would make every reflow a
+        test failure and tempt the next person to unwrap the document.
+        """
+        return " ".join(text.split())
+
+    def test_the_document_says_what_it_runs_against_before_anything_else(self) -> None:
+        """The reach is the first section, not a closing caveat.
+
+        It was the last line of the file -- "Targets are Docker service names
+        only" -- which is true, and was read by nobody, because by the time
+        the reader gets there they have already run the thing.
+        """
+        guide = self.guide({})
+
+        self.assertTrue(guide.startswith(f"# {self.CVE} Lab PoC"), guide[:80])
+        head = guide.split("## How the steps work")[0]
+        self.assertIn("## What this runs against", head)
+        self.assertIn("two Docker builds", self.flat(head))
+        self.assertIn("not an address", self.flat(head))
+        self.assertIn("be pointed at a client's server", self.flat(head))
+
+    def test_a_refused_single_instance_script_carries_the_drafters_reason(self) -> None:
+        """The whole point: the sentence that stops someone overclaiming."""
+        reason = (
+            "A stock containerd daemon serves no HTTP route that reports its "
+            "root directory permissions."
+        )
+        guide = self.guide({"manual_poc_field": {"shipped": False, "reason": reason}})
+
+        self.assertIn("There is **no** single-instance script for this lab", self.flat(guide))
+        self.assertIn("recorded why", self.flat(guide))
+        self.assertIn("> " + reason, guide)
+        self.assertIn("be pointed at a server you did not build here", self.flat(guide))
+        # And it does not advertise an artifact this lab does not have.
+        self.assertNotIn(MANUAL_POC_NAME, guide)
+
+    def test_a_multi_line_reason_stays_inside_the_quote(self) -> None:
+        """A blank line in the prose would end the blockquote.
+
+        The rest of the drafter's sentence would then render as body text,
+        reading as CVELab's own claim rather than as the reason a script was
+        refused -- the opposite of what quoting it is for.
+        """
+        guide = self.guide({"manual_poc_field": {
+            "shipped": False,
+            "reason": "The effect is internal.\n\nOnly the lab's adapter reports it.",
+        }})
+
+        self.assertIn("> The effect is internal.", guide)
+        self.assertIn("> Only the lab's adapter reports it.", guide)
+        for line in guide.splitlines():
+            if "adapter reports it" in line:
+                self.assertTrue(line.startswith(">"), line)
+
+    def test_a_step_never_asked_for_is_not_reported_as_a_refusal(self) -> None:
+        """"not requested" is core.py's own default, not a drafter's verdict.
+
+        Rendering it as a refusal would attribute to the model a judgement it
+        was never asked to make, and would tell the reader the effect cannot
+        be shown against a live instance when nobody has yet looked.
+        """
+        guide = self.guide(
+            {"manual_poc_field": {"shipped": False, "reason": "not requested"}}
+        )
+
+        self.assertIn("because one was never asked for", self.flat(guide))
+        self.assertIn("--manual-poc", self.flat(guide))
+        self.assertNotIn("not requested", self.flat(guide))
+        self.assertNotIn("tried to write one", self.flat(guide))
+
+    def test_a_shipped_script_is_named_so_the_reader_can_find_it(self) -> None:
+        guide = self.guide({"manual_poc_field": {"shipped": True, "reason": None}})
+
+        self.assertIn("**does** exist", self.flat(guide))
+        self.assertIn(MANUAL_POC_NAME, guide)
+        self.assertIn(MANUAL_POC_GUIDE_NAME, guide)
+        self.assertIn("stayed silent on the fixed one", self.flat(guide))
+
+    def test_a_vulnerable_only_lab_claims_no_differential_it_never_had(self) -> None:
+        """One build, so nothing can have "stayed silent on the fixed one"."""
+        guide = self.guide(
+            {"manual_poc_field": {"shipped": True, "reason": None}},
+            {"lab_type": "VULNERABLE_ONLY_REPRODUCTION",
+             "revisions": {"vulnerable": "a" * 40, "patched": None}},
+        )
+
+        self.assertIn("The one Docker build in this lab directory", self.flat(guide))
+        self.assertIn("no fixed revision to compare against", self.flat(guide))
+        self.assertNotIn("stayed silent on the fixed one", self.flat(guide))
+        self.assertNotIn("two Docker builds", self.flat(guide))
+
+    def test_a_report_with_no_record_at_all_claims_neither_way(self) -> None:
+        """A plan.json `runner` lab never attempts one, and is not a refusal.
+
+        core.shipyard_report carries no manual-PoC key of any kind, so the
+        field is absent rather than False. Saying "CVELab tried and refused"
+        for one would invent a verdict out of a missing key.
+        """
+        guide = self.guide({})
+
+        self.assertIn("kept no record of a single-instance script either way", self.flat(guide))
+        self.assertNotIn("tried to write one", self.flat(guide))
+        self.assertNotIn("**does** exist", self.flat(guide))
+
+    def test_a_script_on_disk_is_believed_over_a_report_that_lacks_the_field(self) -> None:
+        """An archived lab re-rendered by `cvelab deliverables` still reads true.
+
+        field.write_manual_poc runs as run_lab's after_validation callback,
+        before create_deliverables, so by the time the document is written the
+        script is already on disk. Trusting disk first keeps the document
+        honest about what the reader actually has, even for a report written
+        before manual_poc_field existed. The report here carries no such
+        field, so only the file can answer; without it this is the "no record"
+        case above.
+        """
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        lab = Path(temporary.name) / self.CVE
+        artifacts = lab / "artifacts"
+        artifacts.mkdir(parents=True)
+        (artifacts / MANUAL_POC_NAME).write_text("# shipped\n", encoding="utf-8")
+
+        _write_generic_manual_assets(self.CVE, lab, artifacts, False, {})
+        guide = (artifacts / LAB_POC_GUIDE_NAME).read_text(encoding="utf-8")
+
+        self.assertIn("**does** exist", self.flat(guide))
+        self.assertNotIn("kept no record", self.flat(guide))
+
+    def test_the_walkthrough_points_at_the_document_by_its_new_name(self) -> None:
+        """WALKTHROUGH.md is the other document a reader takes to a client."""
+        self.deliver({})
+        walkthrough = (
+            self.lab / "artifacts" / "WALKTHROUGH.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(LAB_POC_GUIDE_NAME, walkthrough)
+        self.assertNotIn("MANUAL-POC.md", walkthrough)
+        self.assertIn("reach this lab's own two builds", self.flat(walkthrough))
+
+    def test_the_returned_deliverables_name_the_renamed_document(self) -> None:
+        """autoflow and the CLI print these paths; a stale key would 404."""
+        self.deliver({})
+
+        self.assertEqual(
+            self.delivered["deliverables"]["manual_guide"],
+            str(self.lab / "artifacts" / LAB_POC_GUIDE_NAME),
+        )
+        self.assertFalse((self.lab / "artifacts" / "MANUAL-POC.md").exists())
 
 
 if __name__ == "__main__":

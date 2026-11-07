@@ -94,7 +94,8 @@ class FidelityReadNotRunTests(unittest.TestCase):
     def fidelity(self, component: str) -> dict:
         return {
             "execution_level": "source_component", "vendor_product_started": False,
-            "exercised_vendor_components": [component], "simulated_components": [], "rationale": "r",
+            "exercised_vendor_components": [component], "simulated_components": [],
+            "trigger_source": "documented", "rationale": "r",
         }
 
     def test_a_component_read_as_text_is_refused(self) -> None:
@@ -128,6 +129,9 @@ VALIDATOR = " ".join([
     "attack_executed", "proof_quality", "observable_effect", "evidence_type", "vulnerable",
     "patched", "differential_confirmed", "confirmed", "blocked", "observations",
     "CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "exploit", "verify",
+    # The operator entry point: _validate_generated requires the token a
+    # script that reads its arguments cannot be written without.
+    "sys.argv",
 ])
 REQUIRED = [
     {"path": "docker-compose.yml", "content": COMPOSE},

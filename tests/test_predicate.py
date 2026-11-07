@@ -235,6 +235,64 @@ class PlainMappingTests(unittest.TestCase):
             self.assertNotIn(forbidden, source, forbidden)
 
 
+class QuotedValueTests(unittest.TestCase):
+    """Which clauses name a value something in particular introduced.
+
+    A caller with no second build to compare against asks this instead of
+    asking the comparison, so the question is about the declaration and not
+    about a response. Nothing here decides whether an effect happened.
+    """
+
+    CANARY = "CVELAB-0123456789abcdef0123456789abcdef"
+
+    def test_status_is_not_a_quoting_kind(self) -> None:
+        """The absence is the content of QUOTING, so it is asserted.
+
+        A status code comes from a vocabulary the service answers from on
+        every build; no status list can name a value the attack supplied.
+        """
+        self.assertEqual(predicate.QUOTING, ("body_contains", "body_regex", "header"))
+        self.assertNotIn("status", predicate.QUOTING)
+        self.assertEqual(
+            predicate.quotes({"status": [200], "body_contains": self.CANARY}, self.CANARY),
+            ["body_contains"],
+        )
+
+    def test_every_text_bearing_kind_can_quote(self) -> None:
+        self.assertEqual(
+            predicate.quotes(
+                {
+                    "body_contains": f"note={self.CANARY}",
+                    "body_regex": rf"note=\s*{self.CANARY}",
+                    "header": {"name": "Set-Cookie", "contains": f"s={self.CANARY}"},
+                },
+                self.CANARY,
+            ),
+            ["body_contains", "body_regex", "header"],
+        )
+
+    def test_a_header_name_does_not_quote(self) -> None:
+        """Only the observed value can carry what the attack introduced."""
+        self.assertEqual(
+            predicate.quotes({"header": {"name": self.CANARY, "contains": "x"}}, self.CANARY),
+            [],
+        )
+
+    def test_nothing_quotes_a_value_there_is_none_of(self) -> None:
+        """An absent canary quotes nothing, rather than everything."""
+        for absent in (None, "", "  ", 200):
+            with self.subTest(value=repr(absent)):
+                self.assertEqual(
+                    predicate.quotes({"body_contains": "anything"}, absent), []
+                )
+
+    def test_a_clause_whose_declaration_is_not_text_is_left_out(self) -> None:
+        """For the reason `_text` refuses to coerce a status into a body."""
+        self.assertEqual(predicate.quoted_texts({"body_contains": 200}), {})
+        self.assertEqual(predicate.quoted_texts({"header": {"name": "X", "contains": 1}}), {})
+        self.assertEqual(predicate.quoted_texts({"header": "Set-Cookie"}), {})
+
+
 class ShippedContractTests(unittest.TestCase):
     """The predicates this project publishes as examples still decide."""
 

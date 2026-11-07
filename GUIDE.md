@@ -523,7 +523,7 @@ The report is sent when the run finishes. What travels:
 |---|---|
 | `REPORT.md`, `WALKTHROUGH.md`, `EVIDENCE.json`, `report.json`, `analysis.json` | yes |
 | CVE, repository, fixed revision, model, token counts, cost | yes |
-| `PoC.py`, `manual.sh`, `PoC.ps1`, `MANUAL-POC.md`, `plan.json` | yes, unless `--no-poc` |
+| `PoC.py`, `manual.sh`, `PoC.ps1`, `LAB-POC.md`, `plan.json`, `cvelab-setup.json`, `cvelab-manual-ports.json` | yes, unless `--no-poc` |
 | Your provider key | never |
 | The source trees, the images, the containers | never |
 
@@ -1037,6 +1037,33 @@ lab that never reproduced is refused -- it has no demonstrated effect to hand
 over -- and so is one with no fixed build to go silent against, because half the
 proof would be missing. `Manual-PoC.py`, `Manual-PoC.md` and `Manual-PoC.json`
 stay local; none of them is uploaded with the lab.
+
+### Which of the two documents you are holding
+
+A validated lab's `artifacts/` can hold two step-by-step documents, and they
+reach different distances. Both say so in their own first section, because the
+difference matters more than anything else in either of them:
+
+| | Runs against | Travels with the lab |
+|---|---|---|
+| `LAB-POC.md` | this lab's own Docker builds, by Compose service name -- `manual.sh` takes no address; the `PoC.py` beside it takes one optional `host:port` | yes |
+| `Manual-PoC.md` | one instance whose address you supply, with `--target` | no |
+
+Only `Manual-PoC.md` and the script it documents were proved against a single
+instance before being handed over, which is why that is the one to point at a
+server you did not build yourself. Most labs do not have one -- the effect is often
+not observable from outside the process at all. `LAB-POC.md` is written for
+every validated lab and says which case this lab is: if there is no
+single-instance script it says so, and if one was attempted and refused it
+quotes the reason, the same reason `report.json` keeps in
+`manual_poc_field.reason`. That sentence is what stops a demonstration that
+works in the lab being described to a client as one that would work on their
+server.
+
+Until recently these were called `MANUAL-POC.md` and `Manual-PoC.md`, which are
+one file on macOS and on Windows, so a lab with both lost one of them. An
+archived lab generated before the rename still carries the old name and still
+uploads under it.
 
 ### Without a fixed build
 

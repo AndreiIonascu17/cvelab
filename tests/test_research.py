@@ -327,6 +327,9 @@ VALIDATOR = " ".join([
     "attack_executed", "proof_quality", "observable_effect", "evidence_type", "vulnerable",
     "patched", "differential_confirmed", "confirmed", "blocked", "observations",
     "CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "exploit", "verify",
+    # The operator entry point: _validate_generated requires the token a
+    # script that reads its arguments cannot be written without.
+    "sys.argv",
 ])
 COMPOSE = """services:
   vulnerable:
@@ -352,11 +355,16 @@ def generation(adapter: list[dict]) -> dict:
         "cwe": "CWE-384", "confidence": 0.5, "rationale": "r",
         "fidelity": {
             "execution_level": "source_component", "vendor_product_started": False,
-            "exercised_vendor_components": ["session"], "simulated_components": [], "rationale": "r",
+            "exercised_vendor_components": ["session"], "simulated_components": [],
+            "trigger_source": "documented", "rationale": "r",
         },
         "exploit_contract": {
             "attack_summary": "a", "preconditions": [], "observable_effect": "e",
             "evidence_type": "data_exposure",
+            # exploit_contract.service_port: the port the product
+            # listens on inside its container, which every answer must
+            # declare -- nothing else in a generated lab states it.
+            "service_port": 8080,
             "effect_predicate": {"body_contains": "session-token"},
         },
         "docker_compose": COMPOSE, "dockerignore": "", "vulnerable_dockerfile": "FROM scratch\n",
