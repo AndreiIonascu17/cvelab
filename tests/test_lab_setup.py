@@ -769,7 +769,15 @@ class ThePromptTests(unittest.TestCase):
         shown = _example_from(sourcegen._SETUP_CONTRACT)
         self.assertEqual(shown[0]["extract"], {"header": "X-CSRF-Token"})
         self.assertIn("{{csrfToken}}", json.dumps(shown[1:]))
-        self.assertIn("victim", json.dumps(shown[2]))
+        # The third step spends the binding on a second request rather than
+        # only on the login, which is the form that has never arrived. Pinned
+        # by what the step does -- a second account, created with the bound
+        # token -- and not by the account's name: that name is incidental and
+        # pinning it made this test fail for a rewording that changed no
+        # behaviour at all.
+        self.assertEqual(shown[2]["method"], "POST")
+        self.assertIn("{{csrfToken}}", json.dumps(shown[2]["headers"]))
+        self.assertIn("username", json.dumps(shown[2]["body"]))
 
     def test_it_names_the_declared_input_beside_the_example(self) -> None:
         self.assertIn('inputs is ["csrfToken"]', sourcegen._SETUP_CONTRACT)
