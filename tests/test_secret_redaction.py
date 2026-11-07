@@ -155,8 +155,15 @@ class SecretRedactionTests(unittest.TestCase):
                     sourcegen.repair_source_lab(
                         "CVE-2026-0001", root, failure, 1, "key", "model", "openai", None
                     )
-        self.assertNotIn(SENTINEL, sent["input_text"])
-        self.assertIn("[REDACTED]", sent["input_text"])
+        # The whole user turn, both halves: the stable context goes in
+        # input_text and the failure diagnostic in input_suffix, so that the
+        # first can carry a cache breakpoint. A secret must be absent from
+        # what the provider receives, which is their concatenation -- asserting
+        # on one parameter would pass while the other leaked.
+        whole = sent["input_text"] + sent.get("input_suffix", "")
+        self.assertNotIn(SENTINEL, whole)
+        self.assertIn("[REDACTED]", whole)
+        self.assertNotIn(SENTINEL, sent["instructions"])
 
     def test_short_values_are_not_registered(self) -> None:
         # Redacting a short string would mangle ordinary text instead of

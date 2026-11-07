@@ -2679,7 +2679,8 @@ def generate_source_lab(
                     "directory, so initialize a local repository without a remote only when the build requires it. "
                     "Healthchecks must verify the final application route and must not accept redirects as healthy."
                 ),
-                input_text=context + feedback_suffix + refused,
+                input_text=context,
+                input_suffix=feedback_suffix + refused,
                 provider=provider,
                 base_url=base_url,
             )
@@ -2878,7 +2879,8 @@ def generate_source_lab(
                 "copy, labels carrying their own name, package versions and commit ids; the adapter runs unchanged "
                 "in both and must never compare against the variant name."
             ),
-            input_text=context + feedback_suffix + refused,
+            input_text=context,
+            input_suffix=feedback_suffix + refused,
             provider=provider,
             base_url=base_url,
         )
@@ -3196,9 +3198,9 @@ def repair_source_lab(
                 + _SETUP_CONTRACT
                 + variant_contract
             ),
-            input_text=(
-                context
-                + "\n\n--- FAILED ADAPTER ---\n"
+            input_text=context,
+            input_suffix=(
+                "\n\n--- FAILED ADAPTER ---\n"
                 + current
                 + "\n\n--- OBSERVED FAILURE (AUTOMATIC ATTEMPT "
                 + str(attempt)

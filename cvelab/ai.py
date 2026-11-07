@@ -415,33 +415,82 @@ def _validate_schema(value: object, schema: dict, path: str = "$") -> None:
 #: asked of two providers, was being sampled under two different regimes and
 #: nothing said so.
 #:
-#: WHY THE DEFAULT IS STILL "SEND NONE"
+#: WHY THE DEFAULT IS ZERO
 #:
-#: Not because pinning it would break the re-ask loops. That was the first
-#: answer here and it was wrong, so it is written down: nothing in this
-#: project re-asks a byte-identical prompt and hopes for a different sample.
-#: `sourcegen._answer_until_valid` appends the refusal it received before
-#: asking again, the repair prompts carry their own feedback suffix, the
-#: decline fallback asks a different model, and the output escalation changes
-#: only the budget. Every retry already differs by construction, so a pinned
-#: temperature would not starve any of them.
+#: Safe with the re-asks, which was the first worry and was wrong: nothing in
+#: this project re-asks a byte-identical prompt and hopes for a different
+#: sample. `sourcegen._answer_until_valid` appends the refusal it received
+#: before asking again, the repair prompts carry their own feedback suffix,
+#: the decline fallback asks a different model, and the output escalation
+#: changes only the budget. Every retry differs by construction.
 #:
-#: The default is "send none" because changing it changes every run on every
-#: provider, including the zero chat-completions has always sent, and that is
-#: a decision for whoever is measuring rather than a side effect of adding
-#: the knob. Pin it for a run whose point is reproducibility.
+#: Worth having because the alternative was measured. The same ten CVEs, run
+#: six times with no code change between them, validated 6, 4, 3, 3, 2, 1, 1,
+#: 0, 0 and 0 times out of six -- one entry every time, three never, and six
+#: closer to a coin toss. Two runs three hours apart on one binary declined 2
+#: and 6 of ten. A rate measured that way is a draw from a distribution, and
+#: the first step to narrowing it is to stop leaving the sampling to whatever
+#: each provider happens to default to.
+#:
+#: Zero is not determinism -- batching and kernel scheduling keep a run from
+#: repeating exactly -- and it is not free: a model held at zero can be worse
+#: at long structured generation than one allowed to wander. Which way that
+#: lands here is measurable and is not yet measured, so CVELAB_TEMPERATURE=
+#: default sends none and gives each provider's own behaviour back.
 TEMPERATURE_VARIABLE = "CVELAB_TEMPERATURE"
+
+#: Whether to mark the stable half of a request as cacheable.
+#:
+#: Caching here is a prefix match, so it pays only where two requests share a
+#: prefix within the entry's lifetime. CVELab's do: `_answer_until_valid` and
+#: every repair re-ask the same lab, appending their feedback to the END of
+#: the user turn while the context in front of it -- the dossier, the fix's
+#: diff, the file excerpts, which is the great bulk of the tokens -- stays
+#: byte-identical. Measured over 205 archived labs: a median of 9 model calls
+#: each, and only 14% made a single call.
+#:
+#: At a 5-minute TTL a write costs 1.25x and a read 0.1x, so two calls break
+#: even and the median lab pays 1.25 + 8x0.1 = 2.05 instead of 9.0 -- a 77%
+#: cut on input tokens, which are most of the bill: on one measured entry
+#: 33,005 input against 12,365 output. The 14% that ask once pay 25% more on
+#: the cheapest requests there are.
+#:
+#: The 5-minute TTL rather than the hour: entries of a batch run two at a
+#: time and each call starts minutes after the last, so every read refreshes
+#: the timer, and the hour's doubled write price would buy nothing.
+#:
+#: Only the messages dialect takes it. The system block is deliberately NOT
+#: the breakpoint: a breakpoint caches everything rendered before it, so the
+#: one on the stable user block already covers tools and system, and the
+#: system block holds a per-lab canary that would make a cross-lab entry miss
+#: anyway.
+CACHE_VARIABLE = "CVELAB_PROMPT_CACHE"
+
+
+def prompt_cache_enabled() -> bool:
+    """Whether a cache breakpoint is placed on the stable half of the turn."""
+    return os.getenv(CACHE_VARIABLE, "").strip().lower() not in ("off", "0", "no", "false")
+
+
+#: Values that mean "send no temperature at all", as every dialect but
+#: chat-completions did before this existed.
+PROVIDER_CHOICE = ("default", "provider", "off", "none", "unset")
 
 
 def temperature_setting() -> float | None:
     """The temperature to send, or None to let the provider choose."""
     raw = os.getenv(TEMPERATURE_VARIABLE, "").strip()
-    if not raw:
+    if raw.lower() in PROVIDER_CHOICE:
         return None
+    if not raw:
+        return 0.0
     try:
         value = float(raw)
     except ValueError:
-        return None
+        # An unreadable setting falls back to the default rather than
+        # raising: a run is worth more than a complaint about a stray
+        # environment variable.
+        return 0.0
     # The range every dialect here accepts. Out-of-range would be refused by
     # the endpoint, which is a worse way to find out.
     return min(2.0, max(0.0, value))
@@ -510,6 +559,28 @@ def _openai_response(
     raise RuntimeError("OpenAI response did not contain structured output")
 
 
+def _user_turn(stable: str, volatile: str) -> list[dict] | str:
+    """The user turn, split so the part that repeats can be cached.
+
+    A plain string when there is nothing to split or caching is off, which is
+    the request shape this dialect has always sent. Otherwise two text blocks
+    with the breakpoint on the first: everything rendered before it -- tools,
+    system, and this block -- is what a later re-ask reads back, and the
+    feedback that made it a re-ask sits in the second block, after the
+    breakpoint, where it cannot invalidate anything.
+    """
+    if not prompt_cache_enabled():
+        return stable + volatile
+    blocks: list[dict] = [{
+        "type": "text",
+        "text": stable,
+        "cache_control": {"type": "ephemeral"},
+    }]
+    if volatile:
+        blocks.append({"type": "text", "text": volatile})
+    return blocks
+
+
 def _anthropic_response(
     api_key: str,
     model: str,
@@ -520,6 +591,7 @@ def _anthropic_response(
     tools: list[dict] | None,
     timeout_seconds: int | None = None,
     temperature: float | None = None,
+    input_suffix: str = "",
 ) -> dict:
     compatible_schema = _anthropic_compatible_schema(schema)
     effort = os.getenv("CVELAB_ANTHROPIC_EFFORT", "low").lower()
@@ -531,7 +603,7 @@ def _anthropic_response(
         "model": model,
         "max_tokens": max_output_tokens,
         "system": instructions,
-        "messages": [{"role": "user", "content": input_text}],
+        "messages": [{"role": "user", "content": _user_turn(input_text, input_suffix)}],
         "output_config": {
             "effort": effort,
             "format": {"type": "json_schema", "schema": compatible_schema},
@@ -691,6 +763,7 @@ def structured_response(
     provider: str | None = None,
     base_url: str | None = None,
     temperature: float | None = None,
+    input_suffix: str = "",
 ) -> dict:
     selected = resolve_provider(provider)
     api_key = _provider_key(selected, api_key)
@@ -725,18 +798,21 @@ def structured_response(
     def ask(budget: int, seconds: int, which: str) -> dict:
         if provider.dialect == RESPONSES:
             return _openai_response(
-                api_key or "", which, instructions, input_text, schema, schema_name,
-                budget, tools, include, seconds, temperature=chosen,
+                api_key or "", which, instructions, input_text + input_suffix,
+                schema, schema_name, budget, tools, include, seconds,
+                temperature=chosen,
             )
         if provider.dialect == MESSAGES:
             return _anthropic_response(
                 api_key or "", which, instructions, input_text, schema,
                 budget, tools, seconds, temperature=chosen,
+                input_suffix=input_suffix,
             )
         if provider.dialect == CHAT_COMPLETIONS:
             return _chat_completions_response(
-                selected, api_key, base_url, which, instructions, input_text,
-                schema, schema_name, budget, seconds, temperature=chosen,
+                selected, api_key, base_url, which, instructions,
+                input_text + input_suffix, schema, schema_name, budget, seconds,
+                temperature=chosen,
             )
         raise RuntimeError(f"No handler for dialect {provider.dialect!r}")
 

@@ -51,6 +51,13 @@ class Totals:
     input_tokens: int = 0
     output_tokens: int = 0
     cached_input_tokens: int = 0
+    #: Tokens written to a cache, which cost MORE than an ordinary input
+    #: token, not less. Counted separately from the reads because the two
+    #: move a cost estimate in opposite directions: without the writes, a run
+    #: that caches reports less than it spent, and a benchmark that publishes
+    #: a spend figure cannot be allowed to drift low when a feature is turned
+    #: on.
+    cache_write_input_tokens: int = 0
     models: set[str] = field(default_factory=set)
     #: Requests the provider declined under its usage policy, by the category
     #: it named. Counted because a benchmark has to tell a run that was
@@ -80,8 +87,12 @@ def note_decline(category: object) -> None:
         _totals.declines.append(str(category or "unnamed"))
 
 
-def _extract(provider: str, payload: dict) -> tuple[int, int, int]:
-    """Return (input, output, cached) for one provider payload."""
+def _extract(provider: str, payload: dict) -> tuple[int, int, int, int]:
+    """Return (input, output, cache reads, cache writes) for one payload.
+
+    Only the messages dialect reports writes; the others leave that zero,
+    which is correct for them -- CVELab places no breakpoint there.
+    """
     usage = payload.get("usage") or {}
     dialect = get_provider(provider).dialect if provider in PROVIDERS else CHAT_COMPLETIONS
     if dialect == MESSAGES:
@@ -89,6 +100,7 @@ def _extract(provider: str, payload: dict) -> tuple[int, int, int]:
             int(usage.get("input_tokens") or 0),
             int(usage.get("output_tokens") or 0),
             int(usage.get("cache_read_input_tokens") or 0),
+            int(usage.get("cache_creation_input_tokens") or 0),
         )
     if dialect == RESPONSES:
         details = usage.get("input_tokens_details") or {}
@@ -96,6 +108,7 @@ def _extract(provider: str, payload: dict) -> tuple[int, int, int]:
             int(usage.get("input_tokens") or 0),
             int(usage.get("output_tokens") or 0),
             int(details.get("cached_tokens") or 0),
+            0,
         )
     # The chat/completions shape. Many local servers report nothing at all; a
     # missing count is zero, not an error. DeepSeek additionally reports cache
@@ -104,16 +117,18 @@ def _extract(provider: str, payload: dict) -> tuple[int, int, int]:
         int(usage.get("prompt_tokens") or 0),
         int(usage.get("completion_tokens") or 0),
         int(usage.get("prompt_cache_hit_tokens") or 0),
+        0,
     )
 
 
 def record(provider: str, model: str | None, payload: dict) -> None:
-    input_tokens, output_tokens, cached = _extract(provider, payload)
+    input_tokens, output_tokens, cached, written = _extract(provider, payload)
     with _lock:
         _totals.calls += 1
         _totals.input_tokens += input_tokens
         _totals.output_tokens += output_tokens
         _totals.cached_input_tokens += cached
+        _totals.cache_write_input_tokens += written
         if model:
             _totals.models.add(model)
 
@@ -143,8 +158,15 @@ def estimate_cost(totals: Totals | None = None) -> float | None:
         if price is None:
             return None
     per_input, per_output = price
+    # The published multipliers for the five-minute TTL: a cache write costs
+    # 1.25x an ordinary input token and a read 0.1x. Reads used to be priced
+    # at zero here, which was close enough while nothing wrote to a cache and
+    # wrong in the cheap direction the moment something did.
     return (
-        totals.input_tokens * per_input + totals.output_tokens * per_output
+        totals.input_tokens * per_input
+        + totals.cache_write_input_tokens * per_input * 1.25
+        + totals.cached_input_tokens * per_input * 0.1
+        + totals.output_tokens * per_output
     ) / 1_000_000
 
 
@@ -155,6 +177,7 @@ def snapshot() -> Totals:
             input_tokens=_totals.input_tokens,
             output_tokens=_totals.output_tokens,
             cached_input_tokens=_totals.cached_input_tokens,
+            cache_write_input_tokens=_totals.cache_write_input_tokens,
             models=set(_totals.models),
             declines=list(_totals.declines),
         )
@@ -168,6 +191,7 @@ def as_dict() -> dict:
         "input_tokens": totals.input_tokens,
         "output_tokens": totals.output_tokens,
         "cached_input_tokens": totals.cached_input_tokens,
+        "cache_write_input_tokens": totals.cache_write_input_tokens,
         "total_tokens": totals.total_tokens,
         "models": sorted(totals.models),
     }
