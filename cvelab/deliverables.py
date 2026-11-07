@@ -89,6 +89,17 @@ def _fidelity(plan: dict) -> dict:
     }
 
 
+#: The lab types that built the vendor's own source, as against a synthetic
+#: class model. Two sentences are decided on this -- whether a PoC is emitted
+#: at all, and whether the documents call the lab a vendor-source
+#: reproduction -- and they were two copies of the same three names. A type
+#: added to one and not the other would ship a source lab that described
+#: itself as synthetic, or refuse a PoC for a lab the documents then described.
+_SOURCE_BACKED = frozenset({
+    "SOURCE_REPRODUCTION", "END_TO_END_REPRODUCTION",
+    "VULNERABLE_ONLY_REPRODUCTION",
+})
+
 #: What the Manual PoC line of REPORT.md says, per report.manual_poc_status.
 #: "verified" and "failed" render as the boolean they replaced, so a real
 #: verdict reads exactly as it did before the third state existed.
@@ -301,11 +312,7 @@ def create_deliverables(
     fidelity_record = _fidelity(plan)
     real_poc_verified = (
         result.get("ok") is True
-        and plan.get("lab_type")
-        in {
-            "SOURCE_REPRODUCTION", "END_TO_END_REPRODUCTION",
-            "VULNERABLE_ONLY_REPRODUCTION",
-        }
+        and plan.get("lab_type") in _SOURCE_BACKED
         and report.get("real_poc_verified") is True
         and validation.get("attack_executed") is True
         and validation.get("proof_quality") in {
@@ -350,25 +357,21 @@ def create_deliverables(
     poc_path = artifacts / "PoC.py"
     write_text(poc_path, poc_header + validator)
     poc_name = "PoC.py"
-    _write_generic_manual_assets(
-        cve,
-        lab_dir,
-        artifacts,
-        plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION",
-    )
+    # Read once rather than per sentence. It was asked of the plan here and
+    # then again below, which is one expression to keep in step with itself
+    # for no gain: the manual assets and the prose have to agree about which
+    # lab this is or the kit describes a patched side the documents deny.
+    vulnerable_only = plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION"
+    _write_generic_manual_assets(cve, lab_dir, artifacts, vulnerable_only)
     write_text(artifacts / "plan.json", json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
 
     source_note = (
         "This is a vendor-source reproduction using the revisions recorded below. "
         "Its fidelity level is recorded separately and must not be inferred from source use alone."
-        if plan["lab_type"] in {
-            "SOURCE_REPRODUCTION", "END_TO_END_REPRODUCTION",
-            "VULNERABLE_ONLY_REPRODUCTION",
-        }
+        if plan["lab_type"] in _SOURCE_BACKED
         else "This is a synthetic CWE-class demonstration, not a vendor-source reproduction."
     )
     revisions = plan.get("revisions", {})
-    vulnerable_only = plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION"
     # Two different labs wear the same lab_type, and every sentence below that
     # says why there is no patched side has to tell them apart. A demoted lab
     # did identify a fixed revision -- sourcegen resolved it, read its diff,
@@ -380,23 +383,34 @@ def create_deliverables(
     demoted = vulnerable_only and bool(demotion)
     demotion_reason = demotion.get("reason") or "the pair could not show the fix"
     rejected_fixed = demotion.get("rejected_fixed")
+    # The revision as every sentence names it. A demotion that recorded no
+    # revision still has to be nameable, because the point of the sentence is
+    # that one was identified.
+    named_fix = rejected_fixed or "unrecorded"
+    # The clause that says what happened to it, in one place.
+    #
+    # The reason ends with the remedy, so it goes last in whatever sentence
+    # carries it, introduced by a colon. Three sentences carry it -- the scope
+    # note of both documents, the report's interpretation of its own status,
+    # and its remediation status -- and all three held a verbatim copy of it
+    # under a comment saying there was one place to change the wording. There
+    # was not: a reworded copy would have had the same lab answer the question
+    # two ways in one deliverable.
+    discarded_fix = (
+        f"A fixed revision (`{named_fix}`) was identified and then discarded: "
+        f"{demotion_reason}."
+    )
     # What stands in the Patched row of both documents. revisions.patched is
     # null for a demoted lab too, so the row fell through to "no public fixed
     # revision identified" -- which denies the very reference the row exists
     # to show.
     discarded_revision = (
-        f"{rejected_fixed or 'unrecorded'} (identified, then discarded as unusable)"
-        if demoted
-        else None
+        f"{named_fix} (identified, then discarded as unusable)" if demoted else None
     )
     if demoted:
-        # The reason ends with the remedy, so it goes last in whatever
-        # sentence carries it, introduced by a colon. Every one of these
-        # reads the same field, so there is one place to change the wording.
         source_note = (
             "This is a vendor-source vulnerable-only reproduction, so no patched behavior "
-            f"is claimed. A fixed revision (`{rejected_fixed or 'unrecorded'}`) was "
-            f"identified and then discarded: {demotion_reason}."
+            f"is claimed. {discarded_fix}"
         )
     elif vulnerable_only:
         source_note = (
@@ -460,6 +474,15 @@ def create_deliverables(
         f"Execution level: `{fidelity_record.get('execution_level', 'unknown')}`. "
         f"Vendor product started: `{fidelity_record.get('vendor_product_started', False)}`. "
         f"{fidelity_record.get('rationale', analyst_fidelity)}"
+    )
+    # Where the lab stops being the vendor's own code, as both documents say
+    # it. One pair of bullets rather than two identical ones: this is the
+    # boundary a reader is entitled to rely on, and a walkthrough naming
+    # different components from the report beside it would make the claim
+    # unreadable rather than merely untidy.
+    boundary = (
+        f"- Exercised vendor components: `{_evidence(fidelity_record.get('exercised_vendor_components', []))}`\n"
+        f"- Simulated components: `{_evidence(fidelity_record.get('simulated_components', []))}`"
     )
     walkthrough = f"""# {cve} Walkthrough
 
@@ -525,8 +548,7 @@ For an inspectable, step-by-step reproduction that keeps the lab running, follow
 
 {fidelity}
 
-- Exercised vendor components: `{_evidence(fidelity_record.get('exercised_vendor_components', []))}`
-- Simulated components: `{_evidence(fidelity_record.get('simulated_components', []))}`
+{boundary}
 """
     write_text(artifacts / "WALKTHROUGH.md", walkthrough)
 
@@ -548,9 +570,7 @@ For an inspectable, step-by-step reproduction that keeps the lab running, follow
         status_meaning = (
             "`REAL_VULNERABLE_ONLY_POC_VALIDATED` means the recorded vulnerable upstream "
             "revision executed the declared security-sensitive path inside the isolated lab. "
-            "No patched behavior is claimed. A fixed revision "
-            f"(`{rejected_fixed or 'unrecorded'}`) was identified and then discarded: "
-            f"{demotion_reason}."
+            f"No patched behavior is claimed. {discarded_fix}"
         )
     elif vulnerable_only:
         status_meaning = (
@@ -586,9 +606,8 @@ For an inspectable, step-by-step reproduction that keeps the lab running, follow
             # fixing reference resolved to the commit that carries the fix.
             remediation = (
                 "Re-run differential validation once the fixing reference resolves to the "
-                "commit that carries the fix; there is nothing to wait for. A fixed revision "
-                f"(`{rejected_fixed or 'unrecorded'}`) was identified and then discarded: "
-                f"{demotion_reason}."
+                "commit that carries the fix; there is nothing to wait for. "
+                f"{discarded_fix}"
                 if demoted
                 else "No public fixed revision was identified at generation time. Re-run "
                 "differential validation when a fix becomes public."
@@ -665,8 +684,7 @@ For an inspectable, step-by-step reproduction that keeps the lab running, follow
 
 - Execution level: `{fidelity_record.get('execution_level', 'unknown')}`
 - Vendor product started: `{fidelity_record.get('vendor_product_started', False)}`
-- Exercised vendor components: `{_evidence(fidelity_record.get('exercised_vendor_components', []))}`
-- Simulated components: `{_evidence(fidelity_record.get('simulated_components', []))}`
+{boundary}
 - Boundary: {fidelity_record.get('rationale', 'Not recorded.')}
 
 ## Remediation status

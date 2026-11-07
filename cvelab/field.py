@@ -59,7 +59,6 @@ import os
 import re
 import shutil
 import subprocess
-import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -69,11 +68,12 @@ from .ai import ProviderDeclined, ai_is_configured, structured_response
 from .closed import (
     DEFAULT_HEALTH_TIMEOUT,
     MAX_HEALTH_TIMEOUT,
-    _apply_fixture,
     _docker,
     _seconds,
     _validate_fixture,
-    _wait_ready,
+    check_lab_arguments,
+    disposable_instance,
+    sidecar_argv,
 )
 from .core import (
     build_limits,
@@ -83,8 +83,6 @@ from .core import (
     startup_grace,
     write_text,
 )
-
-_CVE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 
 #: How a run shows the effect. The first two read the answer the target sends
 #: back. oob_callback is for an effect that produces no answer at all -- a
@@ -2185,6 +2183,20 @@ def emit_field_poc(
     )
 
 
+#: The seeding program this mode runs, and the other of the two.
+#:
+#: `steps.SETUP_RUNNER` is its counterpart and carries the measurement of how
+#: alike they are and the five reasons they were left apart. The short of it:
+#: the same five jobs, 15% of the same text, and each pinned by exact text in
+#: its own quoting convention, so merging them is rewriting one of two
+#: programs that a lab run is made of rather than lifting a shared one out.
+#:
+#: The difference this side owns is the multipart body below. Three labs that
+#: reproduced were refused a script over a crafted upload -- an archive that
+#: escapes its extraction root, a file whose name a filter should have
+#: refused -- so a single-target spec can declare one and this builds it. A
+#: generated lab's setup cannot, and is told so during generation rather than
+#: here.
 _SETUP_RUNNER = (
     "import base64, io, json, os, re, sys, tarfile, urllib.error, urllib.request\n"
     "import uuid, zipfile\n"
@@ -2332,15 +2344,17 @@ def _run_setup(
     the fixed build's own behaviour for both and call it a differential.
     """
     completed = subprocess.run(
-        [
-            "docker", "run", "--rm", "--network", f"container:{container}",
-            "--security-opt", "no-new-privileges:true",
-            *runtime_flags(),
-            "-e", f"CVELAB_BASE=http://{host}:{port}",
-            "-e", "CVELAB_SETUP=" + json.dumps(requests),
-            "-e", "CVELAB_INPUTS=" + json.dumps(inputs or {}),
-            image, "python", "-c", _SETUP_RUNNER,
-        ],
+        ["docker", *sidecar_argv(
+            f"container:{container}",
+            image=image,
+            program=_SETUP_RUNNER,
+            flags=runtime_flags(),
+            environment={
+                "CVELAB_BASE": f"http://{host}:{port}",
+                "CVELAB_SETUP": json.dumps(requests),
+                "CVELAB_INPUTS": json.dumps(inputs or {}),
+            },
+        )],
         capture_output=True, text=True, timeout=300, check=False,
     )
     tail = completed.stdout.strip().splitlines()[-1:] or [""]
@@ -2398,19 +2412,22 @@ def _run_field_script(
         "runpy.run_path(str(home / 'field.py'), run_name='__main__')\n"
     )
     completed = subprocess.run(
-        [
-            "docker", "run", "--rm", "--network", f"container:{container}",
-            "--security-opt", "no-new-privileges:true",
-            *runtime_flags(),
-            # A socket PoC takes a host and a port and refuses a URL, so the
-        # form the sidecar passes has to follow the spec's transport.
-        "-e", "CVELAB_BASE=" + (
-            f"http://{host}:{port}" if transport == "http" else f"{host}:{port}"
-        ),
-            "-e", f"CVELAB_FIELD={script}",
-            "-e", "CVELAB_INPUTS=" + json.dumps(inputs or {}),
-            image, "python", "-c", bootstrap,
-        ],
+        ["docker", *sidecar_argv(
+            f"container:{container}",
+            image=image,
+            program=bootstrap,
+            flags=runtime_flags(),
+            environment={
+                # A socket PoC takes a host and a port and refuses a URL, so
+                # the form the sidecar passes has to follow the spec's
+                # transport.
+                "CVELAB_BASE": (
+                    f"http://{host}:{port}" if transport == "http" else f"{host}:{port}"
+                ),
+                "CVELAB_FIELD": script,
+                "CVELAB_INPUTS": json.dumps(inputs or {}),
+            },
+        )],
         capture_output=True, text=True, timeout=300, check=False,
     )
     verdict = completed.stdout.strip().splitlines()[-1:] or [""]
@@ -2440,50 +2457,29 @@ def _run_variant(
     cve: str, variant: str, image: str, port: int, health_path: str,
     spec: dict[str, Any], script: str,
 ) -> dict[str, Any]:
-    """Start one image, seed it, and run the field PoC against it."""
-    token = uuid.uuid4().hex[:12]
-    name = f"cvelab-field-{cve.lower()}-{variant}-{token}"
-    network_name = f"{name}-net"
-    container_id = ""
-    network_id = ""
-    try:
-        network_id = _docker(
-            "network", "create", "--internal",
-            "--label", "io.cvelab.managed=true",
-            "--label", f"io.cvelab.cve={cve}",
-            "--label", f"io.cvelab.run={token}",
-            network_name,
-        )
-        container_id = _docker(
-            "run", "-d", "--name", name,
-            "--label", "io.cvelab.managed=true",
-            "--label", f"io.cvelab.cve={cve}",
-            "--label", f"io.cvelab.run={token}",
-            "--security-opt", "no-new-privileges:true",
-            *runtime_flags(),
-            "--network", network_name, image,
-        )
-        base_url = f"http://{name}:{port}"
-        _wait_ready(network_name, base_url, health_path,
-                    int(spec.get("health_timeout", DEFAULT_HEALTH_TIMEOUT)))
-        fixture = spec.get("fixture")
-        applied = _apply_fixture(name, fixture) if fixture else None
+    """Start one image, seed it, and run the field PoC against it.
+
+    The starting, seeding and taking away is `disposable_instance`, which the
+    closed path uses for the same thing on the same kind of input: a pair of
+    published images. `field-` stays in the container's name so an operator
+    reading `docker ps` can tell the two modes apart.
+
+    It brought the health wait and the fixture with it, which is why
+    `_apply_fixture` and `_wait_ready` are no longer imported here -- this
+    module no longer does either by hand. `_validate_fixture` still is: a
+    spec's fixture is checked when the spec is read, long before anything is
+    started.
+    """
+    with disposable_instance(
+        cve, variant, image, port, health_path, spec, prefix="cvelab-field"
+    ) as running:
         outcome = _run_field_script(
-            name, port, script, spec.get("transport", "http"),
+            running.container, port, script, spec.get("transport", "http"),
             sidecar.ensure_image({spec.get("transport", "http")}, True),
         )
-        return {"variant": variant, "image": image, "fixture": applied, **outcome}
-    finally:
-        if container_id:
-            current = _docker("inspect", "--format", "{{.Id}}", name, check=False)
-            if current == container_id:
-                _docker("rm", "-f", container_id, check=False)
-        if network_id:
-            current_net = _docker(
-                "network", "inspect", "--format", "{{.Id}}", network_name, check=False
-            )
-            if current_net == network_id:
-                _docker("network", "rm", network_id, check=False)
+        return {
+            "variant": variant, "image": image, "fixture": running.fixture, **outcome
+        }
 
 
 def run_field_lab(
@@ -2502,13 +2498,7 @@ def run_field_lab(
     behavior, so a fixed image is required here even though the closed mode
     treats it as optional.
     """
-    cve = cve.upper()
-    if not _CVE.fullmatch(cve):
-        raise ValueError("invalid CVE identifier")
-    if not 1 <= container_port <= 65535:
-        raise ValueError("container port must be between 1 and 65535")
-    if not health_path.startswith("/"):
-        raise ValueError("health path must start with /")
+    cve = check_lab_arguments(cve, container_port, health_path)
     if not fixed_image:
         raise ValueError("field mode needs a fixed image to prove the effect is the bug")
     spec = validate_spec(json.loads(spec_path.read_text(encoding="utf-8")))
@@ -2730,6 +2720,24 @@ def _require_reproduced(lab_dir: Path) -> None:
         )
 
 
+def _seal_lab(compose: list[str], lab_dir: Path, environment: dict[str, str]) -> None:
+    """Put the lab back the way it was found: nothing running, nothing kept.
+
+    The volumes and the orphans are not optional and that is why this has a
+    name. `down` on its own leaves the lab's volumes behind, and a later run
+    of the same lab would then start against state this one created -- which
+    for a seeding step is exactly the difference between a lab that was put
+    in the state the attack needs and one that was already in it. The two
+    paths that end a run, the proof's own teardown and `demo-target down`,
+    were spelling the same four arguments out separately.
+    """
+    subprocess.run(
+        compose + ["down", "--volumes", "--remove-orphans"],
+        cwd=lab_dir,
+        env=environment,
+    )
+
+
 def _resolved_compose(
     compose: list[str], lab_dir: Path, environment: dict[str, str]
 ) -> dict[str, Any]:
@@ -2814,13 +2822,13 @@ def _reachable_address(container: str, port: int, timeout: int) -> str:
     """
     hosts = ["127.0.0.1", *(a for a in _container_address(container).split() if a)]
     completed = subprocess.run(
-        [
-            "docker", "run", "--rm", "--network", f"container:{container}",
-            "--security-opt", "no-new-privileges:true",
-            *runtime_flags(),
-            "python:3.13-alpine", "python", "-c", _PORT_READY,
-            str(port), str(timeout), *hosts,
-        ],
+        ["docker", *sidecar_argv(
+            f"container:{container}",
+            image="python:3.13-alpine",
+            program=_PORT_READY,
+            flags=runtime_flags(),
+            arguments=[str(port), str(timeout), *hosts],
+        )],
         capture_output=True, text=True, timeout=timeout + 60, check=False,
     )
     if completed.returncode != 0:
@@ -3407,11 +3415,7 @@ def run_manual_poc(
             outcome.pop("spec_at_fault", None)
     finally:
         if not keep:
-            subprocess.run(
-                compose + ["down", "--volumes", "--remove-orphans"],
-                cwd=lab_dir,
-                env=environment,
-            )
+            _seal_lab(compose, lab_dir, environment)
         shutil.rmtree(scratch, ignore_errors=True)
 
     write_manual_poc(cve, lab_dir, plan, spec, container_port, outcome)
@@ -3654,11 +3658,7 @@ def run_demo_target(
     docker, environment, compose, scratch = prepare_compose(lab_dir)
     try:
         if action == "down":
-            subprocess.run(
-                compose + ["down", "--volumes", "--remove-orphans"],
-                cwd=lab_dir,
-                env=environment,
-            )
+            _seal_lab(compose, lab_dir, environment)
             progress.step(f"{cve} is back to its sealed posture")
             return {"ok": True, "cve": cve, "lab_dir": str(lab_dir), "running": False}
 
