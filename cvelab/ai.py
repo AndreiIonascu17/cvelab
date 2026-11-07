@@ -406,6 +406,47 @@ def _validate_schema(value: object, schema: dict, path: str = "$") -> None:
             raise RuntimeError(f"Structured response number is above maximum at {path}")
 
 
+#: The sampling temperature every dialect sends, when one is asked for.
+#:
+#: Unset means "send none and take the provider's default", which is what two
+#: of the three dialects did and still do: the messages dialect (Anthropic)
+#: and the responses dialect (OpenAI) never named a temperature, while the
+#: chat-completions dialect (DeepSeek, local) pinned 0. So the same CVE,
+#: asked of two providers, was being sampled under two different regimes and
+#: nothing said so.
+#:
+#: WHY THE DEFAULT IS STILL "SEND NONE"
+#:
+#: Pinning this low makes a benchmark reproducible and breaks the mechanism
+#: that benchmark measures. `sourcegen._answer_until_valid` re-asks the SAME
+#: prompt when a pre-build check refuses the answer, and its whole premise is
+#: that the next sample differs -- its own docstring records that catching
+#: answers this way removed 15 of 27 failed builds. Pinned at 0 it would
+#: receive the identical refused answer every time and spend the budget on
+#: nothing. Measured on this panel: three consecutive "answer refused before
+#: the build; asking again" lines, then a run that ended with the model's
+#: answer thrown away.
+#:
+#: So this exists to be set deliberately, for a run whose point is
+#: reproducibility, and a caller that re-asks is expected to raise it per
+#: attempt rather than hold it fixed.
+TEMPERATURE_VARIABLE = "CVELAB_TEMPERATURE"
+
+
+def temperature_setting() -> float | None:
+    """The temperature to send, or None to let the provider choose."""
+    raw = os.getenv(TEMPERATURE_VARIABLE, "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    # The range every dialect here accepts. Out-of-range would be refused by
+    # the endpoint, which is a worse way to find out.
+    return min(2.0, max(0.0, value))
+
+
 def _openai_response(
     api_key: str,
     model: str,
@@ -417,6 +458,7 @@ def _openai_response(
     tools: list[dict] | None,
     include: list[str] | None,
     timeout_seconds: int | None = None,
+    temperature: float | None = None,
 ) -> dict:
     body = {
         "model": model,
@@ -433,6 +475,8 @@ def _openai_response(
             }
         },
     }
+    if temperature is not None:
+        body["temperature"] = temperature
     if tools:
         body["tools"] = tools
         body["tool_choice"] = "auto"
@@ -475,6 +519,7 @@ def _anthropic_response(
     max_output_tokens: int,
     tools: list[dict] | None,
     timeout_seconds: int | None = None,
+    temperature: float | None = None,
 ) -> dict:
     compatible_schema = _anthropic_compatible_schema(schema)
     effort = os.getenv("CVELAB_ANTHROPIC_EFFORT", "low").lower()
@@ -492,6 +537,8 @@ def _anthropic_response(
             "format": {"type": "json_schema", "schema": compatible_schema},
         },
     }
+    if temperature is not None:
+        body["temperature"] = temperature
     if tools:
         body["tools"] = [
             {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
@@ -545,6 +592,7 @@ def _chat_completions_response(
     schema_name: str,
     max_output_tokens: int,
     timeout_seconds: int | None = None,
+    temperature: float | None = None,
 ) -> dict:
     """The OpenAI chat/completions dialect, for every provider that speaks it.
 
@@ -581,7 +629,7 @@ def _chat_completions_response(
             {"role": "system", "content": system},
             {"role": "user", "content": input_text},
         ],
-        "temperature": 0,
+        "temperature": 0 if temperature is None else temperature,
         "max_tokens": max_output_tokens,
         "response_format": (
             {"type": "json_schema",
@@ -642,6 +690,7 @@ def structured_response(
     include: list[str] | None = None,
     provider: str | None = None,
     base_url: str | None = None,
+    temperature: float | None = None,
 ) -> dict:
     selected = resolve_provider(provider)
     api_key = _provider_key(selected, api_key)
@@ -669,21 +718,25 @@ def structured_response(
 
     # Dispatch on the dialect, not the name: a provider that speaks one we
     # already handle needs no new request code.
+    # Resolved once, here, so every dialect is sampled the same way and a
+    # caller that re-asks can raise it per attempt.
+    chosen = temperature if temperature is not None else temperature_setting()
+
     def ask(budget: int, seconds: int, which: str) -> dict:
         if provider.dialect == RESPONSES:
             return _openai_response(
                 api_key or "", which, instructions, input_text, schema, schema_name,
-                budget, tools, include, seconds,
+                budget, tools, include, seconds, temperature=chosen,
             )
         if provider.dialect == MESSAGES:
             return _anthropic_response(
                 api_key or "", which, instructions, input_text, schema,
-                budget, tools, seconds,
+                budget, tools, seconds, temperature=chosen,
             )
         if provider.dialect == CHAT_COMPLETIONS:
             return _chat_completions_response(
                 selected, api_key, base_url, which, instructions, input_text,
-                schema, schema_name, budget, seconds,
+                schema, schema_name, budget, seconds, temperature=chosen,
             )
         raise RuntimeError(f"No handler for dialect {provider.dialect!r}")
 

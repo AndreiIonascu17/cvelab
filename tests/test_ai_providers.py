@@ -281,10 +281,6 @@ class AIProviderTests(unittest.TestCase):
             self.assertEqual(resolve_provider("auto"), "anthropic")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class AFieldNameIsNotAConstraintTests(unittest.TestCase):
     """The constraint keywords and the answer's own field names share one
     namespace in JSON Schema; only position tells them apart.
@@ -332,3 +328,66 @@ class AFieldNameIsNotAConstraintTests(unittest.TestCase):
         out = _anthropic_compatible_schema(EFFECT_PREDICATE_SCHEMA)
         for name in out["properties"]["header"]["required"]:
             self.assertIn(name, out["properties"]["header"]["properties"])
+
+
+class TemperatureReachesEveryDialectTests(unittest.TestCase):
+    """One setting, three dialects, and nothing sent unless it is asked for.
+
+    Before this, the messages dialect (Anthropic) and the responses dialect
+    (OpenAI) named no temperature while chat-completions (DeepSeek, local)
+    pinned 0, so the same CVE asked of two providers was sampled under two
+    regimes and nothing recorded that.
+    """
+
+    PAYLOADS = {
+        "openai": {"output": [{"type": "message",
+                               "content": [{"type": "output_text", "text": '{"ok":true}'}]}]},
+        "anthropic": {"content": [{"type": "text", "text": '{"ok":true}'}],
+                      "stop_reason": "end_turn"},
+        "deepseek": {"choices": [{"message": {"content": '{"ok":true}'}}]},
+    }
+
+    def body(self, provider: str, **extra) -> dict:
+        with mock.patch("cvelab.ai._request_json",
+                        return_value=self.PAYLOADS[provider]) as request:
+            structured_response(
+                api_key="secret", model="test-model", provider=provider,
+                instructions="test", input_text="input", schema=SCHEMA,
+                schema_name="test_schema", max_output_tokens=100, **extra,
+            )
+        return request.call_args.args[2] if len(request.call_args.args) > 2 \
+            else request.call_args.kwargs["body"]
+
+    def test_each_dialect_sends_what_was_asked_for(self) -> None:
+        for provider in ("openai", "anthropic", "deepseek"):
+            with self.subTest(provider=provider):
+                self.assertEqual(self.body(provider, temperature=0.25)["temperature"], 0.25)
+
+    def test_the_two_that_never_named_one_still_do_not(self) -> None:
+        # The default request stays byte-identical to the one these dialects
+        # have always sent, so turning the knob is a deliberate act.
+        for provider in ("openai", "anthropic"):
+            with self.subTest(provider=provider):
+                self.assertNotIn("temperature", self.body(provider))
+
+    def test_chat_completions_keeps_the_zero_it_always_pinned(self) -> None:
+        self.assertEqual(self.body("deepseek")["temperature"], 0)
+
+    def test_the_environment_reaches_a_caller_that_asked_for_nothing(self) -> None:
+        with mock.patch.dict("os.environ", {"CVELAB_TEMPERATURE": "0.7"}):
+            self.assertEqual(self.body("anthropic")["temperature"], 0.7)
+
+    def test_an_unreadable_setting_is_ignored_rather_than_raised(self) -> None:
+        # A run is worth more than a complaint about a stray environment
+        # variable, and the provider's default is a defined behaviour.
+        with mock.patch.dict("os.environ", {"CVELAB_TEMPERATURE": "warm"}):
+            self.assertNotIn("temperature", self.body("anthropic"))
+
+    def test_out_of_range_is_clamped_not_sent(self) -> None:
+        # The endpoint would refuse it, which is a worse way to find out.
+        with mock.patch.dict("os.environ", {"CVELAB_TEMPERATURE": "11"}):
+            self.assertEqual(self.body("anthropic")["temperature"], 2.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
