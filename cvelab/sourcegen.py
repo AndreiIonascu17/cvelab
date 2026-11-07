@@ -29,7 +29,7 @@ import tarfile
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
@@ -1346,7 +1346,11 @@ def _check_variant_parity(contents: dict[str, str]) -> None:
             )
 
 
-def _validate_generated(files: list[dict], vulnerable_only: bool = False) -> None:
+def _validate_generated(
+    files: list[dict],
+    vulnerable_only: bool = False,
+    support_services: Sequence[str] = (),
+) -> None:
     paths = {item["path"].replace("\\", "/") for item in files}
     required = {
         "docker-compose.yml", "vulnerable/Dockerfile",
@@ -1466,7 +1470,22 @@ def _validate_generated(files: list[dict], vulnerable_only: bool = False) -> Non
                 # and refused a validator that only formatted its target.
                 if "{" in url or "%" in url:
                     continue
+                # The two builds, loopback, and whatever second service
+                # the answer declared. Without that last part the lab had no
+                # legal way to use a feature the schema offers: a model that
+                # declared a support service and probed it was refused here,
+                # before _validate_support_services had read the declaration
+                # at all, and the refusal named the hostname as "external"
+                # when it was a service on the lab's own internal network.
+                # Measured: of 36 archived refusals from this check, 5 wanted
+                # a declared second service -- and support_services is
+                # declared in none of 186 labs, so the feature was unusable
+                # rather than unused. The names are safe to admit because
+                # _validate_support_services now runs FIRST and has refused
+                # reserved names, duplicates, and any name that is not a
+                # service in the lab's own Compose file.
                 allowed_hosts = {"vulnerable", "127.0.0.1", "localhost"}
+                allowed_hosts.update(support_services)
                 if not vulnerable_only:
                     allowed_hosts.add("patched")
                 if url not in allowed_hosts:
@@ -2682,7 +2701,13 @@ def generate_source_lab(
                 {"path": "validator/validator.py", "content": generation["validator_py"]},
                 *_adapter_files(generation["adapter_files"]),
             ]
-            _validate_generated(generated_files, vulnerable_only=True)
+            _validate_support_services(
+                generation["support_services"], generation["docker_compose"]
+            )
+            _validate_generated(
+                generated_files, vulnerable_only=True,
+                support_services=generation["support_services"],
+            )
             _check_build_inputs(generated_files, lab_dir, vulnerable_only=True)
             _check_base_images(generated_files)
             _validate_fidelity(generation["fidelity"])
@@ -2691,7 +2716,6 @@ def generate_source_lab(
                 generation["exploit_contract"],
                 generation["docker_compose"], generation["validator_py"],
             )
-            _validate_support_services(generation["support_services"], generation["docker_compose"])
             return generated_files
 
         generation, generated_files, refusals = _answer_until_valid(_ask, _check)
@@ -2875,7 +2899,12 @@ def generate_source_lab(
             {"path": "validator/validator.py", "content": generation["validator_py"]},
             *_adapter_files(generation["adapter_files"]),
         ]
-        _validate_generated(generated_files)
+        _validate_support_services(
+            generation["support_services"], generation["docker_compose"]
+        )
+        _validate_generated(
+            generated_files, support_services=generation["support_services"]
+        )
         _check_build_inputs(generated_files, lab_dir)
         _check_base_images(generated_files)
         _validate_fidelity(generation["fidelity"])
@@ -2884,7 +2913,6 @@ def generate_source_lab(
             generation["exploit_contract"],
             generation["docker_compose"], generation["validator_py"],
         )
-        _validate_support_services(generation["support_services"], generation["docker_compose"])
         return generated_files
 
     generation, generated_files, refusals = _answer_until_valid(_ask, _check)
@@ -3202,7 +3230,11 @@ def repair_source_lab(
                 {"path": "patched/Dockerfile", "content": generation["patched_dockerfile"]},
             )
         generated_files.extend(_adapter_files(generation["adapter_files"]))
-        _validate_generated(generated_files, vulnerable_only=vulnerable_only)
+        _validate_support_services(generation["support_services"], compose)
+        _validate_generated(
+            generated_files, vulnerable_only=vulnerable_only,
+            support_services=generation["support_services"],
+        )
         _check_build_inputs(generated_files, lab_dir, vulnerable_only=vulnerable_only)
         _check_base_images(generated_files)
         _validate_fidelity(generation["fidelity"])
@@ -3218,7 +3250,6 @@ def repair_source_lab(
         _validate_setup_contract(
             generation["exploit_contract"], compose, generation["validator_py"]
         )
-        _validate_support_services(generation["support_services"], compose)
         return generated_files
 
     generation, generated_files, refusals = _answer_until_valid(_ask, _check)
