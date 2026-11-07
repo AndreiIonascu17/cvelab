@@ -189,6 +189,69 @@ def unknown_kinds(predicate: Mapping[str, Any]) -> list[str]:
     return sorted(str(key) for key in predicate if key not in KINDS)
 
 
+#: The kinds whose declaration is text the response itself has to carry.
+#:
+#: `status` is missing on purpose, and the absence is the whole content of
+#: this tuple rather than an oversight. A status code is drawn from a fixed
+#: vocabulary the service answers from on every build, so it can never name a
+#: value that something in particular put there; every other kind declares a
+#: string, and a string can be one the lab planted.
+QUOTING: tuple[str, ...] = ("body_contains", "body_regex", "header")
+
+
+def quoted_texts(predicate: Mapping[str, Any]) -> dict[str, str]:
+    """The text each clause requires the response to carry, keyed by kind.
+
+    `header` reports its `contains` and not its `name`: the name says which
+    header is read and the value is what was observed in it, so only the
+    value can carry something the attack introduced. A clause whose text is
+    not a string is left out rather than coerced, for the reason `_text`
+    refuses to coerce: a caller asking what text a predicate looks for must
+    not be handed `str(200)`.
+    """
+    texts: dict[str, str] = {}
+    for kind in ("body_contains", "body_regex"):
+        declared = predicate.get(kind)
+        if isinstance(declared, str):
+            texts[kind] = declared
+    header = predicate.get("header")
+    if isinstance(header, Mapping) and isinstance(header.get("contains"), str):
+        texts["header"] = header["contains"]
+    return texts
+
+
+def quotes(predicate: Mapping[str, Any], value: str | None) -> list[str]:
+    """The clauses of this predicate that quote `value`, in kind order.
+
+    WHY A CALLER WANTS TO KNOW
+
+    For a lab with a fixed build to contradict it, nothing here is needed:
+    the comparison rules out a predicate that does not describe the effect,
+    because such a predicate holds on the patched side too. A lab with only
+    a vulnerable build has no such contradiction available, and the question
+    that replaces it is whether the declared effect is something the attack
+    introduced or something the system produces on its own. The caller
+    answers that by asking whether any clause quotes a value the lab planted
+    -- which is what the canary marker is for.
+
+    Containment, not equality, so that a clause may name the planted value
+    inside the surrounding text it is expected to appear in. For `body_regex`
+    that is containment in the pattern's source, which is sound exactly when
+    `value` holds no regular-expression metacharacter -- otherwise a pattern
+    could "quote" it as syntax rather than as text. The one value CVELab
+    asks about is the marker, which is a fixed prefix and hex digits by
+    construction, so the condition holds for it and the caller need not
+    escape anything.
+
+    An absent or blank `value` quotes nothing, and the empty list is the
+    honest answer: there is no planted value to have named.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return []
+    texts = quoted_texts(predicate)
+    return [kind for kind in QUOTING if value in texts.get(kind, "")]
+
+
 def evaluate(
     observations: Mapping[str, Any],
     predicate: Mapping[str, Any],

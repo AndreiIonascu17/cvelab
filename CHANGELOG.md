@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A generated lab's `PoC.py` now runs the way a published PoC does:
+  `python3 PoC.py 10.0.0.5:8080`, and where the weakness is command execution,
+  `python3 PoC.py 10.0.0.5:8080 id`, whose output it prints. Given an address it
+  holds one session for the whole run and performs the lab's declared setup
+  steps itself. With no argument it behaves exactly as before -- the same
+  environment variables, the same Compose service names, the same output and the
+  same exit codes -- which is the path automatic validation takes. `manual.sh`
+  gains an `address` action and publishes the build's port on loopback with the
+  host side left for the kernel to assign; `setup` prints the assigned address
+  and the line that uses it.
+
+  Measured, and the reason it exists: `artifacts/PoC.py` is
+  `validator/validator.py` with a six-line docstring prepended and nothing else
+  changed -- across 89 archived labs `diff` prints `0a1,6` and stops. So the
+  artifact the kit calls the manual PoC was the validator's own source, copied
+  out to be read. None of the 89 read `sys.argv`, every one addressed its target
+  by Compose service name, and no lab published a host port, so there was
+  nothing on the host to point anything at. A tester carrying these to a client
+  had a script they could read and could not run.
+
+- `exploit_contract.service_port`: the port the product listens on inside its
+  container, declared by the answer rather than recovered from the lab. There
+  was no reliable source for it -- a healthcheck string in 53% of archived labs,
+  `expose` in 15%, a `PORT = N` constant in 15%, and
+  `exploit_contract.setup_port` in 2%, that last one only where the lab declares
+  seeding and meaning the port the seeding goes to. An answer without it, or one
+  whose two ports disagree, is refused before anything is built. A lab generated
+  before the field existed publishes nothing and its guide says so, rather than
+  describing a script it does not contain.
+
 - `service_crash` and `timing_differential`, two strategies for the effects the
   manual PoC could not express. A crash, a panic or a hang is shown by asking
   an ordinary question, sending the input that kills the service, and asking
@@ -41,7 +71,217 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported as nothing found. The script header, the generated guide and the
   refusal itself all say it causes an outage.
 
+- `fidelity.trigger_source`, which says whether what the lab triggers is what
+  the evidence says triggers the weakness. Every other field in that record
+  says what the lab runs, and none said that: a route written to produce the
+  weakness's precondition on demand reaches the same symptom without going
+  near the weakness, and a fixed build driven the same way reaches it too, so
+  the symptom is recorded as the effect and the lab reads as a reproduction.
+  Across the 577 archived labs, three of the 674 distinct fidelity prose
+  strings say in so many words that the lab does not reproduce the weakness --
+  a route that reaches the fault condition directly rather than through the
+  context the advisory names, an adapter standing in for the listener the
+  weakness lives in, a fixed-side check that "is not reached" -- and all three
+  shipped as reproductions. The sentence was in the record and nothing read it.
+
+  `substituted` is a passing answer: it ships, it names the substitute among
+  the simulated components, and it may not claim `product_end_to_end`.
+  Refusing the substitution outright would teach the next answer to stop
+  writing the disclaimer, and that prose is the only reason the defect was
+  visible. What is refused is the one answer that cannot be true --
+  `documented` asserted over prose that disclaims the reproduction -- which
+  costs one model call and no build. The marker travels into `plan.json` and
+  `report.json`, so a later step reads "reproduced the documented trigger" and
+  "reached the same condition another way" apart instead of inferring one from
+  the other.
+
 ### Fixed
+
+- The manual-PoC drafter no longer declines for reasons that are not true. Of
+  78 archived labs where it was asked, 19 shipped a script, 11 drafted one and
+  refused it after proving, and 48 never drafted at all; of those 48, 24
+  genuinely cannot be shown against a single instance, and the other 24
+  declined on a false reason or one the tool already answers. Four changes,
+  none of which move the bar.
+
+  It was given the predicate and never the verdict, and re-derived the
+  differential from raw bodies -- twice on one panel, both times backwards.
+  One lab's drafter read the warm-up pass out of the runs array and declined
+  because the observation "found tail_nonzero false on both builds"; another
+  quoted the patched build's line as the vulnerable build's, having said in
+  the same answer that the shape was expressible and the record was the only
+  obstacle. Measured by capturing the assembled input: the predicate arrived
+  buried under the plan's declaration of what *would* be measured, the
+  evidence not at all, and `differential_confirmed` only as a variable name
+  inside a source listing. The verdict is now handed over ahead of the
+  validator source, which can take half the input budget, so it cannot be what
+  the limit truncates; a fourth key says whether a fixed build was tested at
+  all, since on a vulnerable-only lab a bare false would manufacture a fresh
+  wrong refusal.
+
+  The harness's own diagnostic is now separated from the artifact it was
+  computed over -- the decoded image, the cleaned text, the command output --
+  because the clause forbidding a harness that reports the effect was
+  swallowing the whole library case. Where the project ships no listener, the
+  operator-supplied input *is* the route: 11 of 12 shipped component PoCs
+  declare one and 9 name it `target_path`, while 19 of the 48 declines gave
+  "ships no listener of its own" as the reason for declining -- the same
+  sentence was the reason to use the pattern and the reason given for refusing
+  it. And a decline is asked once more: the retry was gated on a flag set only
+  for a malformed spec, so a decline was a single unretried sample. Declining
+  again is a correct answer and is recorded as one. A provider decline is
+  still never re-asked, and one on the second ask no longer replaces a real
+  verdict with the absence of one.
+
+  The bar is untouched and tests pin it: a script that fires on both builds
+  does not ship, nor does one silent on both. Worth recording that the bar has
+  never had anything to reject -- of the 11 refused after proving, 9 ran
+  against both builds and in all 9 the script fired on neither. The cost is
+  the drafting instructions growing 26% and the asks on that population going
+  from 78 to at most 126; the re-ask doubles classifier exposure on exactly
+  the labs that yield nothing today, and the PROVIDER_DECLINED rate on second
+  asks is the number that decides whether it holds. It has not been measured.
+
+- A vulnerable-only lab can no longer prove itself on something its target
+  emits anyway. With no fixed build to contradict it, the effect check returned
+  the vulnerable side's verdict on its own, and nothing required the declared
+  effect to be related to the attack. One lab declared
+  `{"body_regex": "Allowed memory size of [0-9]+ bytes exhausted"}`: specific,
+  non-empty, not a status clause, and printed by the runtime for any script at
+  all that exceeds its configured limit. It validated with
+  `PUBLIC_FIX_NOT_IDENTIFIED` and a full deliverable set, and the only step
+  that objected was the manual-PoC drafter, which refused to write a script for
+  "only a proxy" after the automatic path had already passed. The same text is
+  checked in under that product's own test suite as the expected output of an
+  ordinary allocation failure, so what the predicate matched was documented
+  behaviour.
+
+  A vulnerable-only predicate must now quote the canary marker the lab planted,
+  in at least one of `body_contains`, `body_regex` or `header`: with no
+  comparison available, naming a value the attack introduced is the only way a
+  declaration can tell the weakness from how the product behaves regardless.
+  Refused before the build, where a repair can still act on it, and refused
+  again at the gate, because the measured lab's plan was written before the
+  rule existed and revalidating it must not reproduce it. Of the three
+  vulnerable-only labs in the archive it accepts the one whose predicate quotes
+  its marker, refuses the one above, and the third declared no predicate at all
+  and was already refused. Differential labs are untouched and must stay so:
+  43 of their 53 recorded predicates name an attacker-supplied value or a field
+  the adapter computes rather than the marker, and the comparison is what
+  judges those. A vulnerable-only lab whose effect is a crash, a hang or an
+  allocation failure has no text to plant and no fixed build to compare
+  against, so it is now refused rather than validated; `service_crash` and
+  `timing_differential` are how such an effect is shown.
+
+- The lab's own step-by-step document is `artifacts/LAB-POC.md`, renamed from
+  `MANUAL-POC.md`, because that name was the same file as the single-instance
+  script's guide on half the platforms CVELab ships for.
+  `"MANUAL-POC.md".lower() == "Manual-PoC.md".lower()`, and on macOS and
+  Windows the file system compares names without case, so a lab holding both
+  kept only whichever was written second -- which of the two survived depended
+  on write order. 13 of 103 archived labs hold both. CVELab ships for Windows
+  (`PoC.ps1`, the `os.name == "nt"` branches in `upload.py`, `deliverables.py`
+  and `core.py`), and `sourcegen._adapter_files` already compares adapter
+  paths case-insensitively "as the file system on Windows and macOS compares
+  names": the guard was in the repo and the shipped names walked past it,
+  because the two names were declared in two modules and `test_manual_poc`
+  asserted they differed with `assertNotIn` -- an exact-string test, which a
+  difference of case passes. All four manual-PoC artifact names are now
+  declared in one block in `field.py`, the test compares the way those file
+  systems do, and a second test scans every quoted file name in the package so
+  that a third module cannot reintroduce the fault.
+
+  The `Manual-PoC.py`/`.md`/`.json` trio was deliberately left alone: its name
+  is inside the emitted script's own usage text, so renaming it would have
+  changed a shipped script's bytes. Archived labs keep the old document name
+  and `cvelab upload` still ships it, since the share gate never required it
+  and losing it would have been silent.
+
+- Each of the two documents now says in its first section what it runs
+  against, and `LAB-POC.md` says what the lab cannot show. Both used to open
+  with the identical line `# <CVE> Manual PoC`, so following one to the end and
+  watching it work told the reader nothing about whether any of it could be
+  pointed at a client's server. For most labs it cannot: the single-instance
+  script is refused far more often than it is written, because the effect is
+  frequently not observable from outside the process at all.
+
+  `LAB-POC.md` now states that it takes a Compose service name and not an
+  address, says whether a single-instance script exists for this lab, and
+  where one was attempted and refused, quotes the drafter's own reason for
+  refusing. That reason was already recorded in `report.manual_poc_field`,
+  where it was often the best sentence in the record and read by nobody,
+  because nobody opens `report.json` before a client meeting. Those sentences
+  -- "a stock daemon serves no HTTP route that reports its own root directory
+  permissions" -- are exactly what stops a lab demonstration being described
+  as a check that would run against a live instance. `create_deliverables`
+  needed nothing new to reach the field: it is handed the same report dict
+  `run_lab` returns. A step that was never asked for reads as never asked for
+  rather than as a refusal, because `"not requested"` is `core.py`'s own
+  default and not a judgement the drafter made.
+
+- The handed-over demo now runs as its own guide documents it, on a machine
+  that has Docker and the lab directory and nothing else. Five things were
+  wrong with it and all five were in the one function that writes it:
+
+  `manual.sh` reached the validator with `compose run --no-deps`. The internal
+  path had already stopped doing that and recorded why: a one-off `run`
+  container does not get the aliases its service declares on the network, so a
+  validator that reaches its own canary by name gets "Temporary failure in
+  name resolution" and the lab reads as not reproduced -- one lab, three runs
+  running, and every lab built around a named stand-in failing the same way.
+  The script now brings the service up, waits on the container, reads its logs
+  and removes it, which is what CVELab does. 99 of 99 generated labs.
+
+  `--no-deps` also skipped the only health wait there was, and `setup` printed
+  "Manual lab ready" the moment `up -d` returned. A product that compiles
+  assets or migrates a database on first boot had not listened yet, and the
+  attack going out first reports "targets not ready", which reads as a lab
+  that failed to reproduce. `setup` now waits for the build to report healthy
+  and each later action re-waits without recreating anything. 63 labs exposed.
+
+  MANUAL-POC.md said to run the block from the lab's `artifacts/` directory
+  and opened with `cd CVE-…/artifacts`, which from `artifacts/` goes nowhere --
+  the first line of the documented demo, in every lab. The relative path
+  arrived in 0.6.7 as a privacy fix for an absolute one and was no more
+  runnable than what it replaced. `manual.sh` resolves the lab from its own
+  path, so the cd is gone rather than corrected.
+
+  `PoC.ps1` shipped in every lab and no document named it, so the only
+  instructions a Windows reader had were for a shell they do not have. The
+  guide now has a Windows section, and the wrapper offers only the builds the
+  lab actually has.
+
+  A lab whose contract declares the state its attack needs had that state
+  established by a Compose override written to a scratch directory and removed
+  when CVELab exited, so it validated seeded and shipped a demo that could not
+  seed: the attack reached an instance with nothing to act on and the affected
+  build reported BLOCKED. The seeding now travels with the lab as
+  `artifacts/cvelab-setup.json` -- the same file CVELab merged into its own
+  run, written where the resolved Compose model exists because that is the
+  only place it can be built -- and `manual.sh` merges it, runs it once per
+  build, and carries what it bound through to the attack. 3 of 185 archived
+  labs declare setup; 0 of 3 shipped it.
+
+- A report can no longer call a manual PoC verified over a kit that cannot
+  perform the seeding its own contract declares. One archived lab recorded
+  `manual_poc_status: "verified"` and `ok: true` over exactly that, and it was
+  not wrong about anything it measured: CVELab ran the handed-over actions
+  itself, with its own override merged and its own bindings in the
+  environment, and they passed. What nothing measured was whether the kit
+  beside the report can do the same.
+
+  That is now computed from the files in the lab directory -- the shipped
+  seeding file against the steps and port the contract declares, and the
+  shipped script against the names it has to carry -- and never from a field
+  the model wrote or a sentence in the generated guide. A gap reports
+  `manual_poc_status: "seeding_not_shipped"` with the reason beside it, in
+  report.json, artifacts/report.json, EVIDENCE.json and the REPORT.md line.
+
+  The lab is still carried. A differential reproduction is a proof whether or
+  not the kit beside it can seed, so the check stays out of `proof_checks`,
+  where every value is ANDed into `ok`: throwing away the proof to punish the
+  packaging would leave nothing to show a client, which is the other half of
+  the same problem.
 
 - A provider too busy to answer no longer counts as a failed repair. Requests
   now retry a 429, 500, 502, 503, 504 or 529 with a widening pause, honouring

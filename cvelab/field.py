@@ -2669,16 +2669,50 @@ infer source-level root cause or behavior outside the requests it sends.
 # from one host at all. CVELab keeps the half worth automating: proving the
 # script against both builds before it is handed over.
 
+# --- The names of the two kinds of manual document ------------------------
+#
+# All four in one block, and this is why. A validated lab's artifacts/ holds
+# two step-by-step documents with two different reaches, written by two
+# modules. The one below used to be MANUAL-POC.md in deliverables.py, and
+# `"MANUAL-POC.md".lower() == "Manual-PoC.md".lower()`: on macOS and Windows,
+# whose file systems compare names without case, the two were one file and
+# whichever was written second silently replaced the other. 13 of the
+# archived labs hold both. CVELab ships for Windows -- PoC.ps1, the
+# `os.name == "nt"` branches in upload.py, deliverables.py and core.py -- and
+# sourcegen._adapter_files already compares adapter paths case-insensitively
+# "as the file system on Windows and macOS compares names". The guard was in
+# the repo and the shipped names walked past it, because the two names were
+# declared in two modules and nobody held both in view at once. Now they are
+# declared together: anything added here is next to what it must not collide
+# with, and tests/test_manual_poc.py fails on a lowercased duplicate.
+#
+# The lab document was the one renamed, not this trio. This name is inside
+# the emitted script's own usage text -- _poc_usage() takes it and prints
+# `python3 Manual-PoC.py 10.0.0.5:8080` -- so renaming it would change the
+# bytes of a shipped script, and a benchmark harness outside this repo reads
+# lab directories by these names.
+
 #: The artifact that leaves the lab: one script, one --target, run by the
-#: operator against a server they are permitted to test. Named apart from
-#: MANUAL-POC.md and manual.sh, which drive PoC.py inside the lab and reach
-#: nothing outside it.
+#: operator against a server they are permitted to test.
 MANUAL_POC_NAME = "Manual-PoC.py"
 MANUAL_POC_GUIDE_NAME = "Manual-PoC.md"
 
 #: What the attempt found, written whether or not the script was handed over.
 #: A spec that was refused is only fixable if the reason survives the run.
 MANUAL_POC_RECORD_NAME = "Manual-PoC.json"
+
+#: The other document: deliverables.py writes it for every validated lab, and
+#: it drives manual.sh and PoC.ps1 against the lab's own Docker builds,
+#: reaching nothing outside them. Declared here, beside the names it must not
+#: collide with, and imported by the module that writes it.
+LAB_POC_GUIDE_NAME = "LAB-POC.md"
+
+#: What LAB_POC_GUIDE_NAME was called before the rename. Nothing writes it.
+#: It survives in upload.py's allowlists only, because `cvelab upload` reads a
+#: lab directory that an older CVELab may have generated -- 87 of the archived
+#: labs hold the old name -- and dropping it there would silently stop
+#: shipping a document those labs still have.
+LEGACY_LAB_POC_GUIDE_NAME = "MANUAL-POC.md"
 
 
 def _lab_plan(lab_dir: Path) -> dict[str, Any]:
@@ -3504,6 +3538,13 @@ def _manual_poc_guide(cve: str, spec: dict[str, Any], plan: dict[str, Any], port
         if declared else ""
     )
     project = plan.get("repository") or "the affected project"
+    # How many builds the lab has, for the sentence naming the other
+    # document. A vulnerable-only lab has one, and saying "two" there would
+    # credit it with a differential the trust section below then denies.
+    lab_builds = (
+        "build" if plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION"
+        else "two Docker builds"
+    )
     if plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION":
         trust = (
             f"CVELab built the affected revision of {project} and ran this exact script\n"
@@ -3538,14 +3579,27 @@ def _manual_poc_guide(cve: str, spec: dict[str, Any], plan: dict[str, Any], port
             "vulnerable, so\nread a silent run against an empty instance as nothing "
             "learned."
         )
+    # The reach goes first, under its own heading, because this document and
+    # the lab's one both opened with the identical line `# <CVE> Manual PoC`
+    # and the reader could not tell from the heading, the filename or the
+    # first paragraph which of the two could be pointed at a live server.
+    # Only this one can, and that is the single fact a reader taking it to a
+    # client needs before any of the rest.
     return f"""# {cve} Manual PoC
 
-A single-target script you run yourself, against one server you are permitted to
-test. It shows the vulnerability happening: {spec['observable_effect']}
+## What this runs against
 
-This is not the lab's proof. `PoC.py` is: it compares the vulnerable and the
-fixed build inside Docker and reaches nothing else. This script is the other
-artifact, the one that leaves the lab.
+One instance whose address you supply, with `--target`. This is the artifact
+that leaves the lab, and the only one here that CVELab proved against a single
+instance before writing it down -- so it is the one to be pointed at a server
+you did not build yourself.
+
+It shows the vulnerability happening: {spec['observable_effect']}
+
+The other document beside it is `{LAB_POC_GUIDE_NAME}`, which drives `manual.sh`
+against this lab's own {lab_builds} and nothing outside them. The `PoC.py` it
+documents will take an address, but nothing proved it against one. That
+document is the lab's proof; this one is the handover.
 
 ## Run it
 
@@ -3763,6 +3817,33 @@ _DRAFT_INSTRUCTIONS = (
     "and a fixed revision of the project, ran its validator against both, and confirmed the "
     "effect occurs on the vulnerable revision and not on the fixed one. That work is "
     "finished and recorded, and nothing in your answer changes it.\n\n"
+    "the_differential_is_already_measured holds that measurement, and it is CVELab's "
+    "verdict rather than a reading offered for you to check. effect_predicate is the "
+    "predicate the effect was judged against, effect_evidence is the clause-by-clause "
+    "result on each build, and differential_confirmed is the verdict. Where "
+    "differential_confirmed is true, the effect was observed on the vulnerable build and "
+    "not on the fixed one, and that is settled. Where it is false and "
+    "a_fixed_build_was_tested is false, the project published no resolvable patched "
+    "revision, no second build was ever run and there was no differential to confirm: the "
+    "vulnerable lines of effect_evidence are the verdict there, and that is not a reason "
+    "to answer feasible=false either.\n"
+    "  So you are not being asked whether the vulnerability is real, or whether the lab "
+    "proved it. Both are decided. The only question put to you is whether that same "
+    "already-confirmed effect can also be observed against a single live instance. Do not "
+    "re-derive the differential from the bodies in what_the_validator_observed, and do "
+    "not answer feasible=false because you read those bodies differently than the "
+    "predicate did. A draft that re-opens the differential is answering a question nobody "
+    "asked.\n"
+    "  Two drafts did re-open it and both got it backwards. One read a vulnerable body "
+    "holding six runs objects -- the first \"tail_nonzero\": false, the five after it true "
+    "-- and reported that the lab \"found tail_nonzero false on both the vulnerable and "
+    "the patched build\". The other swapped the builds outright, quoting the patched "
+    "build's confirmed=false and its stripped filename as the vulnerable build's. In both "
+    "the predicate, the evidence and differential_confirmed said the opposite, and both "
+    "refused a demonstration that was there to be written.\n"
+    "  What you may still refuse for is unchanged, and none of it is the differential: an "
+    "effect one instance genuinely cannot express, and an effect whose only evidence comes "
+    "through a route the lab invented. Both are set out below.\n\n"
     "Decide one thing. Can the effect the lab already confirmed also be shown by one script "
     "pointed at one running instance, with no second instance to compare against? Some "
     "vulnerabilities cannot: a race that needs two clients driven at once, a memory or "
@@ -3935,6 +4016,23 @@ _DRAFT_INSTRUCTIONS = (
     "instance, a tenant id, the id or title of an object they own, the name of a share. A request fills one in as "
     "{{name}}. Declare one rather than guessing a credential, and rather than answering "
     "feasible=false because a value is missing.\n"
+    "    An input is not only a value. Where the project ships no server of its own, the "
+    "route is the input, and it belongs to the operator rather than to the project. There "
+    "is no path to hardcode, because the project serves none and the lab's own adapter "
+    "route is not on anyone's instance -- so the path itself is what you declare, as "
+    "{\"path\": \"{{target_path}}\"}, with the lab's adapter route given in "
+    "lab_values_json as its value so the script can still be proved here. \"This project "
+    "ships no listener of its own\" is therefore the condition that calls for this "
+    "pattern, and never a reason to answer feasible=false. Read it as the signal to "
+    "declare the route.\n"
+    "    Measured, because the same sentence was being used both ways: of the shipped "
+    "component PoCs, 11 of 12 declare an operator-supplied input and 9 of those name it "
+    "target_path -- while 19 of 48 declines gave \"ships no listener of its own\" as the "
+    "reason for declining. One lab asked nine times produced six scripts and three "
+    "refusals, each refusal explaining at length that a library with no listener cannot "
+    "be shown on one instance; six scripts for that same library already existed, on "
+    "identical input. If you are about to write that sentence as a reason, you have found "
+    "the pattern rather than an obstacle.\n"
     "  A check may also carry discover: up to six steps, each binding one value under a name "
     "that probe, control and observe fill in as {{name}}. A step is either {\"bind\": "
     "\"<name>\", \"query\": [<requests of any method>], \"extract\": {<one of the four "
@@ -4000,6 +4098,13 @@ _DRAFT_INSTRUCTIONS = (
     "fields it read back -- so the status your probe should expect is written down rather "
     "than guessed. A draft that guessed 302 for a forged request had it right, and the "
     "observation had said 302 against 403 all along.\n"
+    "  It is there for that and only that: to make your expectation match what the "
+    "service actually answers. Whether the effect occurred is not read off these bodies "
+    "-- the_differential_is_already_measured above is the verdict, and these are the "
+    "bodies it was reached from. A body is often a list or several objects, where the "
+    "value the predicate matched sits in one of them and the others hold the control: "
+    "read the predicate to see which, and never take the first element of a list as the "
+    "result.\n"
     "Read validator_that_proved_it for what the lab had to do before it attacked. Where it "
     "calls a route to create a document, an account, a file or a setting first, those calls "
     "belong in setup, or the proof runs against an empty instance and your spec finds "
@@ -4010,7 +4115,10 @@ _DRAFT_INSTRUCTIONS = (
     "an endpoint the lab added so the validator could read internal state, or a page it "
     "renders to observe a browser, does not exist on a stock instance, so a spec aimed at "
     "it would pass against the lab and mean nothing against a real server. When the only "
-    "evidence is of that kind, answer feasible=false and say so.\n"
+    "evidence is of that kind, answer feasible=false and say so. Before you conclude that "
+    "it is, read the paragraph on the channel below: nearly every adapter both reaches "
+    "the code and reports the result, and a reported result does not by itself mean the "
+    "effect is out of reach.\n"
     "  A project that ships no listener of its own -- a library, a parser, an "
     "instrumentation package, anything an application depends on -- is a different case, "
     "and used to be refused right here. It should not be. Nobody runs a library; they run "
@@ -4029,6 +4137,33 @@ _DRAFT_INSTRUCTIONS = (
     "passes a request body to the library's render, parse or decode entry point -- so a "
     "script pointed at a route that never reaches the library reports nothing, which is "
     "an honest answer rather than a false one.\n"
+    "    The paragraph above settles the path. Settle the channel the same way, because "
+    "the usual adapter does both jobs at once -- it reaches the vulnerable code and it "
+    "also computes the value the validator read -- and that is where feasible=false keeps "
+    "being answered wrongly. Separate the harness's diagnostic from the artifact the "
+    "diagnostic was computed over. A field the adapter invented to summarise the result "
+    "-- tail_nonzero, canary_deleted, a boolean the lab added so its validator had "
+    "something to match -- is not on a stock instance and a spec must not aim at it. The "
+    "artifact underneath it usually is: the decoded image, the cleaned or escaped text, "
+    "the parsed document, the command output, the response the library's return value "
+    "was rendered into. Ask what the operator's own route returns. If a route of theirs "
+    "returns that artifact, the effect is in the artifact and not in the diagnostic: "
+    "declare the route as an input exactly as above, aim the probe at the artifact, and "
+    "say in observable_effect what the route must return to be in range. One shipped PoC "
+    "is this shape end to end -- a library with no listener, the operator's target_path as "
+    "its only input, and \"the operator's route must pass its JSON request body to "
+    "quote() and run the result\" written into its own observable_effect.\n"
+    "    Refuse on the channel when no route of any kind could carry the effect out of "
+    "the process: state no response is a function of -- a property set on a built-in "
+    "prototype that changes nothing an answer contains, a directory's mode bits, a "
+    "counter only the harness reads. The test is not whether this lab's adapter reported "
+    "it; the adapter always reports it. The test is whether a real application calling "
+    "the same function could return anything that differs. When it could, the missing "
+    "piece is a route the operator knows and the lab does not, and that is an input, not "
+    "a refusal. Measured before this was written: of 115 labs that reproduced, 24 shipped "
+    "a PoC, 12 were drafted and refused by the prover, and 79 were never drafted at all "
+    "-- so a draft declining is by a wide margin the most expensive thing that happens "
+    "here, and the channel is where it declined.\n"
     "    Where such a library's effect is a panic, the strategy is service_crash and the "
     "baseline is a route of the operator's application that answers normally. Where it is "
     "an algorithmic blowup, it is timing_differential. Between those two and the input "
@@ -4139,6 +4274,108 @@ def _observation(lab_dir: Path) -> dict[str, Any]:
     return seen
 
 
+#: One clause verdict per line, each cut at the limit autoflow's digest uses
+#: for a validator result. Headroom rather than a real cut: across the ten
+#: labs of the half-seen10-2026-11-07 panel the whole of effect_evidence ran
+#: between 135 and 331 characters. Cut line-wise rather than by total length,
+#: because each line is one clause's own verdict and half a line is worse
+#: than one line fewer -- the last line is the differential's own verdict.
+_MAX_EVIDENCE_LINES = 12
+_MAX_EVIDENCE_LINE_CHARS = 600
+
+
+def _measured_differential(lab_dir: Path) -> dict[str, Any]:
+    """CVELab's verdict on the effect, handed over as a verdict.
+
+    `_observation` above hands over what each build answered, which is what a
+    spec needs in order to choose an expectation. It is not the question of
+    whether the effect occurred: CVELab settled that against a declared
+    predicate and wrote down the clause-by-clause result. This carries that
+    result, so the draft is told the verdict instead of being left to
+    re-derive it from raw bodies.
+
+    Leaving it to re-derive was measured as a wrong answer, not merely a
+    redundant one, and twice on one ten-lab panel -- both times the draft
+    reported the opposite of what the record said, and refused on it.
+
+    On a Pillow lab (panel half-seen10-2026-11-07) the vulnerable body is a
+    451-character JSON array of six `runs` objects: the first holds
+    `"tail_nonzero": false`, the five after it hold true, and the top-level
+    `"tail_nonzero": true` sits beside them. The draft read the first element
+    and refused, saying "the lab's own recorded observation found tail_nonzero
+    false on both the vulnerable and the patched build, so nothing in the
+    record shows the effect reliably".
+
+    On a Mattermost lab in the same panel it swapped the two builds. The
+    vulnerable observation holds `confirmed: true`, `blocked: false` and
+    `"name":"..\\..\\cvelab-canary.txt"`; the patched one holds `confirmed:
+    false`, `blocked: true` and the stripped `"name":"cvelab-canary.txt"`. The
+    draft reported "the vulnerable build (v11.5.4) returning
+    "name":"cvelab-canary.txt" with confirmed=false and blocked=true, the same
+    basename the patched build returns" -- the patched build's line, read as
+    the vulnerable one -- and refused because "the recorded run does not show
+    the claimed effect there". It had already judged the shape expressible:
+    "a field in an HTTP response, which a single instance can express as
+    direct_observation with body_contains, so the shape is not the obstacle".
+    That lab simulated nothing at all, so the record was the only obstacle.
+
+    Both records said the opposite in three places at once:
+    differential_confirmed true, a predicate naming exactly the string the
+    vulnerable body carries, and evidence reading `vulnerable: ... passed=True`
+    against `patched: ... passed=False`. Neither body was truncated and
+    neither was lossy -- both sat well inside _MAX_OBSERVATION_CHARS, so
+    trimming is not the fault and enlarging the observation would not help.
+
+    What the draft actually had: the predicate reached it buried as one key of
+    `confirmed_attack`, which is the plan's declaration of what would be
+    measured and says nothing about whether it held; `differential_confirmed`
+    reached it only as a line of Python inside `validator_that_proved_it`, a
+    variable name in a source listing rather than a value; and
+    `effect_evidence` did not reach it at all.
+
+    `autoflow._validation_digest` carries these same three to the repair loop
+    for exactly this reason, and the note it records is that a repair without
+    them "could only guess". A draft was guessing in the same way, from the
+    same report, one step further on.
+    """
+    try:
+        report = json.loads((lab_dir / "report.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(report, dict):
+        return {}
+    validation = report.get("validation")
+    if not isinstance(validation, dict):
+        validation = {}
+    held = report.get("effect_evidence")
+    evidence = [
+        str(line)[:_MAX_EVIDENCE_LINE_CHARS]
+        for line in (held[:_MAX_EVIDENCE_LINES] if isinstance(held, list) else [])
+    ]
+    return {
+        # Read from validation, which is where the validator's own result
+        # lands and what core's own differential_confirmed proof check reads.
+        # The top-level copy is derived from this one.
+        "differential_confirmed": validation.get("differential_confirmed"),
+        # Why differential_confirmed is false has two entirely different
+        # answers, and only this tells them apart. Where the project
+        # publishes no resolvable patched revision there is no second build,
+        # so false is the recorded shape of a VULNERABLE_ONLY lab rather than
+        # a measurement that failed -- and the instructions have always said
+        # that a lab with no fixed build is not a reason to answer
+        # feasible=false. Handing over a bare false would have manufactured a
+        # fresh wrong refusal in place of the one being fixed here: the same
+        # ambiguity an empty simulated_components list already cost once.
+        "a_fixed_build_was_tested": report.get("patched_tested") is True,
+        # The predicate the effect was judged against, and the per-clause
+        # result. The predicate is also inside confirmed_attack, and that is
+        # deliberately not where it is read from: there it is the plan's
+        # declaration of intent, here it is what the verdict was reached with.
+        "effect_predicate": (report.get("proof_contract") or {}).get("effect_predicate"),
+        "effect_evidence": evidence,
+    }
+
+
 def _validator_source(lab_dir: Path) -> str:
     path = lab_dir / "validator" / "validator.py"
     if not path.is_file():
@@ -4167,6 +4404,74 @@ def draft_manual_poc_spec(
     the model with the request. It is set here for a spec whose shape this
     validator refused, and passed in by a caller whose spec was proved against
     the lab and did not hold up.
+
+    A feasible=false answer is asked once more, with its own reason fed back
+    through that same `complaint` channel. The mechanism was already here and
+    simply never fired for this case: `_ask_for_spec` marked only a malformed
+    spec for retry, so every decline was a single unretried sample. An archive
+    audit put the cost at 8 to 12 labs of 48, and six labs had shipped on a
+    human asking a refused run again by hand.
+
+    The second ask is bounded at one and does not touch the shape-retry
+    budget. It is not a lowering of the bar: whatever the second answer
+    offers is still emitted as a script and proved against both builds, and
+    of the 11 labs that were drafted and refused by that proof, 9 ran on both
+    builds and the script fired on neither -- not one false positive has ever
+    had to be rejected there, so asking again protects nothing less.
+    """
+    answer = _draft_until_the_shape_fits(
+        cve, plan, complaint, api_key=api_key, model=model,
+        provider=provider, base_url=base_url, lab_dir=lab_dir,
+    )
+    if "spec" in answer or "declined" in answer or not answer.pop("reconsider", False):
+        return answer
+    refused = str(answer.get("reason") or "")
+    progress.step(f"the draft declined, asking once more: {refused[:120]}")
+    second = _draft_until_the_shape_fits(
+        cve, plan, _reconsider_complaint(refused), api_key=api_key, model=model,
+        provider=provider, base_url=base_url, lab_dir=lab_dir,
+    )
+    # Dropped rather than honoured: this is the one extra ask, so a second
+    # decline is the answer. Without this the two declines would ask forever.
+    second.pop("reconsider", None)
+    if "spec" in second:
+        return second
+    # The second ask produced no verdict of its own -- the provider declined
+    # it, or the call failed -- and the first ask did. Keep the first, because
+    # a model that answered feasible=false and said why is the more
+    # informative record and the truer one: reporting the lab as
+    # provider-declined would overwrite a real answer with the absence of
+    # one, and "no manual PoC" is only actionable if it says why. This is the
+    # one way asking twice could have made a record worse than asking once.
+    if "declined" in second or str(second.get("reason", "")).startswith(
+        "the spec call failed"
+    ):
+        kept = dict(answer)
+        kept["reconsidered"] = (
+            "asked again after this answer; the second ask returned no verdict "
+            f"({second.get('reason')})"
+        )
+        return kept
+    return second
+
+
+def _draft_until_the_shape_fits(
+    cve: str,
+    plan: dict[str, Any],
+    complaint: str,
+    *,
+    api_key: str | None,
+    model: str | None,
+    provider: str | None,
+    base_url: str | None,
+    lab_dir: Path | None,
+) -> dict[str, Any]:
+    """One ask, repeated while the answer does not fit the schema.
+
+    Split out from `draft_manual_poc_spec` so that the extra ask after a
+    feasible=false has its own budget: a decline must not be able to spend
+    the shape retries, and a malformed spec must not be able to spend the
+    reconsideration.
     """
     attempts = _draft_retries() + 1
     for _attempt in range(attempts):
@@ -4185,6 +4490,45 @@ def draft_manual_poc_spec(
             progress.step(f"the drafted spec did not fit, asking again: {complaint[:120]}")
     answer.pop("retry", None)
     return answer
+
+
+def _reconsider_complaint(refused: str) -> str:
+    """What goes in front of the one extra ask after a feasible=false.
+
+    It feeds the decline back rather than rewording the request, which is the
+    same thing `complaint` already does for a spec whose shape was refused.
+    Nothing here says the decline was wrong: of 48 declines in the archive
+    audit, 24 were correct and have to stay correct, so this names the
+    recoverable shapes and says plainly that answering feasible=false again is
+    a real answer. What it does not do is leave the first sample unexamined,
+    which is what every decline used to be.
+    """
+    return (
+        "You already answered feasible=false for this same finding, saying:\n"
+        f"{refused.strip()[:1500]}\n\n"
+        "Reconsider once and answer again. Most declines on record turned out to name "
+        "one of four things that have answers above, so check your reason against them "
+        "before giving it a second time.\n"
+        "  The project ships no listener of its own. That is the condition for declaring "
+        "the route as an input -- {{target_path}}, with the lab's adapter route as its lab "
+        "value -- and not a reason to decline.\n"
+        "  The only thing that reported the effect was the lab's own adapter. Separate its "
+        "diagnostic from the artifact underneath: if a route of the operator's returns that "
+        "artifact -- the decoded bytes, the cleaned text, the parsed document, the command "
+        "output -- aim at the artifact and declare the route.\n"
+        "  The effect needs something to act on that this lab had to create. discover "
+        "enumerates what a real target already holds, inputs asks the operator for what "
+        "only they know, and setup supplies the lab's own for the proof.\n"
+        "  The effect comes back in no answer at all. oob_callback, service_crash and "
+        "timing_differential each carry their own control for exactly that.\n"
+        "If your reason is none of those and the effect genuinely cannot be observed "
+        "against one live instance -- it needs two clients driven at once, or state no "
+        "response is a function of, or a second host you control -- answer feasible=false "
+        "again and say so. That is a correct answer and it will be recorded as one. Do not "
+        "offer a spec you do not believe separates the two builds: it is emitted as a "
+        "script, run against both, and discarded unless it shows the effect on the "
+        "vulnerable build and stays silent on the fixed one."
+    )
 
 
 def _draft_retries() -> int:
@@ -4221,6 +4565,16 @@ def _ask_for_spec(
                 "repository": plan.get("repository"),
                 "revisions": plan.get("revisions"),
                 "confirmed_attack": plan.get("exploit_contract") or {},
+                # CVELab's verdict, named rather than left to be inferred,
+                # and placed here on purpose: ahead of the validator source,
+                # which is up to _MAX_VALIDATOR_CHARS of the 40 KB this input
+                # gets, so the verdict cannot be what _MAX_DRAFT_INPUT cuts.
+                # The digest this mirrors records the same placement reason
+                # from the other side -- "the report is the last key and the
+                # first thing the prompt's limit cuts".
+                "the_differential_is_already_measured": (
+                    _measured_differential(lab_dir) if lab_dir else {}
+                ),
                 "container_port": _port_hint(lab_dir) if lab_dir else None,
                 "validator_that_proved_it": _validator_source(lab_dir) if lab_dir else "",
                 "what_the_validator_observed": _observation(lab_dir) if lab_dir else {},
@@ -4257,7 +4611,21 @@ def _ask_for_spec(
     if not answered.get("feasible"):
         return {
             "reason": str(answered.get("reason") or "").strip()
-            or "the model judged the effect not observable on one instance"
+            or "the model judged the effect not observable on one instance",
+            # Asked once more with this reason fed back, and only once. Not
+            # because a decline is wrong by default -- half of them are right
+            # and have to stay right -- but because it was a single unretried
+            # sample of a sampled answer. One lab asked nine times produced
+            # six scripts and three declines, every decline explaining at
+            # length that a library with no listener cannot be shown on one
+            # instance, while six scripts for that same library already
+            # existed on identical input. One sample was never the measure.
+            #
+            # Distinct from "retry" above, which means the answer did not fit
+            # the schema and is bounded by CVELAB_SPEC_RETRIES. This means the
+            # answer fit and said no. The two budgets are kept apart so a
+            # decline cannot spend the shape retries or the other way round.
+            "reconsider": True,
         }
     offered = answered.get("spec_json")
     if not isinstance(offered, str) or not offered.strip():

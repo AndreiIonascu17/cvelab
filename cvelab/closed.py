@@ -779,6 +779,13 @@ def run_closed_lab(
             "exercised_vendor_components": [vulnerable_image]
             + ([fixed_image] if fixed_image else []),
             "simulated_components": [],
+            # Documented by construction on this path, and not a claim this
+            # function makes for itself: the closed route refuses to build at
+            # all unless a non-destructive HTTP reproduction is documented in
+            # vendor or official sources, so the request this lab sends is
+            # that documented one. The generated path has to ask instead,
+            # because there the request is written rather than cited.
+            "trigger_source": "documented",
             "rationale": (
                 "Both targets are the vendor's own published images, started "
                 "unmodified and reached only over HTTP."

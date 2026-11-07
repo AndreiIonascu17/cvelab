@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -950,6 +951,9 @@ _VALIDATOR = " ".join([
     "vulnerable", "patched", "patched_tested", "fix_status",
     "differential_confirmed", "confirmed", "blocked", "observations",
     "CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "exploit", "verify",
+    # The operator entry point: _validate_generated requires the token a
+    # script that reads its arguments cannot be written without.
+    "sys.argv",
 ])
 
 _VULNERABLE_ONLY_COMPOSE = """services:
@@ -985,7 +989,13 @@ networks:
 """
 
 
-def _generation(vulnerable_only: bool) -> dict:
+#: As in tests/test_revision_pair.py: the canary is a fresh uuid per lab, so
+#: the fixture reads it out of the prompt the way the real model does.
+_MARKER = re.compile(r"CVELAB-[0-9a-f]{32}")
+
+
+def _generation(vulnerable_only: bool, instructions: str = "") -> dict:
+    planted = _MARKER.search(instructions)
     answer = {
         "cwe": "CWE-88",
         "confidence": 0.6,
@@ -995,15 +1005,26 @@ def _generation(vulnerable_only: bool) -> dict:
             "vendor_product_started": False,
             "exercised_vendor_components": ["app/main.go"],
             "simulated_components": [],
+            "trigger_source": "documented",
             "rationale": "r",
         },
         "exploit_contract": {
             "attack_summary": "a", "preconditions": [], "observable_effect": "e",
             "evidence_type": "code_execution",
+            # exploit_contract.service_port: the port the product
+            # listens on inside its container, which every answer must
+            # declare -- nothing else in a generated lab states it.
+            "service_port": 8080,
             # As above: usable for both schemas, so it meets the
             # vulnerable-only substance rule rather than only the
-            # differential one.
-            "effect_predicate": {"body_contains": "shell-ran"},
+            # differential one -- which now includes quoting the canary,
+            # since with no patched build nothing else tells the declared
+            # effect apart from how the product behaves anyway.
+            "effect_predicate": {
+                "body_contains": (
+                    f"shell-ran {planted.group()}" if planted else "shell-ran"
+                )
+            },
         },
         "docker_compose": (
             _VULNERABLE_ONLY_COMPOSE if vulnerable_only else _DIFFERENTIAL_COMPOSE
@@ -1124,7 +1145,10 @@ class _UnusablePairLab:
     def model(self, **kwargs) -> dict:
         self.schemas.append(kwargs["schema_name"])
         self.prompts.append(kwargs["input_text"])
-        return _generation(kwargs["schema"] is sourcegen.VULNERABLE_ONLY_SCHEMA)
+        return _generation(
+            kwargs["schema"] is sourcegen.VULNERABLE_ONLY_SCHEMA,
+            kwargs.get("instructions", ""),
+        )
 
     def generate(self, fixed: str, vulnerable: str) -> dict:
         self.resolve.return_value = (self.URL, fixed)
@@ -1480,7 +1504,10 @@ class ADemotionThatIsNeverWrittenChangesNothingOnDiskTests(
         before = _tree_state(lab)
 
         def unusable(**kwargs: Any) -> dict:
-            answer = _generation(kwargs["schema"] is sourcegen.VULNERABLE_ONLY_SCHEMA)
+            answer = _generation(
+                kwargs["schema"] is sourcegen.VULNERABLE_ONLY_SCHEMA,
+                kwargs.get("instructions", ""),
+            )
             answer["docker_compose"] = "services: {}\n"
             return answer
 

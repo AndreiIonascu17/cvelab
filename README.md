@@ -374,9 +374,25 @@ Key files:
 - `e2e/result.json`: the verifiable result and reproduction statuses.
 - `e2e/`: the product-specific E2E runner and probes, if used by the profile.
 - `validator/validator.py`: the executable PoC/validator for the generated adapter.
-- `artifacts/PoC.py` (or the profile-specific payload): the inspectable local PoC.
-- `artifacts/manual.sh`: the Linux runner with separate `setup`, `exploit`, `verify`, and `cleanup` actions.
-- `artifacts/MANUAL-POC.md`: manual reproduction instructions.
+- `artifacts/PoC.py` (or the profile-specific payload): the inspectable local PoC. It takes one
+  optional `host:port` and, where the weakness is command execution, a command after it; with no
+  argument it runs exactly as automatic validation runs it, inside the lab's own network.
+- `artifacts/manual.sh`: the Linux runner with separate `setup`, `exploit`, `verify`, `address`, and
+  `cleanup` actions.
+- `artifacts/PoC.ps1`: the same actions on Windows, run through WSL.
+- `artifacts/cvelab-setup.json`: a Compose file carrying the steps that put the product in the
+  state the attack needs, for a lab whose contract declares any. `manual.sh` merges it over
+  `docker-compose.yml` and carries what the steps bound through to the attack. Most labs need
+  no seeding and ship no such file.
+- `artifacts/cvelab-manual-ports.json`: a Compose file publishing the product's port on loopback,
+  with the host side left for the kernel to assign. `manual.sh` merges it over
+  `docker-compose.yml` so `address` can give `PoC.py` a host address; the lab's own Compose file
+  still publishes nothing and its network is still internal. Labs generated before the contract
+  declared a port ship no such file.
+- `artifacts/LAB-POC.md`: manual reproduction instructions for both shells. `manual.sh` drives
+  this lab's own builds and nothing outside them, and the section on `PoC.py` says what pointing
+  it at an address of your own does and does not prove. It also says whether a single-instance
+  script exists for this lab, and where one was refused, the recorded reason.
 - `artifacts/EVIDENCE.json`: structured evidence and provenance.
 - `artifacts/WALKTHROUGH.md`: manual reproduction steps.
 - `artifacts/REPORT.md`: the technical report, limitations, and conclusion.
@@ -392,6 +408,7 @@ cd generated-labs/CVE-YYYY-NNNNN/artifacts
 bash manual.sh setup vulnerable
 bash manual.sh exploit vulnerable
 bash manual.sh verify vulnerable
+python3 PoC.py "$(bash manual.sh address vulnerable)"
 bash manual.sh cleanup
 ```
 

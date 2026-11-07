@@ -596,3 +596,116 @@ def setup_override(
     for key, value in (limits or {}).items():
         definition.setdefault(key, value)
     return {"services": {service: definition}}
+
+
+#: The only address a lab's port may be published on.
+#:
+#: Never 0.0.0.0, which is what Compose binds when a short form names no
+#: address: that would put a build whose whole purpose is to be exploitable
+#: on every interface the host has, including whatever network the owner's
+#: laptop is on at a client site. Loopback keeps the reachable surface to
+#: processes already on the machine.
+MANUAL_BIND = "127.0.0.1"
+
+
+def manual_port_override(model: dict, service: str, container_port: int) -> dict:
+    """A Compose override publishing one service's port on loopback, for manual mode.
+
+    WHY THIS IS NOT THE HOLE THE `ports` REFUSAL EXISTS TO PREVENT
+
+    `ports` is refused in a lab's own definition (SERVICE_REASONS) and stays
+    refused: `enforce` never sees this override, which Compose merges over
+    the lab exactly as the runtime limits and the setup service are merged.
+    The refusal is not a claim that a published port is unsafe in the
+    abstract. It is a claim about who is present when it opens. The automatic
+    path builds and runs model-written code unattended, on the owner's
+    machine, as part of a batch nobody is watching; a `ports:` the model
+    wrote there would be an exploitable service listening on an interface at
+    a time and for a duration no person chose, and the model would be the one
+    choosing both. Manual mode inverts every term of that: a person asks for
+    one lab by name, stays at the keyboard while it runs, and tears it down
+    when the demonstration is over. The exception is held to that difference
+    by construction -- it is a separate override, written by CVELab for a
+    service the caller names, never a key a lab can put in its own file.
+
+    WHAT IT MAY ASK FOR
+
+    One short-form entry, `127.0.0.1::<container port>`, for one service.
+    The address is fixed (MANUAL_BIND) and the host side is left empty, so
+    the kernel assigns an ephemeral port: nothing collides with a port the
+    owner is already using, and nothing the model wrote picks a host-side
+    number. The caller reads the assignment back with `docker compose port
+    <service> <container port>` and hands it to the PoC as its argument. A
+    host-side number, a range, and any other address are all absent from
+    what this builds rather than validated out of it.
+
+    WHAT IT GIVES UP
+
+    A real one. For as long as the lab is up, any process on the host --
+    every browser tab, every other container with a host-gateway route,
+    anything else running as the owner -- can reach the vulnerable build
+    through loopback, and reach it unauthenticated, because being reachable
+    without credentials is usually the point of the lab. The isolation the
+    rest of this module maintains is that the lab can be reached only from
+    inside its own internal network; that is now untrue of one port of one
+    service, by request. What survives is the direction: the network stays
+    `internal: true`, so the lab still cannot reach out, and nothing outside
+    the host can reach in. That is narrower than no exception at all, and
+    calling it unchanged would be a lie.
+
+    WHERE THE PORT COMES FROM
+
+    From the caller, as an argument, because the resolved model does not
+    reliably say. `expose` is in SERVICE_KEYS but nothing in CVELab's
+    generation writes it, so almost no lab declares it; a generated lab
+    records the port it listens on only incidentally, inside a healthcheck
+    command or a URL in `environment`, where reading it back means parsing
+    strings. The closed path has the same argument for the same reason
+    (`closed._run_poc_script` takes its port). This function therefore
+    depends on the caller knowing, and the durable fix is a declared port in
+    the generation contract -- a schema change in sourcegen, not here.
+
+    When a lab does declare `expose` and it disagrees with the argument, the
+    argument wins and nothing is refused. `expose` publishes nothing and
+    changes nothing at runtime, so it is the model's note about itself rather
+    than evidence; measured against real labs it is absent far more often
+    than it is wrong, which makes it incomplete by nature, and a list that is
+    incomplete cannot be read as exhaustive enough to contradict. A
+    disagreement also costs nothing that policy protects: publishing a port
+    nothing listens on is inert, and the PoC fails to connect, which is
+    diagnosable in a second. Refusing would turn a cosmetic mismatch into a
+    hard stop in front of a client, and would do it only for the few labs
+    that declare anything at all while waving every other lab through, which
+    is a guardrail too arbitrary to learn. Which port is correct is a question
+    about the lab, not about the host, and this module only answers the
+    second kind.
+    """
+    services = model.get("services") or {}
+    # Before the membership check, so CVELab's own name is refused with the
+    # reason that actually applies: it is absent from the resolved model
+    # because CVELab injects it, not because the lab forgot it.
+    if service == SETUP_SERVICE:
+        raise PolicyError(
+            f"Compose policy refused this lab:\n  - service '{service}' is CVELab's own, "
+            "and its port may not be published: it runs CVELab's program, not the "
+            "product the PoC is written against"
+        )
+    if service not in services:
+        raise PolicyError(
+            f"Compose policy refused this lab:\n  - no service '{service}' to publish a "
+            "port for; the lab defines " + (", ".join(sorted(services)) or "no services")
+        )
+    if (
+        not isinstance(container_port, int)
+        or isinstance(container_port, bool)
+        or not 1 <= container_port <= 65535
+    ):
+        raise PolicyError(
+            "Compose policy refused this lab:\n  - container port "
+            f"{container_port!r} is not a port; it must be an integer from 1 to 65535"
+        )
+    # A sequence, which Compose appends to across `-f` files rather than
+    # replacing -- the merge hazard setup_override is written around. Safe
+    # here only because `enforce` has already refused a `ports:` of the
+    # lab's own, so there is nothing for this to be appended to.
+    return {"services": {service: {"ports": [f"{MANUAL_BIND}::{container_port}"]}}}

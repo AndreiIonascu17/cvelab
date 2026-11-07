@@ -948,8 +948,209 @@ def setup_contract(plan: dict) -> tuple[list[dict], int] | None:
     return declared, port
 
 
+def service_port(plan: dict) -> int | None:
+    """The port the product listens on inside its container, as the plan declares it.
+
+    None rather than an error for a lab that does not declare one, which is
+    every lab generated before `exploit_contract.service_port` existed. Those
+    labs run exactly as they did: nothing is published, `manual.sh` offers no
+    host address, and the kit's documents say so. Generation refuses an
+    undeclared port from here on -- `sourcegen._validate_service_port`, before
+    anything is built -- so the only labs reaching this with None are the
+    archive, and a lab already on disk is not improved by refusing to run it.
+
+    Deliberately not inferred from anything. The port is recoverable from a
+    healthcheck string in 53% of archived labs and from nothing at all in the
+    rest, and a guess that is wrong publishes a port nothing listens on and
+    hands the operator an address that refuses the connection, which reads as
+    a lab that does not reproduce.
+    """
+    contract = plan.get("exploit_contract")
+    if not isinstance(contract, dict):
+        return None
+    port = contract.get("service_port")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        return None
+    return port
+
+
+#: The Compose file that carries a lab's seeding with the lab, inside the
+#: lab's own artifacts directory.
+#:
+#: WHY THE SEEDING HAD TO BE SHIPPED AT ALL
+#:
+#: `prepare_compose` builds the setup service into a scratch override that is
+#: appended with `-f` while CVELab itself runs and removed afterwards, so a
+#: lab whose contract declares setup validated with its state established and
+#: then shipped a manual demo that could not establish it. The handed-over
+#: `manual.sh` started the product unseeded, the attack went to an instance
+#: with nothing to act on, and the demo printed BLOCKED on the affected
+#: build -- while report.json recorded the manual PoC as verified, because
+#: CVELab had run the handed-over actions itself with its own override still
+#: merged and its own bindings in the environment.
+#:
+#: WHY HERE AND NOT SOMEWHERE ELSE
+#:
+#: It is written where the resolved Compose model exists, which is the only
+#: place it can be written: `policy.setup_override` reads the networks the
+#: validator joins and the wait it declares out of the model `docker compose
+#: config` resolves, and CVELab has no YAML parser of its own -- a lab is
+#: built and validated with nothing installed. So the deliverables pass,
+#: which runs with no Docker and only plan.json to read, cannot build this
+#: file; it can only carry it through. The same bytes CVELab merged into its
+#: own run are therefore what the lab ships, rather than a second rendering
+#: of the same intent that could drift from it.
+#:
+#: Beside `manual.sh` rather than at the lab root, because it is part of the
+#: handed-over kit: `upload.read_document` reads the shared corpus's
+#: documents out of `artifacts/`, and the kit's own script resolves it from
+#: its own directory.
+SHIPPED_SETUP_FILE = "cvelab-setup.json"
+
+#: The Compose file that publishes the lab's port on loopback, for manual mode.
+#:
+#: WHY IT IS SHIPPED AND NOT MERGED HERE
+#:
+#: `policy.manual_port_override`'s docstring draws the line this file sits on:
+#: `ports` stays refused in a lab's own definition because the automatic path
+#: builds and runs model-written code unattended, and a published port there
+#: would be an exploitable service listening at a time and for a duration
+#: nobody chose. Manual mode inverts every term of that -- one lab, asked for
+#: by name, with a person at the keyboard who tears it down afterwards. So
+#: this override is written while the resolved model is in hand and then left
+#: alone: CVELab's own run never appends it, and the only thing that does is
+#: `manual.sh`, which a person starts.
+#:
+#: It is written here for the reason SHIPPED_SETUP_FILE is: this is the one
+#: place the resolved Compose model exists. `policy.manual_port_override`
+#: refuses a service the lab does not define, and answering that needs the
+#: model `docker compose config` produced -- which the deliverables pass,
+#: running with no Docker and only plan.json, cannot produce.
+#:
+#: Both builds are in one file. `manual.sh` starts one of them, so the other
+#: service's entry is inert: a `ports` on a service nothing started publishes
+#: nothing.
+SHIPPED_MANUAL_PORTS_FILE = "cvelab-manual-ports.json"
+
+
+def write_lab_file(path: Path, content: str) -> None:
+    """Write one file into a lab directory without following a link there.
+
+    `write_text` is enough for the paths CVELab chose itself. This is for a
+    write into the lab directory, which is the lab's to shape: a generated
+    lab holds a source checkout, and a lab copied from someone else holds
+    whatever they put in it, so a symlink sitting where this file goes would
+    turn the write into one anywhere the daemon's user can reach. The
+    scratch override next door sidesteps the question by writing outside the
+    lab entirely; this file has to be inside it, because the point of it is
+    that it travels with the lab.
+
+    O_NOFOLLOW refuses the link rather than resolving it, and the
+    `is_symlink` pass covers the parent and the platforms where the flag
+    does not exist -- Windows, where `os.open` ignores an unknown flag.
+    """
+    for part in (path, path.parent):
+        if part.is_symlink():
+            raise RuntimeError(
+                f"Refusing to write {path.name}: {part} is a symlink, and a lab "
+                "directory is the lab's own to shape"
+            )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    with os.fdopen(os.open(path, flags, 0o644), "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(redact(content))
+
+
+#: What `manual_poc_status` says when the handed-over actions passed under
+#: CVELab and the kit the operator gets cannot repeat them, because the state
+#: its own contract declares does not travel with it. Not "verified", which
+#: would be the report claiming something nobody can reproduce, and not
+#: "failed", which would say the actions failed when they did not.
+SEEDING_NOT_SHIPPED = "seeding_not_shipped"
+
+
+def shipped_setup_gap(lab_dir: Path, plan: dict) -> str:
+    """Why this lab's shipped demo cannot seed itself, or "" when it can.
+
+    Read from the files in the lab directory and from nothing else: not from
+    a field the model wrote, not from a sentence in the generated guide, and
+    not from the fact that CVELab's own run seeded successfully -- which is
+    exactly the thing that was true while the shipped demo could not. What
+    the contract declares is compared against what the lab actually holds.
+
+    "" for every lab whose contract declares no seeding, which is all but a
+    handful: there is nothing to carry, so there is no gap, and those labs
+    are reported exactly as they were.
+    """
+    try:
+        contract = setup_contract(plan)
+    except RuntimeError as refused:
+        return str(refused)
+    if contract is None:
+        return ""
+    declared, port = contract
+    artifacts = lab_dir / "artifacts"
+    runner = artifacts / "manual.sh"
+    override = artifacts / SHIPPED_SETUP_FILE
+    if not runner.is_file():
+        return "the lab ships no manual.sh, so there is no handed-over demo to seed"
+    if not override.is_file():
+        return (
+            f"the contract declares {len(declared)} setup step(s) and the lab ships no "
+            f"{SHIPPED_SETUP_FILE}, so the handed-over demo starts the product unseeded"
+        )
+    try:
+        shipped = json.loads(override.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as unreadable:
+        return f"{SHIPPED_SETUP_FILE} is not a readable Compose document: {unreadable}"
+    try:
+        script = runner.read_text(encoding="utf-8", errors="replace")
+    except OSError as unreadable:
+        return f"manual.sh cannot be read: {unreadable}"
+    service = (shipped.get("services") or {}).get(policy.SETUP_SERVICE)
+    if not isinstance(service, dict) or not service:
+        return f"{SHIPPED_SETUP_FILE} declares no {policy.SETUP_SERVICE} service"
+    environment = service.get("environment")
+    if not isinstance(environment, dict):
+        return (
+            f"{SHIPPED_SETUP_FILE} gives {policy.SETUP_SERVICE} no environment, so the "
+            "steps never reach the runner"
+        )
+    try:
+        carried = json.loads(environment.get(steps.SETUP_SPEC_VARIABLE) or "null")
+    except (TypeError, json.JSONDecodeError):
+        carried = None
+    if carried != declared:
+        return (
+            f"the steps {SHIPPED_SETUP_FILE} carries are not the ones the contract "
+            "declares, so the shipped demo would seed something else"
+        )
+    if str(environment.get(steps.SETUP_PORT_VARIABLE)) != str(port):
+        return (
+            f"{SHIPPED_SETUP_FILE} sends the steps to a different port than "
+            f"exploit_contract.setup_port names ({port})"
+        )
+    # The script has to reach the service, name the build it is seeding and
+    # carry the bindings on to the attack. Any one of the three missing is a
+    # kit that runs the steps and then throws away what they established,
+    # which measures the same as never having seeded at all.
+    missing = [
+        token
+        for token in (
+            SHIPPED_SETUP_FILE, policy.SETUP_SERVICE,
+            steps.SETUP_TARGET_VARIABLE, steps.SETUP_BOUND_VARIABLE,
+        )
+        if token not in script
+    ]
+    if missing:
+        return "manual.sh does not carry the seeding through: it never names " + ", ".join(missing)
+    return ""
+
+
 def prepare_compose(
-    lab_dir: Path, setup: tuple[list[dict], int] | None = None
+    lab_dir: Path,
+    setup: tuple[list[dict], int] | None = None,
+    manual_port: int | None = None,
 ) -> tuple[str, dict[str, str], list[str], Path]:
     """Vet a lab's Compose definition and build the command that runs it.
 
@@ -964,6 +1165,12 @@ def prepare_compose(
     override as the runtime limits, because that override is already a
     deterministic Compose file of CVELab's that Compose merges over the
     lab's; there is no second mechanism to invent.
+
+    `manual_port` is the port the lab's contract declares the product listens
+    on. Given one, the loopback publishing override is WRITTEN into the lab's
+    artifacts for `manual.sh` to append, and is deliberately not appended to
+    the command returned here: see SHIPPED_MANUAL_PORTS_FILE for why the
+    automatic run must not publish anything.
 
     Returns the docker executable, the environment both it and Compose need,
     the Compose command with the override appended, and the scratch
@@ -1004,6 +1211,33 @@ def prepare_compose(
             limits=runtime_limits(),
         )
         limits.setdefault("services", {}).update(injected["services"])
+        # The same definition, written into the lab so the seeding travels
+        # with it. Only the setup service: the runtime ceilings and the
+        # startup grace above are what CVELab holds its own run to, and
+        # shipping them would make the handed-over demo a different lab from
+        # the one the operator reads about.
+        write_lab_file(
+            lab_dir / "artifacts" / SHIPPED_SETUP_FILE,
+            json.dumps(injected, indent=2) + "\n",
+        )
+    if manual_port is not None:
+        # Every build the lab defines, in one file, so `manual.sh` appends
+        # the same file whichever target the operator asked for. A service
+        # the lab does not define is skipped rather than refused: a
+        # vulnerable-only lab has no patched build, and asking
+        # manual_port_override for one would raise on a lab that is
+        # perfectly well formed.
+        published: dict[str, object] = {}
+        for build in ("vulnerable", "patched"):
+            if build in (model.get("services") or {}):
+                published.update(
+                    policy.manual_port_override(model, build, manual_port)["services"]
+                )
+        if published:
+            write_lab_file(
+                lab_dir / "artifacts" / SHIPPED_MANUAL_PORTS_FILE,
+                json.dumps({"services": published}, indent=2) + "\n",
+            )
     # Outside the lab directory, which is the lab's to shape: a symlink
     # there would turn this write into one anywhere.
     scratch = Path(tempfile.mkdtemp(prefix="cvelab-limits-"))
@@ -1261,7 +1495,10 @@ def _validator_observations(validation: dict, build: str) -> dict:
 
 
 def effect_observed(
-    validation: dict, contract: dict, vulnerable_only: bool = False
+    validation: dict,
+    contract: dict,
+    vulnerable_only: bool = False,
+    marker: str | None = None,
 ) -> tuple[bool, list[str]]:
     """CVELab's own verdict on whether the declared security effect happened.
 
@@ -1298,9 +1535,37 @@ def effect_observed(
     terms. There is nothing to write around, because the looser the
     predicate the more certainly it fails.
 
+    WHAT STANDS IN FOR THE COMPARISON WHEN THERE IS NO PATCHED SIDE
+
     A vulnerable-only lab has no patched side, so the comparison cannot do
-    that work there; the declaration is instead held to a syntactic minimum
-    at generation time, in `sourcegen._vulnerable_only_substance`.
+    that work there, and for a while nothing did: the vulnerable side's
+    verdict was returned on its own. A predicate matching something the
+    product emits by itself clears that automatically, and one did. The
+    measured case declared a text the runtime prints for any script that
+    exceeds its configured memory limit -- specific, non-empty, not a status
+    clause, and true of a patched build as much as of this one. It validated
+    with PUBLIC_FIX_NOT_IDENTIFIED and a full deliverable set, and the only
+    step that objected was the manual-PoC drafter, which would not write a
+    script for a proxy.
+
+    What replaces the comparison is the question the comparison was asking:
+    did the attack introduce the thing being matched? So one clause must
+    quote `marker`, the canary the lab planted -- the lab's own value, which
+    the generation is told to use as its canary data and which the sound
+    archived lab names in its predicate. The rule is declared and refused
+    before the build, in `sourcegen._vulnerable_only_substance`, where its
+    reasoning and what it costs are written out; it is repeated here for the
+    reason the unknown-kinds branch below is repeated, and with better cause.
+    That branch guards against a plan edited after generation. This one also
+    catches a plan generated before the rule existed, which is how the
+    measured case holds a VALIDATED report today: revalidating that lab must
+    not reproduce it, and refusing only at generation would leave it passing.
+
+    Nothing about this touches a differential lab. It is reached only when
+    `vulnerable_only` is set, and it must stay that way: 43 of the 53
+    archived differential predicates quote an attacker-supplied value or an
+    adapter-computed field rather than the marker, and the comparison is
+    what judges those.
 
     Returns the verdict and the evidence lines behind it. Fails closed in
     every direction: an undeclared predicate, a kind nothing evaluates, an
@@ -1330,7 +1595,29 @@ def effect_observed(
     )
     evidence = [f"vulnerable: {line}" for line in vulnerable.evidence]
     if vulnerable_only:
-        return vulnerable.held, evidence
+        # Reported alongside what was measured rather than instead of it, so
+        # the evidence says both that the predicate held and that holding did
+        # not settle anything. The refused lab's evidence read, in full,
+        # "vulnerable: body_regex='Allowed memory size of [0-9]+ bytes
+        # exhausted' passed=True" -- which is true, and is why a reader of
+        # the report had nothing to go on.
+        quoting = predicate.quotes(declared, marker)
+        anchored = bool(quoting)
+        planted = str(marker or "").strip()
+        if not planted:
+            found = "this plan records no canary, so nothing says what the lab planted"
+        elif anchored:
+            found = (
+                f"the canary {planted} this lab planted is quoted by "
+                + ", ".join(quoting)
+            )
+        else:
+            found = f"no clause quotes the canary {planted} this lab planted"
+        evidence.append(
+            f"{found}, so the declared effect is{'' if anchored else ' not'} something "
+            f"the attack introduced; passed={vulnerable.held and anchored}"
+        )
+        return vulnerable.held and anchored, evidence
     patched = predicate.effect_observed(
         _validator_observations(validation, "patched"), declared, where=where
     )
@@ -1403,7 +1690,9 @@ def run_lab(
         if missing:
             raise RuntimeError("Generated lab preflight failed; missing: " + ", ".join(missing))
     declared_setup = setup_contract(plan)
-    docker, environment, compose, scratch = prepare_compose(lab_dir, declared_setup)
+    docker, environment, compose, scratch = prepare_compose(
+        lab_dir, declared_setup, service_port(plan)
+    )
     validated_run = False
     try:
         with progress.stage("building lab images"):
@@ -1467,7 +1756,7 @@ def run_lab(
         patched_blocked = _validator_said(validation, "patched", "blocked")
         proof_contract = plan.get("exploit_contract", {})
         effect_held, effect_evidence = effect_observed(
-            validation, proof_contract, vulnerable_only
+            validation, proof_contract, vulnerable_only, plan.get("marker")
         )
         proof_checks = {
             "source_reproduction": plan.get("lab_type")
@@ -1582,6 +1871,31 @@ def run_lab(
                     "shipped": False,
                     "reason": f"{type(error).__name__}: {error}"[:600],
                 }
+        # Whether the kit on disk can do what CVELab just did. The four
+        # actions above were run by CVELab, through `run_validator`, with its
+        # own setup override still merged and its own bindings in the
+        # environment -- none of which the operator has. So the actions
+        # passing says the validator answers those actions, and says nothing
+        # about whether the handed-over script can put the lab in the state
+        # they need. That is a question about files, and it is answered by
+        # reading them.
+        #
+        # It is recorded beside the checks and not among them. Every value in
+        # proof_checks is ANDed into the lab's status, and a lab that
+        # reproduced its CVE differentially has proved it whether or not the
+        # kit beside it can seed: demoting the run would throw away the proof
+        # to punish the packaging. What must not survive is the claim, so the
+        # claim is what this changes.
+        #
+        # Provisional for a lab that declares seeding, and deliberately so.
+        # The seeding file is already here -- `prepare_compose` wrote it
+        # before anything was built -- but `manual.sh` is written by the
+        # deliverables pass, which runs after this function returns, so the
+        # answer here is "no manual.sh" until that pass settles it by calling
+        # the same function again over the kit it has just written. It fails
+        # closed in the meantime: a run that never reaches the deliverables
+        # keeps the answer that claims less.
+        setup_gap = shipped_setup_gap(lab_dir, plan)
         # Compose can surface a lifecycle exit code after `docker wait` even
         # when the validator completed and emitted a complete proof document.
         # Accept only the strict, independently checked proof contract; retain
@@ -1621,12 +1935,19 @@ def run_lab(
             "manual_poc_checks": manual_poc_checks,
             # Beside the checks rather than among them: "not_run" is the
             # third state proof_checks has no room for, since every value
-            # there is ANDed into the status.
+            # there is ANDed into the status. SEEDING_NOT_SHIPPED is the
+            # fourth, for the same reason -- the actions did run and did
+            # pass, and what failed is the kit's ability to repeat them.
             "manual_poc_status": (
                 "not_run" if "manual_poc_verified" not in proof_checks
-                else "verified" if proof_checks["manual_poc_verified"]
-                else "failed"
+                else "failed" if not proof_checks["manual_poc_verified"]
+                else SEEDING_NOT_SHIPPED if setup_gap
+                else "verified"
             ),
+            # Named here even when empty, so a reader can tell a lab that was
+            # checked and had nothing to carry from one written before the
+            # check existed.
+            "manual_poc_shipping_gap": setup_gap or None,
             "manual_poc_field": manual_poc_field,
             "validator_exit_code": validator_exit,
             # The names each build bound and not their values. A repair that

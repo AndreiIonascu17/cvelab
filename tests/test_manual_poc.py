@@ -19,6 +19,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import json
+import re
 import subprocess
 import tempfile
 import unittest
@@ -628,14 +629,136 @@ class StaysLocalTests(unittest.TestCase):
                 self.assertNotIn(name, upload.ALWAYS)
                 self.assertNotIn(name, upload.EXPLOIT)
 
-    def test_its_name_does_not_collide_with_the_in_lab_manual_runner(self) -> None:
-        """MANUAL-POC.md and manual.sh drive PoC.py inside the lab."""
-        self.assertNotIn(
-            field.MANUAL_POC_NAME, ("manual.sh", "MANUAL-POC.md", "PoC.py")
+
+class NamesCannotCollideTests(unittest.TestCase):
+    """No two artifact names may differ only by case.
+
+    This class replaces a test that claimed to make this guarantee and did
+    not. It compared `field.MANUAL_POC_GUIDE_NAME` against the tuple
+    `("manual.sh", "MANUAL-POC.md", "PoC.py")` with assertNotIn, which is an
+    exact-string membership test: "Manual-PoC.md" is not equal to
+    "MANUAL-POC.md", so it passed, while the two names were the same file on
+    macOS and on Windows. 13 of the archived labs held both documents, and on
+    those platforms one of the two was silently lost to whichever was written
+    second. A test whose name promises "does not collide" and compares with
+    `==` semantics is worse than no test, because it is read as cover.
+
+    The lab guide was renamed to LAB-POC.md. These tests are the guard that
+    should have existed, and they compare the way Windows and macOS do.
+    """
+
+    #: Every name CVELab writes into a lab's artifacts/ directory, in the
+    #: spelling it writes. Collected from the constants where there are
+    #: constants and spelled out where the writer spells it out.
+    ARTIFACT_NAMES = (
+        field.MANUAL_POC_NAME,
+        field.MANUAL_POC_GUIDE_NAME,
+        field.MANUAL_POC_RECORD_NAME,
+        field.LAB_POC_GUIDE_NAME,
+        "PoC.py", "PoC.ps1", "manual.sh",
+        "REPORT.md", "WALKTHROUGH.md",
+        "EVIDENCE.json", "report.json", "plan.json", "contract.json",
+        "analysis.json", "field-poc.py", "field-spec.json",
+    )
+
+    def test_no_two_artifact_names_differ_only_by_case(self) -> None:
+        folded: dict[str, str] = {}
+        for name in self.ARTIFACT_NAMES:
+            earlier = folded.setdefault(name.lower(), name)
+            with self.subTest(name=name):
+                self.assertEqual(
+                    earlier, name,
+                    f"{name!r} and {earlier!r} are one file on macOS and Windows",
+                )
+
+    def test_the_two_manual_documents_are_distinct_without_case(self) -> None:
+        """The exact pair that collided, asserted the way the bug happened."""
+        self.assertNotEqual(
+            field.LAB_POC_GUIDE_NAME.lower(),
+            field.MANUAL_POC_GUIDE_NAME.lower(),
         )
-        self.assertNotIn(
-            field.MANUAL_POC_GUIDE_NAME, ("manual.sh", "MANUAL-POC.md", "PoC.py")
+        # And the old name really is gone from what gets written. It survives
+        # only in upload's allowlists, for archived labs that still hold it.
+        self.assertNotEqual(
+            field.LAB_POC_GUIDE_NAME, field.LEGACY_LAB_POC_GUIDE_NAME
         )
+        self.assertEqual(
+            field.LEGACY_LAB_POC_GUIDE_NAME.lower(),
+            field.MANUAL_POC_GUIDE_NAME.lower(),
+            "the legacy name is kept precisely because it DID collide; if this "
+            "stops being true the comments explaining the rename are wrong",
+        )
+
+    def test_the_whole_package_declares_no_colliding_file_name(self) -> None:
+        """Scanned, not enumerated, so a new name added anywhere is caught.
+
+        The list above is only as good as whoever maintained it, and the bug
+        this replaces happened because two modules each declared a name
+        without seeing the other's. This reads every quoted file name in the
+        package the way test_no_per_cve_logic reads every line, so a third
+        module introducing a third spelling fails here even if nobody thinks
+        to extend ARTIFACT_NAMES.
+        """
+        quoted = re.compile(
+            r"""["']([A-Za-z0-9][A-Za-z0-9._-]*\.(?:md|json|py|sh|ps1|yml|yaml))["']"""
+        )
+        # The one name that is allowed to collide, because colliding is the
+        # whole of what it records. LEGACY_LAB_POC_GUIDE_NAME is the name the
+        # lab guide had when it was one file with Manual-PoC.md on macOS and
+        # Windows. Nothing writes it; it stays in upload.py's allowlists so
+        # that an archived lab holding it still ships it. A read-only name
+        # cannot overwrite anything, so it is exempt here -- and exempt by
+        # name, in one place, rather than by loosening the scan.
+        exempt = {field.LEGACY_LAB_POC_GUIDE_NAME}
+        found: dict[str, tuple[str, str]] = {}
+        for source in sorted(Path(field.__file__).parent.glob("*.py")):
+            for name in quoted.findall(source.read_text(encoding="utf-8")):
+                if name in exempt:
+                    continue
+                where = found.setdefault(name.lower(), (name, source.name))
+                if where[0] != name:
+                    self.fail(
+                        f"{source.name} declares {name!r} and {where[1]} declares "
+                        f"{where[0]!r}; those are one file on macOS and Windows"
+                    )
+
+    def test_the_upload_allowlists_name_the_document_that_is_written(self) -> None:
+        """upload.py spells the names out, so something has to tie them here.
+
+        The allowlists are a declarative list of literals and are easier to
+        read that way, but a rename that missed them would stop shipping a
+        document with no test failing anywhere.
+        """
+        self.assertIn(field.LAB_POC_GUIDE_NAME, upload.ALWAYS)
+        self.assertIn(field.LAB_POC_GUIDE_NAME, upload.EXPLOIT)
+        # Both names stay reachable: an archived lab holds the old one.
+        self.assertIn(field.LEGACY_LAB_POC_GUIDE_NAME, upload.ALWAYS)
+        self.assertIn(field.LEGACY_LAB_POC_GUIDE_NAME, upload.EXPLOIT)
+
+    def test_an_archived_lab_still_ships_its_guide_under_the_old_name(self) -> None:
+        """The reason the legacy name is on the allowlist, exercised.
+
+        `cvelab upload` reads a lab directory off disk, and 87 of the archived
+        labs were generated when the guide was called MANUAL-POC.md. Dropping
+        the old name would have silently stopped shipping a document those
+        labs still have -- and silently, because the share gate does not
+        require this document, so the upload would have succeeded.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            lab = Path(root) / "CVE-2026-0001"
+            artifacts = lab / "artifacts"
+            artifacts.mkdir(parents=True)
+            (artifacts / field.LEGACY_LAB_POC_GUIDE_NAME).write_text(
+                "# an archived lab's guide\n", encoding="utf-8"
+            )
+            payload = upload.collect(
+                lab, {"ok": True, "cve": "CVE-2026-0001"},
+                provider="anthropic", model="m", include_poc=True,
+            )
+        names = {document["name"] for document in payload["documents"]}
+        self.assertIn(field.LEGACY_LAB_POC_GUIDE_NAME, names)
+        # And only one of the two ever travels, because only one is on disk.
+        self.assertNotIn(field.LAB_POC_GUIDE_NAME, names)
 
 
 class CommandLineTests(unittest.TestCase):
@@ -1008,6 +1131,49 @@ class NoFixedBuildTests(unittest.TestCase):
         )
         self.assertIn("stayed silent on the fixed one", with_fix)
         self.assertNotIn("weaker evidence", with_fix)
+
+    def test_the_guide_says_what_it_runs_against_and_names_the_other_one(self) -> None:
+        """The one fact a reader taking this to a client needs first.
+
+        This document and the lab's one both opened with the identical line
+        `# <CVE> Manual PoC`, so neither the heading, the filename nor the
+        first paragraph told the reader which of the two could be pointed at a
+        live server. Only this one can.
+        """
+        guide = field._manual_poc_guide(
+            "CVE-2026-0001", field.validate_spec(_spec()), {"repository": "r"}, 8000,
+        )
+        flat = " ".join(guide.split())
+
+        self.assertTrue(guide.startswith("# CVE-2026-0001 Manual PoC"))
+        self.assertIn("## What this runs against", guide)
+        self.assertIn("One instance whose address you supply, with `--target`", flat)
+        self.assertIn("pointed at a server you did not build yourself", flat)
+        # And it names the other document, so the reader can find the one
+        # whose reach was only ever this lab's own builds.
+        self.assertIn(field.LAB_POC_GUIDE_NAME, guide)
+        self.assertIn("and nothing outside them", flat)
+        # That document's `PoC.py` now takes an optional address as well, so
+        # what separates the two is which was PROVED against a single
+        # instance, not which could be aimed at one. Saying otherwise here
+        # would be the overclaim this whole section exists to prevent.
+        self.assertIn("nothing proved it against one", flat)
+
+    def test_the_guide_does_not_credit_one_build_with_a_second(self) -> None:
+        """A vulnerable-only lab has one build for the other document to drive.
+
+        Saying "two Docker builds" there would promise a differential that the
+        trust section three paragraphs later explicitly denies, in the same
+        document.
+        """
+        guide = field._manual_poc_guide(
+            "CVE-2026-0001", field.validate_spec(_spec()),
+            {"lab_type": "VULNERABLE_ONLY_REPRODUCTION", "repository": "r"}, 8000,
+        )
+        flat = " ".join(guide.split())
+
+        self.assertIn("this lab's own build and nothing outside them", flat)
+        self.assertNotIn("two Docker builds", flat)
 
 
 class EvidenceLabelTests(unittest.TestCase):
@@ -2118,6 +2284,572 @@ class WhatTheValidatorObservedTests(unittest.TestCase):
         """So the differential survives without completing the action."""
         self.assertIn("accepted at all", field._DRAFT_INSTRUCTIONS)
         self.assertIn("damage you do not need", field._DRAFT_INSTRUCTIONS)
+
+
+class TheDifferentialIsHandedOverAsAVerdictTests(unittest.TestCase):
+    """The draft is told the verdict instead of re-deriving it.
+
+    Twice on the half-seen10-2026-11-07 panel a draft re-read the raw bodies,
+    reached the opposite of what the record said, and refused on it.
+
+    CVE-2026-112404 (Pillow): the vulnerable body is a 451-character JSON
+    array of six `runs` objects whose first holds `"tail_nonzero": false` and
+    whose remaining five hold true. The draft read the first element and said
+    "the lab's own recorded observation found tail_nonzero false on both the
+    vulnerable and the patched build".
+
+    CVE-2026-6961 (Mattermost): it swapped the builds, quoting the patched
+    build's confirmed=false and its stripped basename as the vulnerable
+    build's, and refused because "the recorded run does not show the claimed
+    effect there" -- having already written that the shape "is not the
+    obstacle". That lab simulated nothing, so the record was all there was.
+
+    Both reports carried differential_confirmed true, a predicate naming the
+    exact string the vulnerable body holds, and evidence reading passed=True
+    against passed=False. Neither body was truncated. The predicate reached
+    the draft only as a key of confirmed_attack -- the plan's declaration of
+    what would be measured -- differential_confirmed only as a line of Python
+    inside the validator listing, and effect_evidence not at all.
+    """
+
+    def _handed(self, lab_dir: Path) -> dict[str, Any]:
+        """What _ask_for_spec actually puts in front of the model."""
+        held: dict[str, Any] = {}
+
+        def answer(**kwargs: Any) -> dict[str, Any]:
+            held["text"] = kwargs["input_text"]
+            return {"feasible": False, "reason": "not asked here",
+                    "container_port": None, "spec_json": None, "lab_values_json": None}
+
+        with mock.patch.object(field, "structured_response", side_effect=answer):
+            field._ask_for_spec(
+                "CVE-2026-0001", json.loads((lab_dir / "plan.json").read_text()), "",
+                api_key="k", model="m", provider="anthropic", base_url=None,
+                lab_dir=lab_dir,
+            )
+        return {"text": held["text"], **json.loads(held["text"])}
+
+    @contextlib.contextmanager
+    def _lab_reporting(self, **report: Any) -> Iterator[Path]:
+        with _lab() as lab_dir:
+            (lab_dir / "report.json").write_text(json.dumps(report))
+            yield lab_dir
+
+    def _confirmed(self) -> dict[str, Any]:
+        """The shape of CVE-2026-112404's report, bodies and all."""
+        body = (
+            '{"status": "decoded", "runs": [{"tail_nonzero": false}, '
+            '{"tail_nonzero": true}, {"tail_nonzero": true}], "tail_nonzero": true}'
+        )
+        return {
+            "patched_tested": True,
+            "proof_contract": {"effect_predicate": {"body_regex": '"tail_nonzero": true'}},
+            "effect_evidence": [
+                'vulnerable: body_regex=\'"tail_nonzero": true\' passed=True',
+                'patched: body_regex=\'"tail_nonzero": true\' passed=False',
+                "effect on vulnerable=True effect on patched=False passed=True",
+            ],
+            "validation": {
+                "differential_confirmed": True,
+                "vulnerable": {"confirmed": True, "observations": {"body": body}},
+                "patched": {"confirmed": False, "observations": {"body": "{}"}},
+            },
+        }
+
+    def test_a_confirmed_differential_is_handed_over_as_the_verdict(self) -> None:
+        """The whole point: the draft is told, not left to work it out."""
+        with self._lab_reporting(**self._confirmed()) as lab_dir:
+            handed = self._handed(lab_dir)
+        verdict = handed["the_differential_is_already_measured"]
+        self.assertIs(verdict["differential_confirmed"], True)
+        self.assertEqual(
+            verdict["effect_predicate"], {"body_regex": '"tail_nonzero": true'}
+        )
+        self.assertIn("passed=True", verdict["effect_evidence"][0])
+        self.assertIn("passed=False", verdict["effect_evidence"][1])
+
+    def test_all_three_names_reach_the_draft_as_values(self) -> None:
+        """None of the three did before, which is what the drafts were missing.
+
+        The predicate arrived only inside confirmed_attack, which says what
+        was to be measured and not whether it held; differential_confirmed
+        only as a variable name in the validator source; effect_evidence not
+        at all. A name has to arrive as a value to be read as one.
+        """
+        with self._lab_reporting(**self._confirmed()) as lab_dir:
+            handed = self._handed(lab_dir)
+        verdict = handed["the_differential_is_already_measured"]
+        for name in ("differential_confirmed", "effect_predicate", "effect_evidence"):
+            with self.subTest(name=name):
+                self.assertIn(name, verdict)
+        # Same three autoflow's repair digest carries, for the same reason.
+        digest = autoflow._validation_digest(self._confirmed())
+        for name in ("differential_confirmed", "effect_predicate", "effect_evidence"):
+            with self.subTest(digest=name):
+                self.assertEqual(digest[name], verdict[name])
+
+    def test_the_verdict_cannot_be_what_the_input_limit_cuts(self) -> None:
+        """It sits ahead of the validator source, which is 20 KB of the 40.
+
+        The digest records the same hazard from the other side: "the report is
+        the last key and the first thing the prompt's limit cuts".
+        """
+        with self._lab_reporting(**self._confirmed()) as lab_dir:
+            (lab_dir / "validator").mkdir(exist_ok=True)
+            (lab_dir / "validator" / "validator.py").write_text("#" + "x" * 40_000)
+            handed = self._handed(lab_dir)
+        text = handed["text"]
+        self.assertLessEqual(len(text), field._MAX_DRAFT_INPUT)
+        self.assertLess(
+            text.index("the_differential_is_already_measured"),
+            text.index("validator_that_proved_it"),
+        )
+        self.assertIs(
+            handed["the_differential_is_already_measured"]["differential_confirmed"], True
+        )
+
+    def test_a_vulnerable_only_lab_is_not_read_as_a_failed_measurement(self) -> None:
+        """false here has two meanings and only this separates them.
+
+        CVE-2026-36045 is the shape: no resolvable patched revision, so no
+        second build ran and there was no differential to confirm. Handing
+        over a bare false would have manufactured a fresh wrong refusal in
+        place of the one being fixed -- and the instructions have always said
+        a lab with no fixed build is not a reason to answer feasible=false.
+        """
+        with self._lab_reporting(
+            patched_tested=False,
+            proof_contract={"effect_predicate": {"status": [200]}},
+            effect_evidence=["vulnerable: status=200 allowed=[200] passed=True"],
+            validation={"differential_confirmed": False,
+                        "vulnerable": {"confirmed": True}},
+        ) as lab_dir:
+            verdict = self._handed(lab_dir)["the_differential_is_already_measured"]
+        self.assertIs(verdict["differential_confirmed"], False)
+        self.assertIs(verdict["a_fixed_build_was_tested"], False)
+        self.assertIn("passed=True", verdict["effect_evidence"][0])
+        self.assertIn("a_fixed_build_was_tested", field._DRAFT_INSTRUCTIONS)
+        self.assertIn("no second build was ever run", field._DRAFT_INSTRUCTIONS)
+
+    def test_a_lab_with_no_report_is_not_an_error(self) -> None:
+        with _lab() as lab_dir:
+            (lab_dir / "report.json").unlink()
+            self.assertEqual(field._measured_differential(lab_dir), {})
+
+    def test_a_report_with_nothing_recorded_says_nothing(self) -> None:
+        for report in ({}, {"validation": "not a dict"}, {"effect_evidence": "text"}):
+            with self.subTest(report=report), self._lab_reporting(**report) as lab_dir:
+                verdict = field._measured_differential(lab_dir)
+                self.assertIsNone(verdict["differential_confirmed"])
+                self.assertEqual(verdict["effect_evidence"], [])
+
+    def test_the_evidence_is_cut_line_wise_rather_than_mid_clause(self) -> None:
+        """Each line is one clause's verdict; half a line is worse than none."""
+        with self._lab_reporting(
+            effect_evidence=["clause " + "x" * 2000] * 40,
+        ) as lab_dir:
+            evidence = field._measured_differential(lab_dir)["effect_evidence"]
+        self.assertEqual(len(evidence), field._MAX_EVIDENCE_LINES)
+        self.assertTrue(evidence[0].startswith("clause "))
+        self.assertEqual(len(evidence[0]), field._MAX_EVIDENCE_LINE_CHARS)
+
+    def test_the_draft_is_told_the_differential_is_not_its_question(self) -> None:
+        said = field._DRAFT_INSTRUCTIONS
+        self.assertIn("the_differential_is_already_measured", said)
+        self.assertIn("CVELab's verdict", said)
+        self.assertIn("answering a question nobody asked", said)
+        # The bodies keep their job -- choosing an expectation -- and lose the
+        # one they were being read for.
+        self.assertIn("never take the first element of a list as the result", said)
+
+    def test_the_two_standing_refusals_are_still_named_as_refusals(self) -> None:
+        """Nothing here lowers the bar, so both stay spelled out."""
+        said = field._DRAFT_INSTRUCTIONS
+        self.assertIn("effect one instance genuinely cannot express", said)
+        self.assertIn("only evidence comes through a route the lab invented", said)
+
+
+class RefusingIsStillTheAnswerWhenItShouldBeTests(unittest.TestCase):
+    """The two correct refusals on that panel, kept correct.
+
+    Two labs had a spec drafted, proved against both builds and refused --
+    "the script did not tell the two builds apart" -- which is the prover
+    working. Nothing about handing the draft a verdict touches the prover, and
+    these pin that: a spec whose script cannot separate the builds must not
+    ship however confidently the differential was measured, because the lab's
+    own validator separating them says nothing about whether this script does.
+    """
+
+    def _prove(self, observed: tuple[bool, bool]) -> dict[str, Any]:
+        with _lab() as lab_dir, mock.patch.object(
+            field, "_service_container", side_effect=lambda c, name, d, e: f"cid-{name}",
+        ), mock.patch.object(field, "_still_serving", return_value="127.0.0.1"), \
+             mock.patch.object(field.sidecar, "ensure_image", return_value="img"), \
+             mock.patch.object(
+                 field, "_run_field_script",
+                 side_effect=lambda cid, *a, **k: _run(
+                     observed=observed[0] if cid.endswith("vulnerable") else observed[1],
+                     ran=True,
+                 ),
+             ):
+            return field.prove_manual_poc(
+                "CVE-2026-0001", field.validate_spec(_spec()), 3000, lab_dir,
+                ["docker", "compose"], {}, {}, True, None,
+            )
+
+    def test_a_script_that_fires_on_both_builds_does_not_ship(self) -> None:
+        outcome = self._prove((True, True))
+        self.assertIs(outcome["shipped"], False)
+        self.assertIn("did not tell the two builds apart", outcome["reason"])
+        self.assertNotIn("script", outcome)
+
+    def test_a_script_silent_on_both_builds_does_not_ship(self) -> None:
+        outcome = self._prove((False, False))
+        self.assertIs(outcome["shipped"], False)
+        self.assertIn("did not tell the two builds apart", outcome["reason"])
+        self.assertNotIn("script", outcome)
+
+    def test_a_refusal_on_the_lab_s_own_route_is_still_carried_back(self) -> None:
+        """The draft refusing for a harness-only channel is kept as the answer.
+
+        An effect visible only through an endpoint the lab added does not
+        exist on a stock instance. The decline is now put back once -- see
+        ADeclineIsAskedOnceMoreTests -- and a draft that gives it again has
+        its refusal carried back untouched rather than retried into a spec.
+        """
+        refused = (
+            "the only evidence is a flag the lab's own adapter computes, which "
+            "no stock instance reports"
+        )
+        with mock.patch.object(
+            field, "structured_response",
+            return_value={"feasible": False, "reason": refused,
+                          "container_port": None, "spec_json": None,
+                          "lab_values_json": None},
+        ) as asked:
+            out = field.draft_manual_poc_spec(
+                "CVE-2026-0001", {"exploit_contract": {}}, api_key="k", model="m",
+                provider="anthropic", base_url=None,
+            )
+        self.assertEqual(asked.call_count, 2)
+        self.assertNotIn("spec", out)
+        self.assertEqual(out["reason"], refused)
+        self.assertNotIn("reconsider", out)
+
+    def test_the_channel_refusal_keeps_its_own_bar(self) -> None:
+        """Refuse where no response could be a function of the state at all.
+
+        The instruction added for the operator-supplied route must not read as
+        permission to aim at the harness's own field, so the refusing half is
+        stated beside it.
+        """
+        said = field._DRAFT_INSTRUCTIONS
+        self.assertIn("is not on a stock instance and a spec must not aim at it", said)
+        self.assertIn("no route of any kind could carry the effect out", said)
+
+
+class TheOperatorCanSupplyTheRouteTests(unittest.TestCase):
+    """A library CVE's missing piece is a route, and a route is an input.
+
+    Measured over the archive: of 115 labs that reproduced, 24 shipped a PoC,
+    12 were drafted and refused by the prover, and 79 were never drafted at
+    all -- so a draft declining is by far the most expensive outcome here.
+
+    The path half of this was already instructed and already works:
+    CVE-2026-102422 (shell-quote, a library with no listener, execution level
+    source_component) shipped a spec whose only input is target_path and
+    whose observable_effect says the operator's route "must pass its JSON
+    request body to the shell-quote quote() and run the result in sh -c".
+
+    What was missing is the channel. The usual adapter both reaches the
+    vulnerable code and computes the value the validator read, and the rule
+    against aiming at a harness-reported effect was swallowing the whole
+    library case. CVE-2026-112404 refused with "a generic application route
+    would have to return raw pixel bytes", CVE-2026-2950 with "a stock
+    application that calls _.unset does not report that state", and
+    CVE-2026-36045 with "the other strategies would need a stable,
+    operator-reachable route that this lab does not supply" -- all three
+    reaching for the route idea and then declining on the channel.
+    """
+
+    SAID = field._DRAFT_INSTRUCTIONS
+
+    def test_the_route_is_still_declared_as_an_input(self) -> None:
+        """The half that already worked, asserted so it cannot be lost."""
+        self.assertIn("declare it as an input", self.SAID)
+        self.assertIn("target_path", self.SAID)
+        self.assertIn("--input target_path=/their/route", self.SAID)
+
+    def test_the_channel_is_settled_separately_from_the_path(self) -> None:
+        self.assertIn("The paragraph above settles the path", self.SAID)
+        self.assertIn("Settle the channel the same way", self.SAID)
+        self.assertIn("reaches the vulnerable code and it also computes", self.SAID)
+
+    def test_the_diagnostic_is_distinguished_from_the_artifact(self) -> None:
+        """The distinction the three refusals did not have available."""
+        self.assertIn("Separate the harness's diagnostic from the artifact", self.SAID)
+        self.assertIn("the effect is in the artifact and not in the diagnostic", self.SAID)
+        self.assertIn("Ask what the operator's own route returns", self.SAID)
+
+    def test_the_test_is_what_a_real_application_could_return(self) -> None:
+        self.assertIn(
+            "whether a real application calling the same function could return anything "
+            "that differs",
+            " ".join(self.SAID.split()),
+        )
+        self.assertIn("that is an input, not a refusal", self.SAID)
+
+    def test_the_harness_reporting_rule_points_at_the_channel_paragraph(self) -> None:
+        """Left alone it won the reading and refused the library case outright."""
+        self.assertIn(
+            "a reported result does not by itself mean the effect is out of reach",
+            self.SAID,
+        )
+
+    def test_the_cost_of_declining_is_recorded_where_it_is_decided(self) -> None:
+        self.assertIn("of 115 labs that reproduced", self.SAID)
+        self.assertIn("79 were never drafted at all", self.SAID)
+
+    def test_the_route_is_named_as_an_input_where_inputs_are_defined(self) -> None:
+        """Not only in the library paragraph, which is read later or not at all.
+
+        inputs was described purely as values -- "a tenant id, the id or title
+        of an object they own" -- so the stronger thing every shipped
+        component PoC actually does was never said at the point where the
+        field is defined. 11 of 12 shipped component PoCs declare an
+        operator-supplied input, 9 of them named target_path.
+        """
+        self.assertIn("An input is not only a value", self.SAID)
+        self.assertIn(
+            "the route is the input, and it belongs to the operator rather than to the "
+            "project",
+            " ".join(self.SAID.split()),
+        )
+
+    def test_no_listener_is_named_as_the_condition_not_the_obstacle(self) -> None:
+        """The same sentence was being used as both.
+
+        19 of 48 declines gave "ships no listener of its own" as the reason
+        for declining, which is the exact condition the pattern exists for.
+        """
+        flat = " ".join(self.SAID.split())
+        self.assertIn(
+            "\"This project ships no listener of its own\" is therefore the condition "
+            "that calls for this pattern, and never a reason to answer feasible=false",
+            flat,
+        )
+        self.assertIn("you have found the pattern rather than an obstacle", flat)
+
+    def test_the_nine_ask_control_experiment_is_recorded(self) -> None:
+        """Six scripts and three refusals for one library, on identical input."""
+        flat = " ".join(self.SAID.split())
+        self.assertIn("asked nine times produced six scripts and three refusals", flat)
+
+
+class ADeclineIsAskedOnceMoreTests(unittest.TestCase):
+    """feasible=false was a single unretried sample of a sampled answer.
+
+    `complaint` already existed for a spec whose shape was refused, and
+    `_ask_for_spec` marked only a malformed spec for retry -- so a decline
+    returned straight out of the loop and all 48 never-drafted labs in the
+    archive audit got exactly one ask. Six labs had shipped on a human asking
+    a refused run again by hand. The audit put the recoverable share at 8 to
+    12 of those 48.
+
+    The bar is untouched: whatever a second answer offers is still emitted as
+    a script and proved against both builds. Of the 11 labs drafted and then
+    refused by that proof, 9 ran on both builds and the script fired on
+    neither, so no false positive has ever had to be rejected there.
+    """
+
+    REFUSED = "a library with no listener cannot be shown on one instance"
+
+    def _answers(self, *answers: dict[str, Any]) -> tuple[dict[str, Any], mock.Mock]:
+        """Drive draft_manual_poc_spec through a scripted sequence of answers."""
+        asked = mock.Mock(side_effect=list(answers))
+        with mock.patch.object(field, "structured_response", asked):
+            out = field.draft_manual_poc_spec(
+                "CVE-2026-0001", {"exploit_contract": {}}, api_key="k", model="m",
+                provider="anthropic", base_url=None,
+            )
+        return out, asked
+
+    def _decline(self, reason: str = "") -> dict[str, Any]:
+        return {"feasible": False, "reason": reason or self.REFUSED,
+                "container_port": None, "spec_json": None, "lab_values_json": None}
+
+    def _feasible(self) -> dict[str, Any]:
+        return {"feasible": True, "reason": "", "container_port": 8000,
+                "spec_json": json.dumps(_spec()), "lab_values_json": None}
+
+    def test_a_decline_is_asked_once_more(self) -> None:
+        out, asked = self._answers(self._decline(), self._feasible())
+        self.assertEqual(asked.call_count, 2)
+        self.assertIn("spec", out)
+        self.assertEqual(out["container_port"], 8000)
+
+    def test_a_second_decline_is_the_answer_and_is_not_asked_again(self) -> None:
+        """Bounded at one, or two declines would ask forever."""
+        out, asked = self._answers(self._decline(), self._decline("still no"))
+        self.assertEqual(asked.call_count, 2)
+        self.assertNotIn("spec", out)
+        self.assertEqual(out["reason"], "still no")
+        self.assertNotIn("reconsider", out)
+
+    def test_the_decline_text_reaches_the_second_ask(self) -> None:
+        """Fed back, not reworded -- the same channel a refused shape uses."""
+        sent: list[str] = []
+
+        def answer(**kwargs: Any) -> dict[str, Any]:
+            sent.append(kwargs["input_text"])
+            return self._decline() if len(sent) == 1 else self._feasible()
+
+        with mock.patch.object(field, "structured_response", side_effect=answer):
+            field.draft_manual_poc_spec(
+                "CVE-2026-0001", {"exploit_contract": {}}, api_key="k", model="m",
+                provider="anthropic", base_url=None,
+            )
+        self.assertNotIn("your_previous_answer_was_rejected", sent[0])
+        second = json.loads(sent[1])["your_previous_answer_was_rejected"]
+        self.assertIn(self.REFUSED, second)
+        self.assertIn("You already answered feasible=false", second)
+
+    def test_a_provider_decline_is_still_never_asked_again(self) -> None:
+        """The one thing this must not become.
+
+        A provider answering under its usage policy gives the same answer to
+        the same request, so it is recorded and never retried or reworded.
+        """
+        declined = field.ProviderDeclined("anthropic", "claude-haiku-5-5", "cyber")
+        with mock.patch.object(
+            field, "structured_response", side_effect=declined
+        ) as asked:
+            out = field.draft_manual_poc_spec(
+                "CVE-2026-0001", {"exploit_contract": {}}, api_key="k", model="m",
+                provider="anthropic", base_url=None,
+            )
+        self.assertEqual(asked.call_count, 1)
+        self.assertNotIn("spec", out)
+        self.assertEqual(out["declined"]["provider"], "anthropic")
+
+    def test_a_failed_call_is_not_a_decline_and_is_not_asked_again(self) -> None:
+        with mock.patch.object(
+            field, "structured_response", side_effect=RuntimeError("socket closed"),
+        ) as asked:
+            out = field.draft_manual_poc_spec(
+                "CVE-2026-0001", {"exploit_contract": {}}, api_key="k", model="m",
+                provider="anthropic", base_url=None,
+            )
+        self.assertEqual(asked.call_count, 1)
+        self.assertIn("the spec call failed", out["reason"])
+
+    def test_a_decline_does_not_spend_the_shape_retries(self) -> None:
+        """The two budgets are separate, so each keeps its own ask.
+
+        A decline, then a malformed spec, then a usable one: the decline
+        spends the single reconsideration and the malformed answer spends a
+        shape retry, and the usable spec is still reached.
+        """
+        out, asked = self._answers(
+            self._decline(),
+            {"feasible": True, "reason": "", "container_port": 8000,
+             "spec_json": "{not json", "lab_values_json": None},
+            self._feasible(),
+        )
+        self.assertEqual(asked.call_count, 3)
+        self.assertIn("spec", out)
+
+    def test_a_malformed_spec_does_not_spend_the_reconsideration(self) -> None:
+        """And the other way round: shape retries exhaust, then the decline.
+
+        With CVELAB_SPEC_RETRIES at its default of 1 a malformed answer is
+        asked once more; that second answer declining still earns its own
+        extra ask rather than returning straight out.
+        """
+        out, asked = self._answers(
+            {"feasible": True, "reason": "", "container_port": 8000,
+             "spec_json": "{not json", "lab_values_json": None},
+            self._decline(),
+            self._feasible(),
+        )
+        self.assertEqual(asked.call_count, 3)
+        self.assertIn("spec", out)
+
+    def test_the_reconsideration_names_the_recoverable_shapes(self) -> None:
+        said = field._reconsider_complaint(self.REFUSED)
+        for shape in (
+            "ships no listener of its own",
+            "the lab's own adapter",
+            "discover enumerates what a real target already holds",
+            "oob_callback, service_crash and timing_differential",
+        ):
+            with self.subTest(shape=shape):
+                self.assertIn(shape, said)
+
+    def test_the_reconsideration_does_not_lower_the_bar(self) -> None:
+        """Declining again has to stay a real answer, or this becomes pressure.
+
+        24 of the 48 declines in the audit were correct, so the second ask
+        says so rather than asking for a spec at any price.
+        """
+        flat = " ".join(field._reconsider_complaint(self.REFUSED).split())
+        self.assertIn("answer feasible=false again and say so", flat)
+        self.assertIn("That is a correct answer and it will be recorded as one", flat)
+        self.assertIn("Do not offer a spec you do not believe separates the two builds", flat)
+
+    def test_the_second_ask_is_announced(self) -> None:
+        """A doubled call on a lab that produced nothing has to be visible."""
+        said: list[str] = []
+        with mock.patch.object(field.progress, "step", side_effect=said.append):
+            self._answers(self._decline(), self._feasible())
+        self.assertTrue(any("asking once more" in line for line in said), said)
+
+    def test_a_provider_decline_on_the_second_ask_keeps_the_first_answer(self) -> None:
+        """The one way asking twice could leave a worse record than asking once.
+
+        The first ask produced a real verdict and said why. A provider
+        declining the second produces no verdict at all, and returning that
+        would report the lab as provider-declined and throw the reason away --
+        "no manual PoC" is only actionable if it says why.
+        """
+        asked = mock.Mock(side_effect=[
+            self._decline("the effect is a prototype mutation with no response channel"),
+            field.ProviderDeclined("anthropic", "claude-haiku-5-5", "cyber"),
+        ])
+        with mock.patch.object(field, "structured_response", asked):
+            out = field.draft_manual_poc_spec(
+                "CVE-2026-0001", {"exploit_contract": {}}, api_key="k", model="m",
+                provider="anthropic", base_url=None,
+            )
+        self.assertEqual(asked.call_count, 2)
+        self.assertNotIn("declined", out)
+        self.assertIn("no response channel", out["reason"])
+        self.assertIn("the second ask returned no verdict", out["reconsidered"])
+
+    def test_a_failed_second_call_also_keeps_the_first_answer(self) -> None:
+        asked = mock.Mock(side_effect=[
+            self._decline("it needs two clients driven at once"),
+            RuntimeError("socket closed"),
+        ])
+        with mock.patch.object(field, "structured_response", asked):
+            out = field.draft_manual_poc_spec(
+                "CVE-2026-0001", {"exploit_contract": {}}, api_key="k", model="m",
+                provider="anthropic", base_url=None,
+            )
+        self.assertIn("two clients", out["reason"])
+        self.assertIn("the second ask returned no verdict", out["reconsidered"])
+
+    def test_nothing_internal_leaks_into_the_recorded_answer(self) -> None:
+        """report.json carries this dict, so the loop's own keys stay out."""
+        for answers in (
+            (self._decline(), self._feasible()),
+            (self._decline(), self._decline("still no")),
+            (self._feasible(),),
+        ):
+            with self.subTest(answers=len(answers)):
+                out, _ = self._answers(*answers)
+                self.assertNotIn("reconsider", out)
+                self.assertNotIn("retry", out)
 
 
 class SetupCanBindWhatItReadsTests(unittest.TestCase):

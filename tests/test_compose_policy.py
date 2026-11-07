@@ -393,6 +393,111 @@ class RuntimeLimitTests(unittest.TestCase):
         )
 
 
+class ManualPortTests(unittest.TestCase):
+    """The one exception to the `ports` refusal, and the refusal it leaves intact."""
+
+    def override(self, name: str = "vulnerable", port: int = 8080, **services) -> dict:
+        return policy.manual_port_override(model(**services), name, port)
+
+    def published(self, **kwargs) -> list[str]:
+        return self.override(**kwargs)["services"]["vulnerable"]["ports"]
+
+    def test_the_port_is_published_on_loopback_and_is_ephemeral(self) -> None:
+        # No host-side number: the kernel assigns one, so nothing collides
+        # and nothing the model wrote chose it.
+        self.assertEqual(self.published(), ["127.0.0.1::8080"])
+        self.assertEqual(policy.MANUAL_BIND, "127.0.0.1")
+
+    def test_only_that_one_service_and_key_are_touched(self) -> None:
+        # Compose merges this over the lab; anything else here would be
+        # CVELab quietly rewriting a service the owner did not ask about.
+        self.assertEqual(
+            self.override(), {"services": {"vulnerable": {"ports": ["127.0.0.1::8080"]}}}
+        )
+
+    def test_any_service_the_lab_defines_may_be_published(self) -> None:
+        for name in ("vulnerable", "patched", "validator"):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    policy.manual_port_override(model(), name, 3000)["services"],
+                    {name: {"ports": ["127.0.0.1::3000"]}},
+                )
+
+    def test_a_service_the_lab_does_not_define_is_refused(self) -> None:
+        with self.assertRaises(policy.PolicyError) as raised:
+            self.override(name="database")
+        self.assertIn("no service 'database'", str(raised.exception))
+        # The refusal names what there is, so the caller can see the typo.
+        self.assertIn("vulnerable", str(raised.exception))
+
+    def test_cvelabs_own_injected_service_is_refused(self) -> None:
+        # Refused for the reason that applies -- it runs CVELab's program --
+        # rather than as a service the lab happens not to define, and
+        # refused whether or not it is in the model handed in.
+        for value in (model(), model(**{policy.SETUP_SERVICE: service()})):
+            with self.subTest(declared=policy.SETUP_SERVICE in value["services"]):
+                with self.assertRaises(policy.PolicyError) as raised:
+                    policy.manual_port_override(value, policy.SETUP_SERVICE, 8080)
+                self.assertIn("is CVELab's own", str(raised.exception))
+
+    def test_a_port_that_is_not_a_port_is_refused(self) -> None:
+        for port in (0, -1, 65536, 99999, "8080", 8080.0, None, True, False, [8080]):
+            with self.subTest(port=port):
+                with self.assertRaises(policy.PolicyError) as raised:
+                    policy.manual_port_override(model(), "vulnerable", port)
+                self.assertIn("is not a port", str(raised.exception))
+
+    def test_the_edges_of_the_range_are_ports(self) -> None:
+        for port in (1, 80, 65535):
+            with self.subTest(port=port):
+                self.assertEqual(self.published(port=port), [f"127.0.0.1::{port}"])
+
+    def test_the_argument_wins_over_a_disagreeing_expose(self) -> None:
+        # expose publishes nothing and is written by almost no lab, so it is
+        # the model's note about itself, not evidence. Nothing is refused.
+        value = model(vulnerable=service(expose=["9000"]), patched=service(), validator=service())
+        self.assertEqual(
+            policy.manual_port_override(value, "vulnerable", 8080)["services"],
+            {"vulnerable": {"ports": ["127.0.0.1::8080"]}},
+        )
+
+    def test_a_model_written_ports_is_still_refused(self) -> None:
+        """The regression that would matter most.
+
+        The exception is a separate override of CVELab's. It must not have
+        become a key a lab may write, in any of the spellings Compose
+        resolves one to -- including the loopback short form this very
+        function emits, which a lab writing it for itself would be choosing
+        to publish unattended.
+        """
+        for declared in (
+            ["8080:80"],
+            ["127.0.0.1::8080"],
+            ["0.0.0.0:8080:8080"],
+            ["8000-8010:8000-8010"],
+            [{"target": 80, "published": "8080", "host_ip": "127.0.0.1"}],
+            [{"target": 80, "published": "8080", "mode": "host"}],
+        ):
+            with self.subTest(declared=declared):
+                problems = policy.check_model(model(vulnerable=service(ports=declared)), LAB)
+                self.assertIn("service 'vulnerable': ports is not allowed", "\n".join(problems))
+        # And the refusal still says why, in the lab's own vocabulary.
+        self.assertEqual(policy.SERVICE_REASONS["ports"], "published host ports")
+        self.assertNotIn("ports", policy.SERVICE_KEYS)
+
+    def test_the_override_is_what_enforce_refuses_and_never_sees(self) -> None:
+        # Proof the two cannot be reconciled by accident: feed the override
+        # back through the lab's own policy and it is refused. It reaches
+        # Compose as a second -f, the way the limits do, never as lab text.
+        published = self.override()["services"]["vulnerable"]
+        merged = model()
+        merged["services"]["vulnerable"].update(published)
+        self.assertIn(
+            "service 'vulnerable': ports is not allowed",
+            "\n".join(policy.check_model(merged, LAB)),
+        )
+
+
 class ComposeCommandTests(unittest.TestCase):
     def test_the_project_is_named_after_the_lab_not_the_file(self) -> None:
         # Teardown removes the project's volumes; a `name:` must not be

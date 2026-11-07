@@ -79,6 +79,7 @@ class GeneratedValidatorContractTests(unittest.TestCase):
             "attack_executed", "proof_quality", "observable_effect", "evidence_type",
             "vulnerable", "patched", "differential_confirmed", "confirmed", "blocked",
             "observations", "CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "exploit", "verify",
+            "sys.argv",
         ])
         _validate_generated(generated_files(validator))
 
@@ -97,6 +98,7 @@ class GeneratedValidatorContractTests(unittest.TestCase):
             "vendor_product_started": True,
             "exercised_vendor_components": ["vendor server"],
             "simulated_components": ["local backend"],
+            "trigger_source": "documented",
         })
 
     def test_product_end_to_end_requires_product_to_start(self) -> None:
@@ -572,7 +574,7 @@ class ADeclaredSupportServiceIsAReachableTargetTests(unittest.TestCase):
         "attack_executed", "proof_quality", "observable_effect", "evidence_type",
             "vulnerable", "patched", "differential_confirmed", "confirmed",
             "blocked", "observations", "CVELAB_MANUAL_ACTION", "CVELAB_TARGET",
-            "exploit", "verify",
+            "exploit", "verify", "sys.argv",
     ]
 
     def validator(self, *targets: str) -> str:
@@ -673,7 +675,7 @@ class TheValidatorsRequirementsAreAFieldTests(unittest.TestCase):
             "attack_executed", "proof_quality", "observable_effect", "evidence_type",
             "vulnerable", "patched", "differential_confirmed", "confirmed",
             "blocked", "observations", "CVELAB_MANUAL_ACTION", "CVELAB_TARGET",
-            "exploit", "verify",
+            "exploit", "verify", "sys.argv",
         ])
         files = generated_files(validator) + _validator_requirements(
             {"validator_requirements": "requests==2.32.3\n"}
@@ -683,3 +685,144 @@ class TheValidatorsRequirementsAreAFieldTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TriggerSourceSeparatesReproductionFromSubstitutionTests(unittest.TestCase):
+    """A lab must say whether it triggered the weakness or only its symptom.
+
+    THE MEASUREMENT THIS WAS WRITTEN FROM
+
+    A runtime lab was generated whose adapter asked the interpreter to exceed
+    its own memory limit on request. The out-of-memory condition is the
+    weakness's *precondition*; the weakness is what the cleanup path does
+    afterwards. A fixed build driven the same way emits the same message, so
+    the lab's effect predicate separated nothing -- and the record said so, in
+    its own words, in the rationale and the simulated components, and shipped
+    `ok: true` as a reproduction anyway. Three of the 674 distinct fidelity
+    prose strings in benchmarks/labs disclaim their own reproduction like
+    that; none of the three was refused.
+
+    `trigger_source` is where that is said in a field instead of in prose
+    nothing reads. These tests pin the four things the field has to do: be
+    asked for at all, be refusable against the prose beside it, leave the
+    honest answer passing, and stop the honest answer claiming end to end.
+    """
+
+    #: The real disclaiming strings from benchmarks/labs, by lab shape. The
+    #: whole point of the regex is that it fires on what records really say,
+    #: so these are quoted rather than invented.
+    DISCLAIMED = {
+        "trigger_substituted_for_precondition": (
+            "The request-cleanup context named by the advisory was not identified, so "
+            "the trigger is a harness allocation that reaches the ordinary "
+            "out-of-memory bailout in the vendor runtime. This is not a reproduction "
+            "of the advisory's uninitialized-memory flaw."
+        ),
+        "fixed_side_path_never_reached": (
+            "MakeContainer, where the checkpoint annotation check lives in the fixed "
+            "revision, is not reached because building a runtime requires root, so "
+            "this does not prove the fix."
+        ),
+        "adapter_is_not_the_listener": (
+            "the adapter creates its own abstract listener and is not the shim "
+            "listener, so this does not reproduce the weakness"
+        ),
+    }
+
+    def fidelity(self, **changes: object) -> dict:
+        record = {
+            "execution_level": "vendor_service",
+            "vendor_product_started": True,
+            "exercised_vendor_components": ["vendor server on the request path"],
+            "simulated_components": [],
+            "trigger_source": "documented",
+            "rationale": "The vendor service runs and the documented request reaches it.",
+        }
+        record.update(changes)
+        return record
+
+    def test_the_field_is_asked_for_and_not_inferred(self) -> None:
+        missing = self.fidelity()
+        del missing["trigger_source"]
+        with self.assertRaisesRegex(RuntimeError, "must set trigger_source"):
+            _validate_fidelity(missing)
+
+    def test_a_spelling_the_record_does_not_use_is_refused(self) -> None:
+        # Silence and "unknown" are the same answer wearing different hats,
+        # and neither is one of the two.
+        for value in ("unknown", "partial", "", None, True):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(RuntimeError, "must set trigger_source"):
+                    _validate_fidelity(self.fidelity(trigger_source=value))
+
+    def test_documented_cannot_be_claimed_over_prose_that_denies_it(self) -> None:
+        for shape, prose in self.DISCLAIMED.items():
+            with self.subTest(shape=shape, field="rationale"):
+                with self.assertRaisesRegex(RuntimeError, "Both cannot hold"):
+                    _validate_fidelity(self.fidelity(rationale=prose))
+            with self.subTest(shape=shape, field="simulated_components"):
+                with self.assertRaisesRegex(RuntimeError, "Both cannot hold"):
+                    _validate_fidelity(
+                        self.fidelity(simulated_components=[prose])
+                    )
+
+    def test_the_same_prose_passes_once_it_stops_claiming_documented(self) -> None:
+        # The point of the refusal is not to delete the sentence. A record
+        # that keeps the sentence and marks the substitution is the honest
+        # answer and has to be a passing one, or the next answer learns to
+        # drop the sentence instead.
+        for shape, prose in self.DISCLAIMED.items():
+            with self.subTest(shape=shape):
+                _validate_fidelity(self.fidelity(
+                    trigger_source="substituted",
+                    simulated_components=["the route that stands in for the trigger"],
+                    rationale=prose,
+                ))
+
+    def test_a_record_that_says_nothing_either_way_is_not_second_guessed(self) -> None:
+        # Silence in the prose is not evidence of fidelity and not evidence
+        # against it. This check is about self-contradiction only.
+        _validate_fidelity(self.fidelity(trigger_source="documented"))
+        _validate_fidelity(self.fidelity(
+            trigger_source="substituted",
+            simulated_components=["a wrapper that drives the affected call"],
+        ))
+
+    def test_a_substitution_nothing_names_is_refused(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "simulated_components must name"):
+            _validate_fidelity(self.fidelity(
+                trigger_source="substituted", simulated_components=[]
+            ))
+
+    def test_a_substituted_trigger_cannot_claim_end_to_end(self) -> None:
+        # product_end_to_end is the one level core gates product_e2e_verified
+        # on, so this is where the marker costs the lab something.
+        with self.assertRaisesRegex(RuntimeError, "End to end is the product's own path"):
+            _validate_fidelity(self.fidelity(
+                execution_level="product_end_to_end",
+                trigger_source="substituted",
+                simulated_components=["a route written to reach the condition"],
+            ))
+
+    def test_both_generated_shapes_require_the_field_of_every_answer(self) -> None:
+        for name, schema in (
+            ("SOURCE_SCHEMA", SOURCE_SCHEMA), ("VULNERABLE_ONLY_SCHEMA", VULNERABLE_ONLY_SCHEMA)
+        ):
+            with self.subTest(schema=name):
+                fidelity = schema["properties"]["fidelity"]
+                self.assertIn("trigger_source", fidelity["required"])
+                self.assertEqual(
+                    fidelity["properties"]["trigger_source"]["enum"],
+                    ["documented", "substituted"],
+                )
+
+    def test_the_marker_reaches_the_documents_a_reader_gets(self) -> None:
+        # A field only a downstream step could read would leave the person
+        # holding REPORT.md with the same two bullets either way.
+        from cvelab.deliverables import _TRIGGER_SOURCE_BULLET
+
+        self.assertIn("substituted", _TRIGGER_SOURCE_BULLET["substituted"])
+        self.assertNotIn("substituted", _TRIGGER_SOURCE_BULLET["documented"])
+        # A lab generated before the field existed asserted nothing, and the
+        # documents must not assert anything on its behalf.
+        self.assertEqual(_TRIGGER_SOURCE_BULLET.get(None, ""), "")
