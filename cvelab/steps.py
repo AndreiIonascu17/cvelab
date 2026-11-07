@@ -458,14 +458,43 @@ SETUP_CONNECT_WAIT = 120
 #: there is nowhere to put a file. Everything it uses is in the standard
 #: library of the base image.
 #:
-#: It differs from field's in three ways that are not about delivery. It
-#: names its target by service rather than by a base URL, because the two
-#: builds are two names on one network. It refuses a substitution nothing
-#: filled instead of sending `{{name}}` as literal text, which is what
-#: field's does -- a declared input the operator supplies has no value here,
-#: and sending its spelling to the lab would seed something named `{{user}}`
-#: and report success. And it waits out a connection refusal, because it
-#: runs before the health gate rather than after it.
+#: WHY THE TWO WERE NOT MERGED
+#:
+#: Measured rather than assumed, because they look alike: 113 lines each, and
+#: the same five jobs -- fill the substitutions, send, keep the cookies, read
+#: the binding out of the last response, report what was sent. Line for line
+#: they share 17 lines of 113, a 15% textual overlap, because the two were
+#: written independently and agree on almost no name: this one holds the
+#: extractor dispatch in a function and field's inlines it, and a test pins
+#: each by exact text in the other's quoting convention.
+#:
+#: So a merge is not a lift: it is a rewrite of one of the two programs. What
+#: it would be rewriting is not free either. This runner is baked into the
+#: Compose override that starts a generated lab, so its text is part of what
+#: a lab run is, and the five differences below are each a lab that failed
+#: once. Merging buys one copy of five jobs and pays for it by making every
+#: one of those differences conditional on which mode is running -- which is
+#: the same two programs with a flag between them.
+#:
+#: The five differences, none of them about delivery:
+#:
+#: 1. It names its target by service rather than by a base URL, because the
+#:    two builds are two names on one network.
+#: 2. It refuses a substitution nothing filled instead of sending `{{name}}`
+#:    as literal text, which is what field's does -- a declared input the
+#:    operator supplies has no value here, and sending its spelling to the
+#:    lab would seed something named `{{user}}` and report success.
+#: 3. It waits out a connection refusal, because it runs before the health
+#:    gate rather than after it.
+#: 4. It builds no multipart body, and field's does. That is not a gap:
+#:    `validate_request` accepts an upload because a single-target spec needs
+#:    one, and the generated path refuses a setup upload a whole model call
+#:    earlier, where it can say to seed through a route that takes a body
+#:    instead of failing after two builds.
+#: 5. Its failures name the step's index. The steps here are read back from
+#:    plan.json by whoever is fixing the lab, so "which step" is the useful
+#:    half of the answer; field's spec is drafted fresh each run and names
+#:    the path instead.
 SETUP_RUNNER = r'''
 import json, os, re, sys, time, urllib.error, urllib.request
 

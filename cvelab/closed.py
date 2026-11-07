@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import shlex
@@ -22,17 +23,15 @@ import tempfile
 import time
 import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
+from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from . import predicate
 from .core import runtime_flags
 
 _CVE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
-_MAX_BODY = 64 * 1024
-_MAX_RESPONSE = 1024 * 1024
 
 #: Where a contract's fixture files land inside the lab container.
 _FIXTURE_ROOT = "/cvelab/fixture"
@@ -63,39 +62,55 @@ def _docker(*args: str, check: bool = True) -> str:
     return completed.stdout.strip()
 
 
-def _request(base_url: str, spec: dict[str, Any]) -> dict[str, Any]:
-    path = str(spec.get("path", "/"))
-    parsed = urllib.parse.urlsplit(path)
-    if parsed.scheme or parsed.netloc or not path.startswith("/"):
-        raise ValueError("HTTP contract paths must be relative and start with /")
-    body_value = spec.get("body")
-    body = None if body_value is None else str(body_value).encode()
-    if body is not None and len(body) > _MAX_BODY:
-        raise ValueError("HTTP request body exceeds 64 KiB")
-    headers = {str(k): str(v) for k, v in spec.get("headers", {}).items()}
-    headers.setdefault("User-Agent", "CVELab-Closed-PoC/1.0")
-    request = urllib.request.Request(
-        base_url + path,
-        data=body,
-        headers=headers,
-        method=str(spec.get("method", "GET")).upper(),
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            content = response.read(_MAX_RESPONSE).decode("utf-8", errors="replace")
-            return {
-                "status": response.status,
-                "headers": dict(response.headers.items()),
-                "body": content,
-            }
-    except urllib.error.HTTPError as exc:
-        return {
-            "status": exc.code,
-            "headers": dict(exc.headers.items()),
-            "body": exc.read(_MAX_RESPONSE).decode("utf-8", errors="replace"),
-        }
+#: One throwaway container running one program, and nothing about what the
+#: program is for.
+#:
+#: WHY THERE IS ONE OF THESE RATHER THAN FIVE
+#:
+#: Five call sites built this argv by hand -- the contract probe and the
+#: shipped script's own run here, and the setup runner, the single-target
+#: script and the port probe in field.py -- and they are not free to differ.
+#: Every one of them has to carry `--security-opt no-new-privileges:true` and
+#: the runtime ceilings, because the image is the user's or a model's pick and
+#: once ran with no ceiling at all; a site that forgot either would confine
+#: nothing, and nothing at run time would say so. The program travels in
+#: `python -c` and its inputs in `-e` for the same reason everywhere: a lab's
+#: network is `internal: true`, so there is no route to an index and nowhere
+#: to put a file, and Windows caps a command line at about 32 KB, which the
+#: emitted script is over.
+#:
+#: `network` is the one thing that genuinely differs and so it is the one
+#: thing asked for: `container:<id>` to stand in one container's namespace,
+#: or a Compose network's name to stand beside the lab on it.
+#:
+#: It returns the arguments after `docker`, so a caller reaches the daemon the
+#: way it already did -- `_docker` for the short answers it parses, or
+#: `subprocess.run` where it needs the exit code and stderr. `flags` is passed
+#: in rather than read here so it resolves in the calling module, which is
+#: where the tests that bound a run patch it.
+def sidecar_argv(
+    network: str,
+    *,
+    image: str,
+    program: str,
+    flags: Sequence[str] = (),
+    environment: dict[str, str] | None = None,
+    arguments: Sequence[str] = (),
+) -> list[str]:
+    argv = [
+        "run", "--rm", "--network", network,
+        "--security-opt", "no-new-privileges:true",
+        *flags,
+    ]
+    for name, value in (environment or {}).items():
+        argv += ["-e", f"{name}={value}"]
+    return [*argv, image, "python", "-c", program, *arguments]
 
 
+#: The only sender there is. An in-process `urllib` copy of this stood beside
+#: it until the lab's network became `internal: true`, which put the product
+#: out of the host's reach: every request now goes from a container on the
+#: lab's own network, so the host needs no route to anything.
 _PROBE_CODE = r'''import json, os, urllib.error, urllib.request
 spec = json.loads(os.environ["CVELAB_REQUEST"])
 body = spec.get("body")
@@ -119,14 +134,16 @@ print(json.dumps(result))
 def _container_request(
     network_name: str, base_url: str, spec: dict[str, Any]
 ) -> dict[str, Any]:
-    output = _docker(
-        "run", "--rm", "--network", network_name,
-        "--security-opt", "no-new-privileges:true",
-        *runtime_flags(),
-        "-e", f"CVELAB_BASE={base_url}",
-        "-e", f"CVELAB_REQUEST={json.dumps(spec, separators=(',', ':'))}",
-        "python:3.13-alpine", "python", "-c", _PROBE_CODE,
-    )
+    output = _docker(*sidecar_argv(
+        network_name,
+        image="python:3.13-alpine",
+        program=_PROBE_CODE,
+        flags=runtime_flags(),
+        environment={
+            "CVELAB_BASE": base_url,
+            "CVELAB_REQUEST": json.dumps(spec, separators=(",", ":")),
+        },
+    ))
     return json.loads(output)
 
 
@@ -147,6 +164,25 @@ def _matches(response: dict[str, Any], match: dict[str, Any]) -> tuple[bool, lis
     write a verdict it did not measure.
     """
     return predicate.evaluate(response, match, where="observe.match")
+
+
+def check_lab_arguments(cve: str, container_port: int, health_path: str) -> str:
+    """The three things both image-pair modes are handed, and the CVE back.
+
+    `cvelab closed` and `cvelab field` take the same first four arguments and
+    refused them in the same four lines with the same four messages. Shared
+    so the wording stays one wording: these are the first thing an operator
+    sees when they mistype a port, and two copies of them had already started
+    to be two places to change.
+    """
+    cve = cve.upper()
+    if not _CVE.fullmatch(cve):
+        raise ValueError("invalid CVE identifier")
+    if not 1 <= container_port <= 65535:
+        raise ValueError("container port must be between 1 and 65535")
+    if not health_path.startswith("/"):
+        raise ValueError("health path must start with /")
+    return cve
 
 
 def _seconds(value: Any, name: str, default: int, ceiling: int) -> int:
@@ -304,15 +340,17 @@ def _run_poc_script(
     script's own loopback guard holds with nothing exposed to the host.
     """
     completed = subprocess.run(
-        [
-            "docker", "run", "--rm", "--network", f"container:{container}",
-            "--security-opt", "no-new-privileges:true",
-            *runtime_flags(),
-            "-e", f"CVELAB_BASE=http://127.0.0.1:{port}",
-            "-e", f"CVELAB_POC={_POC_SCRIPT}",
-            "-e", f"CVELAB_CONTRACT={_attack_only(contract)}",
-            "python:3.13-alpine", "python", "-c", _POC_BOOTSTRAP,
-        ],
+        ["docker", *sidecar_argv(
+            f"container:{container}",
+            image="python:3.13-alpine",
+            program=_POC_BOOTSTRAP,
+            flags=runtime_flags(),
+            environment={
+                "CVELAB_BASE": f"http://127.0.0.1:{port}",
+                "CVELAB_POC": _POC_SCRIPT,
+                "CVELAB_CONTRACT": _attack_only(contract),
+            },
+        )],
         capture_output=True, text=True, timeout=300, check=False,
     )
     output = completed.stdout.strip()
@@ -367,16 +405,65 @@ def _apply_fixture(container: str, fixture: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _run_variant(
+class Instance(NamedTuple):
+    """One published image, running on a sealed network of its own.
+
+    `network` is the Compose-style network name, for anything that has to
+    stand beside the container rather than inside it; `container` is the name,
+    which is also the host the lab answers on. `fixture` is what the declared
+    seeding command did, or None when nothing was declared.
+    """
+
+    container: str
+    network: str
+    base_url: str
+    fixture: dict[str, Any] | None
+
+
+@contextlib.contextmanager
+def disposable_instance(
     cve: str,
     variant: str,
     image: str,
     port: int,
     health_path: str,
-    contract: dict[str, Any],
-) -> dict[str, Any]:
+    declared: dict[str, Any],
+    *,
+    prefix: str = "cvelab",
+) -> Iterator[Instance]:
+    """Start one image, seed it, hand it over, and take it away again.
+
+    WHY THIS IS SHARED
+
+    `cvelab closed` and the single-target path both take a pair of published
+    images and have to put one of them somewhere a proof can reach it, and
+    they were doing it twice: twenty-one identical lines, down to the labels
+    and the teardown. Nothing in them is about what the proof then does --
+    one replays a contract's requests and measures its predicate, the other
+    runs the script it is about to hand over -- so what differs is after the
+    `yield`, and the part before it is this.
+
+    None of it is decoration. The network is `--internal` so the product is
+    unreachable from the host and from anything but the sidecars put on it.
+    The three labels are what the cleanup paths select on, so a container
+    that outlives a crashed run can be found. `runtime_flags` is not optional
+    either: the image is the user's or a model's pick and once ran with no
+    ceiling at all, and these are the ones a Compose lab gets.
+
+    The teardown confirms the id before removing anything, because the name
+    is predictable and a second run of the same CVE could otherwise delete a
+    container this one did not start. Both halves are guarded separately: a
+    `docker run` that failed leaves a network to remove and no container.
+
+    `declared` is the contract or the spec. Both carry `health_timeout` and
+    `fixture` under those names and mean the same thing by them, which is why
+    one parameter serves both -- a mode that meant something else by either
+    would have to say so rather than pass it here. `prefix` exists only
+    because the two modes name their containers apart, which is how an
+    operator reading `docker ps` can tell which one is running.
+    """
     token = uuid.uuid4().hex[:12]
-    name = f"cvelab-{cve.lower()}-{variant}-{token}"
+    name = f"{prefix}-{cve.lower()}-{variant}-{token}"
     network_name = f"{name}-net"
     container_id = ""
     network_id = ""
@@ -394,39 +481,17 @@ def _run_variant(
             "--label", f"io.cvelab.cve={cve}",
             "--label", f"io.cvelab.run={token}",
             "--security-opt", "no-new-privileges:true",
-            # The image is the user's or a model's pick, and ran with no
-            # ceiling at all; these are the ones a Compose lab gets.
             *runtime_flags(),
             "--network", network_name, image,
         )
         base_url = f"http://{name}:{port}"
         _wait_ready(
             network_name, base_url, health_path,
-            int(contract.get("health_timeout", DEFAULT_HEALTH_TIMEOUT)),
+            int(declared.get("health_timeout", DEFAULT_HEALTH_TIMEOUT)),
         )
-        fixture = contract.get("fixture")
+        fixture = declared.get("fixture")
         applied = _apply_fixture(name, fixture) if fixture else None
-        attack_results = [
-            _container_request(network_name, base_url, step) for step in contract["attack"]
-        ]
-        observation = _container_request(
-            network_name, base_url, contract["observe"]["request"]
-        )
-        confirmed, predicates = _matches(observation, contract["observe"]["match"])
-        shipped = _run_poc_script(
-            name, port, contract, "REPRODUCED" if variant == "vulnerable" else "BLOCKED"
-        )
-        return {
-            "variant": variant,
-            "image": image,
-            "fixture": applied,
-            "shipped_poc": shipped,
-            "attack_executed": True,
-            "confirmed": confirmed,
-            "predicates": predicates,
-            "attack_responses": attack_results,
-            "observation": observation,
-        }
+        yield Instance(name, network_name, base_url, applied)
     finally:
         if container_id:
             current = _docker("inspect", "--format", "{{.Id}}", name, check=False)
@@ -440,6 +505,66 @@ def _run_variant(
                 _docker("network", "rm", network_id, check=False)
 
 
+def _run_variant(
+    cve: str,
+    variant: str,
+    image: str,
+    port: int,
+    health_path: str,
+    contract: dict[str, Any],
+) -> dict[str, Any]:
+    with disposable_instance(
+        cve, variant, image, port, health_path, contract
+    ) as running:
+        attack_results = [
+            _container_request(running.network, running.base_url, step)
+            for step in contract["attack"]
+        ]
+        observation = _container_request(
+            running.network, running.base_url, contract["observe"]["request"]
+        )
+        confirmed, predicates = _matches(observation, contract["observe"]["match"])
+        shipped = _run_poc_script(
+            running.container, port, contract,
+            "REPRODUCED" if variant == "vulnerable" else "BLOCKED",
+        )
+        return {
+            "variant": variant,
+            "image": image,
+            "fixture": running.fixture,
+            "shipped_poc": shipped,
+            "attack_executed": True,
+            "confirmed": confirmed,
+            "predicates": predicates,
+            "attack_responses": attack_results,
+            "observation": observation,
+        }
+
+
+#: The script this lab hands over, with a second predicate evaluator in it.
+#:
+#: WHY THAT COPY STAYS A COPY
+#:
+#: `predicate.py` is the evaluator, and `_matches` above is the runner's only
+#: way of reaching a verdict. The `matches` below is a second implementation
+#: of the same four kinds, which is exactly the thing a consolidation pass
+#: should want to remove, and it cannot be removed: this file is read into a
+#: container that has no CVELab in it, and run by a reviewer on a host that
+#: has none either. An import would be an install instruction in a PoC.
+#:
+#: Nor is it worth moving the text next to the evaluator to make the pair
+#: visible. That relocates the copy without removing it, and what actually
+#: catches the two drifting apart is already in place: a test executes this
+#: `matches` out of the script's own AST and requires it to agree with
+#: `predicate.evaluate` on twelve predicates, and a second asserts that every
+#: name in `predicate.KINDS` has a branch here. A kind added on one side and
+#: not the other fails the suite rather than shipping a lab whose script and
+#: whose report disagree about what was observed.
+#:
+#: What it does not copy is the evidence wording. The runner's lines are
+#: quoted verbatim into EVIDENCE.json and the walkthrough; this prints
+#: `predicate <kind> passed=<bool>` for the operator reading a terminal. Two
+#: audiences, so two formats, and only the verdict has to match.
 _POC_SCRIPT = r'''"""Loopback-only closed software PoC.
 
 Reads `contract.json` beside this file, replays its attack, then checks the
@@ -541,13 +666,7 @@ def run_closed_lab(
     health_path: str,
     contract_path: Path,
 ) -> dict[str, Any]:
-    cve = cve.upper()
-    if not _CVE.fullmatch(cve):
-        raise ValueError("invalid CVE identifier")
-    if not 1 <= container_port <= 65535:
-        raise ValueError("container port must be between 1 and 65535")
-    if not health_path.startswith("/"):
-        raise ValueError("health path must start with /")
+    cve = check_lab_arguments(cve, container_port, health_path)
     contract = _validate_contract(json.loads(contract_path.read_text(encoding="utf-8")))
     lab_dir = output_root.resolve() / cve
     artifacts = lab_dir / "artifacts"
