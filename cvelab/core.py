@@ -1118,6 +1118,43 @@ def run_validator(
     return launched
 
 
+def _manual_action_passed(
+    action: str, expected_verdict: str, returncode: int, output: str
+) -> bool:
+    """Whether one manual-kit action did what it was asked to.
+
+    For `verify` the verdict the script printed is the measurement, and the
+    exit status is how it chose to signal the same thing a second time.
+    Which matters on the patched side: the attack is SUPPOSED to fail there,
+    and a script that says so by exiting non-zero is using the convention
+    CVELab's own shipped Manual-PoC.py documents in its help -- "Exit 0 and
+    OBSERVED when the effect is present on that target, 1 and NOT_OBSERVED
+    when it is not". Requiring exit zero of it as well failed a validator
+    that was right.
+
+    Measured once, on an express lab: `patched_verify` printed
+    "status: 302 anchor_present: False error: None" and then "BLOCKED",
+    exited 1, and was recorded as the one false check in a run whose other
+    eleven proof checks all passed. The repair budget then spent twelve
+    attempts on it, because the feedback said `manual_poc_verified` failed
+    while the output said BLOCKED -- there was nothing for a model to fix.
+    Rare: zero occurrences in the 91 archived labs that measured a manual
+    kit, which is why this widens the rule for exactly that case instead of
+    dropping the exit status from the check.
+
+    Exit 1 and not "non-zero": a signal shows up here as a negative return
+    code and a crash as 2 or more, and neither of those is a script
+    reporting a verdict. For `exploit`, which only re-sends the input and
+    prints what came back, the exit status is all there is to go on and is
+    still required to be zero.
+    """
+    if action != "verify":
+        return returncode == 0 and bool(output)
+    if not output or expected_verdict not in output:
+        return False
+    return returncode in ((0,) if expected_verdict == "REPRODUCED" else (0, 1))
+
+
 #: What a run says when the lab's setup could not put it in the state the
 #: attack needs. A failure class of its own, distinct from a build that did
 #: not compile, a service that never became healthy, and an effect that was
@@ -1512,9 +1549,9 @@ def run_lab(
                     expected_verdict = (
                         "REPRODUCED" if target == "vulnerable" else "BLOCKED"
                     )
-                    passed = checked.returncode == 0 and bool(output)
-                    if action == "verify":
-                        passed = passed and expected_verdict in output
+                    passed = _manual_action_passed(
+                        action, expected_verdict, checked.returncode, output
+                    )
                     manual_poc_checks[f"{target}_{action}"] = {
                         "passed": passed,
                         "exit_code": checked.returncode,

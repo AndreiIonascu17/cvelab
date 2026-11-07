@@ -675,10 +675,6 @@ class CommandLineTests(unittest.TestCase):
             cli.parser().parse_args(["demo-target", "sideways", "/labs/X"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class DraftedSpecTests(unittest.TestCase):
     """The spec is asked for in one separate call, after the lab is finished."""
 
@@ -2235,3 +2231,56 @@ class SetupCanBindWhatItReadsTests(unittest.TestCase):
                 {}, True, {"admin_key": "mine"},
             )
         self.assertEqual(seen[0]["admin_key"], "mine")
+
+
+class ManualActionVerdictTests(unittest.TestCase):
+    """The patched side is supposed to block the attack.
+
+    A script that says so by exiting non-zero is using the convention
+    CVELab's own shipped Manual-PoC.py documents, and requiring exit zero of
+    it as well failed a validator that was right. Measured once, on an
+    express lab, where it cost twelve repair attempts on a check no model
+    could fix: the output said BLOCKED and the feedback said the check
+    failed.
+    """
+
+    def test_the_patched_side_may_say_blocked_by_exiting_one(self) -> None:
+        self.assertTrue(core._manual_action_passed(
+            "verify", "BLOCKED", 1, "status: 302 anchor_present: False\nBLOCKED"))
+
+    def test_and_by_exiting_zero(self) -> None:
+        self.assertTrue(core._manual_action_passed("verify", "BLOCKED", 0, "BLOCKED"))
+
+    def test_a_crash_that_printed_the_verdict_does_not_pass(self) -> None:
+        # 2 and up is a script that fell over, and a negative code is a
+        # signal. Neither is a verdict being reported, which is why this
+        # takes exit 1 rather than anything non-zero.
+        for code in (2, 127, -9):
+            with self.subTest(code=code):
+                self.assertFalse(
+                    core._manual_action_passed("verify", "BLOCKED", code, "BLOCKED"))
+
+    def test_the_verdict_still_has_to_be_there(self) -> None:
+        self.assertFalse(core._manual_action_passed("verify", "BLOCKED", 1, ""))
+        self.assertFalse(
+            core._manual_action_passed("verify", "BLOCKED", 1, "REPRODUCED"))
+
+    def test_the_vulnerable_side_still_has_to_exit_zero(self) -> None:
+        # Nothing is widened here: a reproduction that could not exit zero
+        # has not shown the effect, and the exit status is the only part of
+        # that claim CVELab did not take from the script's own words.
+        self.assertTrue(
+            core._manual_action_passed("verify", "REPRODUCED", 0, "REPRODUCED"))
+        self.assertFalse(
+            core._manual_action_passed("verify", "REPRODUCED", 1, "REPRODUCED"))
+
+    def test_the_exploit_action_is_judged_only_on_its_exit_status(self) -> None:
+        # It re-sends the one input and prints what came back; it reports no
+        # verdict, so the exit status is all there is to go on.
+        self.assertTrue(core._manual_action_passed("exploit", "BLOCKED", 0, "status: 302"))
+        self.assertFalse(core._manual_action_passed("exploit", "BLOCKED", 1, "status: 302"))
+        self.assertFalse(core._manual_action_passed("exploit", "BLOCKED", 0, ""))
+
+
+if __name__ == "__main__":
+    unittest.main()
