@@ -363,25 +363,33 @@ class TemperatureReachesEveryDialectTests(unittest.TestCase):
             with self.subTest(provider=provider):
                 self.assertEqual(self.body(provider, temperature=0.25)["temperature"], 0.25)
 
-    def test_the_two_that_never_named_one_still_do_not(self) -> None:
-        # The default request stays byte-identical to the one these dialects
-        # have always sent, so turning the knob is a deliberate act.
-        for provider in ("openai", "anthropic"):
+    def test_every_dialect_now_pins_zero_by_default(self) -> None:
+        # The two that named no temperature now send the same zero
+        # chat-completions always did, so one run samples one way whatever
+        # provider served it.
+        for provider in ("openai", "anthropic", "deepseek"):
             with self.subTest(provider=provider):
-                self.assertNotIn("temperature", self.body(provider))
+                self.assertEqual(self.body(provider)["temperature"], 0.0)
 
-    def test_chat_completions_keeps_the_zero_it_always_pinned(self) -> None:
-        self.assertEqual(self.body("deepseek")["temperature"], 0)
+    def test_the_provider_default_can_be_asked_for_back(self) -> None:
+        # Zero is not free -- a model held there can be worse at long
+        # structured generation -- so there is a way back to each provider's
+        # own behaviour without editing code.
+        for asked in ("default", "provider", "off", "none", "unset", "DEFAULT"):
+            with self.subTest(asked=asked):
+                with mock.patch.dict("os.environ", {"CVELAB_TEMPERATURE": asked}):
+                    self.assertNotIn("temperature", self.body("anthropic"))
 
     def test_the_environment_reaches_a_caller_that_asked_for_nothing(self) -> None:
         with mock.patch.dict("os.environ", {"CVELAB_TEMPERATURE": "0.7"}):
             self.assertEqual(self.body("anthropic")["temperature"], 0.7)
 
-    def test_an_unreadable_setting_is_ignored_rather_than_raised(self) -> None:
+    def test_an_unreadable_setting_falls_back_to_the_default(self) -> None:
         # A run is worth more than a complaint about a stray environment
-        # variable, and the provider's default is a defined behaviour.
+        # variable; "warm" is not a request for the provider's default, it is
+        # a typo, and the default is what a typo should get.
         with mock.patch.dict("os.environ", {"CVELAB_TEMPERATURE": "warm"}):
-            self.assertNotIn("temperature", self.body("anthropic"))
+            self.assertEqual(self.body("anthropic")["temperature"], 0.0)
 
     def test_out_of_range_is_clamped_not_sent(self) -> None:
         # The endpoint would refuse it, which is a worse way to find out.

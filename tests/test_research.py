@@ -492,7 +492,11 @@ class SourceLabResearchTests(unittest.TestCase):
         result = sourcegen.repair_source_lab(self.CVE, self.root, failure, 1, "key", "model", "anthropic", None)
         repair_research = self.research_calls()[-1]
         self.assertIn("session support missing", repair_research["input_text"])
-        prompt = self.calls[-1]["input_text"]
+        # Both halves of the user turn: the repair's diagnostic moved into
+        # input_suffix so the context in front of it can carry a cache
+        # breakpoint, and this asserts on what the provider actually receives.
+        last = self.calls[-1]
+        prompt = last["input_text"] + last.get("input_suffix", "")
         self.assertIn("The build lacked --enable-session.", prompt)
         self.assertIn("PHP_ARG_ENABLE(session)", prompt)
         self.assertIn("adapter/app/main.py", prompt)
