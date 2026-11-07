@@ -115,10 +115,6 @@ class GeneratedValidatorContractTests(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ValidatorVerdictGuardTests(unittest.TestCase):
     """The guard must reject a faked verdict and accept an honest one.
 
@@ -555,3 +551,67 @@ class SiblingModulesAreLinkedToTheTreeTests(unittest.TestCase):
         """
         self.assertIn("go list -m <module>", self.source)
         self.assertIn("names no version when it resolved to a local directory", self.source)
+
+
+class ADeclaredSupportServiceIsAReachableTargetTests(unittest.TestCase):
+    """A lab may declare a second service, and then has to be able to use it.
+
+    The host allowlist ran before the declaration was read and took no
+    argument for it, so a model that declared a support service and probed it
+    was refused -- and the refusal called the hostname external when it was a
+    service on the lab's own internal network, leaving no legal way to comply.
+    Measured: 5 of 36 archived refusals from this check wanted exactly this,
+    and support_services was declared in none of 186 labs, so the feature the
+    schema offers was unusable rather than unused.
+    """
+
+    CONTRACT = [
+        "attack_executed", "proof_quality", "observable_effect", "evidence_type",
+            "vulnerable", "patched", "differential_confirmed", "confirmed",
+            "blocked", "observations", "CVELAB_MANUAL_ACTION", "CVELAB_TARGET",
+            "exploit", "verify",
+    ]
+
+    def validator(self, *targets: str) -> str:
+        return " ".join([*self.CONTRACT, *(f'"http://{t}:8080/"' for t in targets)])
+
+    def test_a_declared_service_may_be_probed(self) -> None:
+        _validate_generated(
+            generated_files(self.validator("vulnerable", "patched", "upstream")),
+            support_services=["upstream"],
+        )
+
+    def test_the_same_lab_without_the_declaration_is_refused(self) -> None:
+        # The old behaviour, kept as a test so the fix cannot quietly regress
+        # into admitting any hostname at all.
+        with self.assertRaisesRegex(RuntimeError, "external target rejected: upstream"):
+            _validate_generated(
+                generated_files(self.validator("vulnerable", "patched", "upstream"))
+            )
+
+    def test_an_undeclared_host_is_still_refused(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "external target rejected: evil.example.com"):
+            _validate_generated(
+                generated_files(self.validator("vulnerable", "evil.example.com")),
+                support_services=["upstream"],
+            )
+
+    def test_the_two_builds_and_loopback_need_no_declaration(self) -> None:
+        _validate_generated(generated_files(self.validator("vulnerable", "patched", "127.0.0.1")))
+
+    def test_the_declaration_is_policed_before_it_is_trusted(self) -> None:
+        # What makes admitting these names safe: a reserved name, a duplicate
+        # and a name that is not a service in the lab's own Compose file are
+        # all refused, and that check now runs first.
+        compose = generated_files("x")[0]["content"]
+        for declared, why in (
+            (["validator"], "reserved"),
+            (["upstream", "upstream"], "duplicate"),
+            (["notincompose"], "not in the compose file"),
+        ):
+            with self.subTest(why=why), self.assertRaises(RuntimeError):
+                _validate_support_services(declared, compose)
+
+
+if __name__ == "__main__":
+    unittest.main()
