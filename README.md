@@ -192,6 +192,10 @@ export CVELAB_SETUP_REPAIRS=2        # repairs for seeding that did not establis
                                      # counted against the exploit's own attempts
 export CVELAB_BASE_IMAGES=on         # off: do not ask a registry whether a FROM tag is published
 export CVELAB_CONTRACT_RETRIES=2     # answers refused before the build, asked for again
+export CVELAB_TEMPERATURE=0          # pin sampling on every provider; unset lets each one
+                                     # choose. Pinning it low makes a run reproducible and
+                                     # stops the re-ask above from helping, since the same
+                                     # prompt then returns the same refused answer
 export CVELAB_PUBLISHED_RELEASES=on  # off: never offer an npm or PyPI release pair
 
 # How much of a large fix the model may read before writing a lab (GUIDE, section 5):

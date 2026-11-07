@@ -141,7 +141,8 @@ class FallbackModelTests(unittest.TestCase):
     def _ask(self, answers: list[object], fallback: str | None) -> tuple[Any, list[str]]:
         asked: list[str] = []
 
-        def anthropic(key, model, instructions, text, schema, budget, tools, seconds):
+        def anthropic(key, model, instructions, text, schema, budget, tools, seconds,
+                      temperature=None, **rest):
             asked.append(model)
             answer = answers.pop(0)
             if isinstance(answer, Exception):
@@ -185,7 +186,8 @@ class FallbackModelTests(unittest.TestCase):
     def test_a_run_already_on_the_default_is_not_asked_twice(self) -> None:
         asked: list[str] = []
 
-        def anthropic(key, model, instructions, text, schema, budget, tools, seconds):
+        def anthropic(key, model, instructions, text, schema, budget, tools, seconds,
+                      temperature=None, **rest):
             asked.append(model)
             raise self._declined()
 
