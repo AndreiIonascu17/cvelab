@@ -417,19 +417,19 @@ def _validate_schema(value: object, schema: dict, path: str = "$") -> None:
 #:
 #: WHY THE DEFAULT IS STILL "SEND NONE"
 #:
-#: Pinning this low makes a benchmark reproducible and breaks the mechanism
-#: that benchmark measures. `sourcegen._answer_until_valid` re-asks the SAME
-#: prompt when a pre-build check refuses the answer, and its whole premise is
-#: that the next sample differs -- its own docstring records that catching
-#: answers this way removed 15 of 27 failed builds. Pinned at 0 it would
-#: receive the identical refused answer every time and spend the budget on
-#: nothing. Measured on this panel: three consecutive "answer refused before
-#: the build; asking again" lines, then a run that ended with the model's
-#: answer thrown away.
+#: Not because pinning it would break the re-ask loops. That was the first
+#: answer here and it was wrong, so it is written down: nothing in this
+#: project re-asks a byte-identical prompt and hopes for a different sample.
+#: `sourcegen._answer_until_valid` appends the refusal it received before
+#: asking again, the repair prompts carry their own feedback suffix, the
+#: decline fallback asks a different model, and the output escalation changes
+#: only the budget. Every retry already differs by construction, so a pinned
+#: temperature would not starve any of them.
 #:
-#: So this exists to be set deliberately, for a run whose point is
-#: reproducibility, and a caller that re-asks is expected to raise it per
-#: attempt rather than hold it fixed.
+#: The default is "send none" because changing it changes every run on every
+#: provider, including the zero chat-completions has always sent, and that is
+#: a decision for whoever is measuring rather than a side effect of adding
+#: the knob. Pin it for a run whose point is reproducibility.
 TEMPERATURE_VARIABLE = "CVELAB_TEMPERATURE"
 
 
