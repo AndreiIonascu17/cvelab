@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +24,8 @@ from unittest import mock
 from cvelab.ai import (
     AIHTTPError,
     _anthropic_compatible_schema,
+    _user_turn,
+    prompt_cache_enabled,
     resolve_provider,
     structured_response,
 )
@@ -407,6 +410,41 @@ class TemperatureReachesEveryDialectTests(unittest.TestCase):
         # The endpoint would refuse it, which is a worse way to find out.
         with mock.patch.dict("os.environ", {"CVELAB_TEMPERATURE": "11"}):
             self.assertEqual(self.body("openai")["temperature"], 2.0)
+
+
+class PromptCacheIsOptInTests(unittest.TestCase):
+    """Measured at a 0.9% saving, so it does not run unless asked for.
+
+    The estimate that turned it on assumed a lab's nine median calls shared
+    one prefix. They do not: generation, validation and repair are three
+    prompts, and only re-asks inside one phase can read each other's entry.
+    One lab that validated in six calls on a single model wrote 151,499
+    tokens to cache and read 44,140 back.
+    """
+
+    def test_it_is_off_unless_asked_for(self) -> None:
+        with mock.patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("CVELAB_PROMPT_CACHE", None)
+            self.assertFalse(prompt_cache_enabled())
+
+    def test_asking_for_it_turns_it_on(self) -> None:
+        for asked in ("on", "1", "yes", "true", "ON"):
+            with self.subTest(asked=asked):
+                with mock.patch.dict("os.environ", {"CVELAB_PROMPT_CACHE": asked}):
+                    self.assertTrue(prompt_cache_enabled())
+
+    def test_off_leaves_the_turn_as_one_string(self) -> None:
+        with mock.patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("CVELAB_PROMPT_CACHE", None)
+            self.assertEqual(_user_turn("CONTEXT", "TAIL"), "CONTEXTTAIL")
+
+    def test_on_puts_the_breakpoint_before_the_tail(self) -> None:
+        with mock.patch.dict("os.environ", {"CVELAB_PROMPT_CACHE": "on"}):
+            blocks = _user_turn("CONTEXT", "TAIL")
+        self.assertEqual(blocks[0]["text"], "CONTEXT")
+        self.assertEqual(blocks[0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(blocks[1]["text"], "TAIL")
+        self.assertNotIn("cache_control", blocks[1])
 
 
 if __name__ == "__main__":
