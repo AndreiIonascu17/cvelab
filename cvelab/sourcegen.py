@@ -117,7 +117,8 @@ SOURCE_SCHEMA = {
     "required": [
         "cwe", "confidence", "rationale", "fidelity", "exploit_contract", "docker_compose",
         "dockerignore", "vulnerable_dockerfile", "patched_dockerfile",
-        "validator_dockerfile", "validator_py", "support_services", "adapter_files",
+        "validator_dockerfile", "validator_py", "validator_requirements",
+        "support_services", "adapter_files",
     ],
     "properties": {
         "cwe": {"type": "string"},
@@ -209,6 +210,23 @@ SOURCE_SCHEMA = {
         "patched_dockerfile": {"type": "string", "minLength": 1},
         "validator_dockerfile": {"type": "string", "minLength": 1},
         "validator_py": {"type": "string", "minLength": 1},
+        # A field of its own, because prose did not hold. The validator image
+        # builds from validator/ alone, so a Dockerfile that pip-installs from
+        # requirements.txt needs that file returned at validator/
+        # requirements.txt -- and the only place to return it used to be
+        # `adapter_files`, a field named after a different directory. The
+        # differential prompt said so outright: "requirements.txt is copyable
+        # only if you also return validator/requirements.txt in this answer; a
+        # COPY of it without that file is rejected before the build."
+        #
+        # It was still the single commonest reason an answer was refused
+        # before a build: 24 of the 71 refusals recorded across the archive,
+        # one third of them, every one a Dockerfile installing from a file the
+        # answer had not returned. Named here, the mistake cannot be made --
+        # the same reason every other file the model writes is a field rather
+        # than an instruction. Empty means the validator installs nothing,
+        # which is the common case.
+        "validator_requirements": {"type": "string"},
         # A product end to end can need a database, a cache, a queue, a mail
         # catcher and an identity provider; ten files did not hold a real
         # project beside its harness. The ceilings are sanity bounds only.
@@ -239,14 +257,14 @@ VULNERABLE_ONLY_SCHEMA = {
     "required": [
         "cwe", "confidence", "rationale", "fidelity", "exploit_contract", "docker_compose",
         "dockerignore", "vulnerable_dockerfile", "validator_dockerfile",
-        "validator_py", "support_services", "adapter_files",
+        "validator_py", "validator_requirements", "support_services", "adapter_files",
     ],
     "properties": {
         key: SOURCE_SCHEMA["properties"][key]
         for key in (
             "cwe", "confidence", "rationale", "fidelity", "exploit_contract", "docker_compose",
             "dockerignore", "vulnerable_dockerfile", "validator_dockerfile",
-            "validator_py", "support_services", "adapter_files",
+            "validator_py", "validator_requirements", "support_services", "adapter_files",
         )
     },
 }
@@ -2364,6 +2382,20 @@ def contract_retries() -> int:
     return max(0, min(value, 5))
 
 
+def _validator_requirements(generation: dict) -> list[dict]:
+    """The validator's requirements file, when the answer returned one.
+
+    A list so a caller can splat it: empty is the common case, because most
+    validators install nothing. Written from its own schema field rather than
+    picked out of `adapter_files`, where a file under validator/ had no
+    business being and where the model kept not putting it.
+    """
+    content = generation.get("validator_requirements") or ""
+    if not content.strip():
+        return []
+    return [{"path": "validator/requirements.txt", "content": content}]
+
+
 def _answer_until_valid(
     ask: Callable[[str], dict], check: Callable[[dict], list[dict]]
 ) -> tuple[dict, list[dict], list[str]]:
@@ -2700,6 +2732,7 @@ def generate_source_lab(
                     "content": _canonicalize_validator_dockerfile(generation["validator_dockerfile"]),
                 },
                 {"path": "validator/validator.py", "content": generation["validator_py"]},
+                *_validator_requirements(generation),
                 *_adapter_files(generation["adapter_files"]),
             ]
             _validate_support_services(
@@ -2872,8 +2905,9 @@ def generate_source_lab(
                 "Build contexts are fixed: vulnerable and patched build from the lab directory, where the vendor "
                 "snapshots are source/vulnerable and source/patched and adapter/ holds only the adapter files you "
                 "return; the validator builds from validator/ alone, which holds validator.py and the plan.json the CLI "
-                "writes there. requirements.txt is copyable only if you also return validator/requirements.txt "
-                "in this answer; a COPY of it without that file is rejected before the build. "
+                "writes there. A validator that installs packages returns them in validator_requirements, "
+                "which CVELab writes to validator/requirements.txt; leave it empty to install "
+                "nothing, and COPY it only when it is filled. "
                 "Every COPY source must exist in its context. vulnerable/Dockerfile and "
                 "patched/Dockerfile, and their Compose services, must be identical except for the snapshot they "
                 "copy, labels carrying their own name, package versions and commit ids; the adapter runs unchanged "
@@ -2899,6 +2933,7 @@ def generate_source_lab(
                 "content": _canonicalize_validator_dockerfile(generation["validator_dockerfile"]),
             },
             {"path": "validator/validator.py", "content": generation["validator_py"]},
+                *_validator_requirements(generation),
             *_adapter_files(generation["adapter_files"]),
         ]
         _validate_support_services(
@@ -3167,8 +3202,9 @@ def repair_source_lab(
                 "Build contexts are fixed: vulnerable and patched build from the lab directory, where the vendor "
                 "snapshots are source/vulnerable and source/patched and adapter/ holds only the adapter files you "
                 "return; the validator builds from validator/ alone, which holds validator.py and the plan.json the CLI "
-                "writes there. requirements.txt is copyable only if you also return validator/requirements.txt "
-                "in this answer; a COPY of it without that file is rejected before the build. "
+                "writes there. A validator that installs packages returns them in validator_requirements, "
+                "which CVELab writes to validator/requirements.txt; leave it empty to install "
+                "nothing, and COPY it only when it is filled. "
                 "Every COPY source must exist in its context. vulnerable/Dockerfile and "
                 "patched/Dockerfile, and their Compose services, must be identical except for the snapshot they "
                 "copy, labels carrying their own name, package versions and commit ids; the adapter runs unchanged "
@@ -3225,6 +3261,7 @@ def repair_source_lab(
                 "content": _canonicalize_validator_dockerfile(generation["validator_dockerfile"]),
             },
             {"path": "validator/validator.py", "content": generation["validator_py"]},
+                *_validator_requirements(generation),
         ]
         if not vulnerable_only:
             generated_files.insert(

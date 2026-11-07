@@ -20,10 +20,13 @@ from pathlib import Path
 
 from cvelab import core
 from cvelab.sourcegen import (
+    SOURCE_SCHEMA,
+    VULNERABLE_ONLY_SCHEMA,
     _canonicalize_validator_dockerfile,
     _validate_fidelity,
     _validate_generated,
     _validate_support_services,
+    _validator_requirements,
 )
 
 
@@ -611,6 +614,71 @@ class ADeclaredSupportServiceIsAReachableTargetTests(unittest.TestCase):
         ):
             with self.subTest(why=why), self.assertRaises(RuntimeError):
                 _validate_support_services(declared, compose)
+
+
+class TheValidatorsRequirementsAreAFieldTests(unittest.TestCase):
+    """Prose in the prompt did not hold, so the file became a field.
+
+    The validator image builds from validator/ alone, so a Dockerfile that
+    installs from requirements.txt needs that file returned beside it -- and
+    the only field to return it in was `adapter_files`, named after a
+    different directory. The differential prompt said so outright and the
+    model still got it wrong 24 times out of 71 recorded pre-build refusals,
+    a third of them, every one a Dockerfile installing from a file the answer
+    had not returned. A named field cannot be missed the same way, which is
+    why every other file the model writes is one.
+    """
+
+    def test_both_schemas_require_it(self) -> None:
+        for name, schema in (("source", SOURCE_SCHEMA),
+                             ("vulnerable-only", VULNERABLE_ONLY_SCHEMA)):
+            with self.subTest(schema=name):
+                self.assertIn("validator_requirements", schema["properties"])
+                self.assertIn("validator_requirements", schema["required"])
+
+    def test_strict_mode_still_holds(self) -> None:
+        # A strict schema needs every property required and no others
+        # allowed; a field added to one list and not the other is a 400 from
+        # the provider rather than a refusal CVELab can explain.
+        for name, schema in (("source", SOURCE_SCHEMA),
+                             ("vulnerable-only", VULNERABLE_ONLY_SCHEMA)):
+            with self.subTest(schema=name):
+                self.assertFalse(schema["additionalProperties"])
+                self.assertEqual(sorted(schema["required"]), sorted(schema["properties"]))
+
+    def test_a_filled_field_becomes_the_file(self) -> None:
+        written = _validator_requirements({"validator_requirements": "requests==2.32.3\n"})
+        self.assertEqual(written, [{
+            "path": "validator/requirements.txt",
+            "content": "requests==2.32.3\n",
+        }])
+
+    def test_an_empty_field_writes_nothing(self) -> None:
+        # The common case: most validators install nothing, and an empty
+        # requirements.txt beside a Dockerfile that does not COPY it is a file
+        # the lab has to explain.
+        for empty in ("", "   ", "\n", None):
+            with self.subTest(given=repr(empty)):
+                self.assertEqual(_validator_requirements({"validator_requirements": empty}), [])
+
+    def test_a_missing_key_is_not_an_error(self) -> None:
+        # A repair answer validated against an older schema still has to
+        # assemble rather than raise.
+        self.assertEqual(_validator_requirements({}), [])
+
+    def test_the_path_it_writes_is_one_the_layout_allows(self) -> None:
+        # Writing a file the next check refuses would trade one refusal for
+        # another.
+        validator = " ".join([
+            "attack_executed", "proof_quality", "observable_effect", "evidence_type",
+            "vulnerable", "patched", "differential_confirmed", "confirmed",
+            "blocked", "observations", "CVELAB_MANUAL_ACTION", "CVELAB_TARGET",
+            "exploit", "verify",
+        ])
+        files = generated_files(validator) + _validator_requirements(
+            {"validator_requirements": "requests==2.32.3\n"}
+        )
+        _validate_generated(files)
 
 
 if __name__ == "__main__":
