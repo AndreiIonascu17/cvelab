@@ -358,18 +358,30 @@ class TemperatureReachesEveryDialectTests(unittest.TestCase):
         return request.call_args.args[2] if len(request.call_args.args) > 2 \
             else request.call_args.kwargs["body"]
 
-    def test_each_dialect_sends_what_was_asked_for(self) -> None:
-        for provider in ("openai", "anthropic", "deepseek"):
+    def test_each_dialect_that_accepts_one_sends_what_was_asked_for(self) -> None:
+        for provider in ("openai", "deepseek"):
             with self.subTest(provider=provider):
                 self.assertEqual(self.body(provider, temperature=0.25)["temperature"], 0.25)
 
-    def test_every_dialect_now_pins_zero_by_default(self) -> None:
-        # The two that named no temperature now send the same zero
-        # chat-completions always did, so one run samples one way whatever
-        # provider served it.
-        for provider in ("openai", "anthropic", "deepseek"):
+    def test_the_dialects_that_accept_one_pin_zero_by_default(self) -> None:
+        for provider in ("openai", "deepseek"):
             with self.subTest(provider=provider):
                 self.assertEqual(self.body(provider)["temperature"], 0.0)
+
+    def test_the_messages_dialect_never_sends_one(self) -> None:
+        """Anthropic's Messages API refuses the parameter outright.
+
+        HTTP 400, "`temperature` is deprecated for this model.", on every
+        current model. It was sent here once -- on the reasonable-sounding
+        grounds that two dialects named no temperature while a third pinned
+        zero -- and it broke every Anthropic request in the five seconds it
+        took the benchmark's smoke entry to reach the provider. Whatever the
+        setting says, this dialect sends none.
+        """
+        for asked in ("", "0", "0.7", "2", "default", "warm"):
+            with self.subTest(asked=asked):
+                with mock.patch.dict("os.environ", {"CVELAB_TEMPERATURE": asked}):
+                    self.assertNotIn("temperature", self.body("anthropic"))
 
     def test_the_provider_default_can_be_asked_for_back(self) -> None:
         # Zero is not free -- a model held there can be worse at long
@@ -378,23 +390,23 @@ class TemperatureReachesEveryDialectTests(unittest.TestCase):
         for asked in ("default", "provider", "off", "none", "unset", "DEFAULT"):
             with self.subTest(asked=asked):
                 with mock.patch.dict("os.environ", {"CVELAB_TEMPERATURE": asked}):
-                    self.assertNotIn("temperature", self.body("anthropic"))
+                    self.assertNotIn("temperature", self.body("openai"))
 
     def test_the_environment_reaches_a_caller_that_asked_for_nothing(self) -> None:
         with mock.patch.dict("os.environ", {"CVELAB_TEMPERATURE": "0.7"}):
-            self.assertEqual(self.body("anthropic")["temperature"], 0.7)
+            self.assertEqual(self.body("openai")["temperature"], 0.7)
 
     def test_an_unreadable_setting_falls_back_to_the_default(self) -> None:
         # A run is worth more than a complaint about a stray environment
         # variable; "warm" is not a request for the provider's default, it is
         # a typo, and the default is what a typo should get.
         with mock.patch.dict("os.environ", {"CVELAB_TEMPERATURE": "warm"}):
-            self.assertEqual(self.body("anthropic")["temperature"], 0.0)
+            self.assertEqual(self.body("openai")["temperature"], 0.0)
 
     def test_out_of_range_is_clamped_not_sent(self) -> None:
         # The endpoint would refuse it, which is a worse way to find out.
         with mock.patch.dict("os.environ", {"CVELAB_TEMPERATURE": "11"}):
-            self.assertEqual(self.body("anthropic")["temperature"], 2.0)
+            self.assertEqual(self.body("openai")["temperature"], 2.0)
 
 
 if __name__ == "__main__":
