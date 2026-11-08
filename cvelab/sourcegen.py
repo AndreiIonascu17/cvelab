@@ -1540,6 +1540,33 @@ def _validate_generated(
                     "instance. With no argument it must behave exactly as it does "
                     "now, from CVELAB_MANUAL_ACTION, CVELAB_TARGET and CVELAB_BOUND."
                 )
+            # The usage line, measured on a generated lab as
+            # `usage: validator.py [<host>:<port>]`. That is a filename its
+            # reader does not have: the kit delivers this file as
+            # artifacts/PoC.py and the guide tells them to run that name, so
+            # the one line printed when they call it wrongly points them at a
+            # file their document never mentions. A script that names itself
+            # from sys.argv[0] is right under both names and has no filename
+            # literal to find, which is what this looks for -- one model call
+            # instead of a line nobody reads until it is printed in front of a
+            # client.
+            #
+            # Only the name. The other half of the same defect, a usage path
+            # that exits 0, has no spelling to pin: the status can come from a
+            # `return`, a `sys.exit`, or falling off the end of a function,
+            # and a pattern loose enough to catch all three refuses correct
+            # scripts. _OPERATOR_CONTRACT states it, and
+            # tests/fixtures/operator_validator.py is the script the tests run
+            # to show it is satisfiable.
+            misnamed = re.search(r"(?i)usage[^\n]{0,120}?[\w./-]+\.py", item["content"])
+            if misnamed:
+                raise RuntimeError(
+                    "Validator writes a filename into its usage line "
+                    f"({misnamed.group(0).strip()!r}): it must name itself by the name "
+                    "it was invoked as, os.path.basename(sys.argv[0]), because this "
+                    "file runs as validator.py inside the lab and is handed to the "
+                    "operator as artifacts/PoC.py"
+                )
             # Only the fields the contract says must be computed. The same
             # instruction defines attack_executed as "the regression input
             # was actually delivered", which the validator knows for a fact
@@ -2797,8 +2824,16 @@ _OPERATOR_CONTRACT = (
     "two-argument form adds what the operator asks for without changing what one "
     "argument does. For every other evidence_type there is no second argument: a command "
     "has nothing to mean, and a script that invents one is refused. "
-    "A third positional argument is never accepted: print how to call the script and "
-    "exit 2. "
+    "An argument the script will not act on is refused, and refusing is not running: "
+    "send nothing, print how to call the script, and exit 2. That covers a third "
+    "positional argument on any lab and a second one on every evidence_type except "
+    "code_execution. Never exit 0 there -- a script that prints its usage and exits 0 "
+    "has told whatever read the status that the proof succeeded while doing nothing at "
+    "all. Name the script in that line by the name it was invoked as, "
+    "os.path.basename(sys.argv[0]), and never by a filename written into the text: this "
+    "file is validator.py inside the lab and reaches the operator as artifacts/PoC.py, "
+    "so a written-in name is wrong in one of those two places and points its reader at "
+    "a file their guide never names. "
     "None of this changes the lab. docker-compose.yml still declares internal: true, "
     "still publishes no host port and mounts no host path, and the containers still "
     "reach nothing outside the lab's own network -- every instruction above about "

@@ -100,7 +100,14 @@ def inside(host):
 def main(argv):
     rest = argv[1:]
     if len(rest) > 2:
-        print("usage: PoC.py [<host>:<port>] [command]", file=sys.stderr)
+        # Named from argv[0] rather than written in, and exiting non-zero
+        # because refusing to run is not a run: the same file is validator.py
+        # inside the lab and artifacts/PoC.py in the operator's hands, so
+        # either literal is wrong in the other place.
+        print(
+            "usage: %s [<host>:<port>] [command]" % os.path.basename(argv[0]),
+            file=sys.stderr,
+        )
         return 2
     if rest:
         address = rest[0]

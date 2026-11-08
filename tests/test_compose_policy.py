@@ -27,8 +27,10 @@ import json
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 import unittest.mock as mock
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -408,19 +410,112 @@ class ManualPortTests(unittest.TestCase):
         self.assertEqual(self.published(), ["127.0.0.1::8080"])
         self.assertEqual(policy.MANUAL_BIND, "127.0.0.1")
 
-    def test_only_that_one_service_and_key_are_touched(self) -> None:
+    def test_only_that_one_service_is_touched_and_only_the_two_keys(self) -> None:
         # Compose merges this over the lab; anything else here would be
         # CVELab quietly rewriting a service the owner did not ask about.
+        # The network is the second key because the first one does nothing
+        # without it -- measured on a generated lab, where `ports` alone
+        # survived the merge and `compose port vulnerable 8080` still printed
+        # ":0" because every network the service had was internal.
         self.assertEqual(
-            self.override(), {"services": {"vulnerable": {"ports": ["127.0.0.1::8080"]}}}
+            self.override(),
+            {
+                "networks": {"cvelab-manual": {
+                    "internal": False,
+                    "driver_opts": {
+                        "com.docker.network.bridge.enable_ip_masquerade": "false"
+                    },
+                }},
+                "services": {"vulnerable": {
+                    "networks": {"lab": None, "cvelab-manual": None},
+                    "ports": ["127.0.0.1::8080"],
+                }},
+            },
         )
+
+    def test_the_publishing_network_is_the_only_one_not_internal(self) -> None:
+        """What the exception costs, held to what was measured.
+
+        A plain bridge here reached `1.1.1.1:443` and port 80 on the gateway
+        of the laptop's own LAN from inside the published build. Without the
+        masquerade rule both timed out and the published port still answered
+        200, so the option is what keeps the exception one-directional.
+        """
+        added = self.override()["networks"]["cvelab-manual"]
+        self.assertIs(added["internal"], False)
+        self.assertEqual(added["driver_opts"], policy.MANUAL_NETWORK_DRIVER_OPTS)
+        self.assertEqual(
+            policy.MANUAL_NETWORK_DRIVER_OPTS,
+            {"com.docker.network.bridge.enable_ip_masquerade": "false"},
+        )
+        # And the lab's own network is not reshaped on the way past: the
+        # override names one network, and it is not the lab's.
+        self.assertEqual(list(self.override()["networks"]), [policy.MANUAL_NETWORK])
+        self.assertNotIn("lab", self.override()["networks"])
+
+    def test_the_labs_own_networks_are_read_rather_than_assumed(self) -> None:
+        """`lab` is this generator's name for it, not a lab's only choice.
+
+        A lab copied from someone else names its network whatever it likes,
+        and a service can be on more than one. Compose merges `networks` as a
+        mapping -- measured on 5.6.1, which normalises the short list form
+        first -- but an override that named only its own network would be
+        wrong the moment a Compose version replaced the key instead, so the
+        whole set is written.
+        """
+        value = model(
+            vulnerable=service(networks={"frontend": None, "backend": None}),
+            patched=service(),
+        )
+        value["networks"] = {
+            "frontend": {"internal": True}, "backend": {"internal": True},
+        }
+        self.assertEqual(
+            policy.manual_port_override(value, "vulnerable", 8080)["services"],
+            {"vulnerable": {
+                "networks": {"frontend": None, "backend": None, "cvelab-manual": None},
+                "ports": ["127.0.0.1::8080"],
+            }},
+        )
+
+    def test_an_endpoint_the_lab_configured_survives(self) -> None:
+        # Copied out of the model whole rather than rewritten as a null,
+        # because an alias is how a validator reaches the stand-in endpoint a
+        # request-forgery finding is observed through, and losing it reads as
+        # a lab that did not reproduce.
+        value = model(
+            vulnerable=service(networks={"lab": {"aliases": ["upstream.invalid"]}}),
+            patched=service(),
+        )
+        self.assertEqual(
+            policy.manual_port_override(value, "vulnerable", 8080)["services"],
+            {"vulnerable": {
+                "networks": {"lab": {"aliases": ["upstream.invalid"]}, "cvelab-manual": None},
+                "ports": ["127.0.0.1::8080"],
+            }},
+        )
+
+    def test_a_lab_that_claims_the_publishing_name_is_refused(self) -> None:
+        # The one thing this override must never do is reshape a network of
+        # the lab's. A lab declaring CVELab's name for its own network would
+        # have internal: false and a driver option written onto it, so the
+        # collision is refused instead of resolved.
+        value = model()
+        value["networks"][policy.MANUAL_NETWORK] = {"internal": True}
+        with self.assertRaises(policy.PolicyError) as raised:
+            policy.manual_port_override(value, "vulnerable", 8080)
+        self.assertIn(policy.MANUAL_NETWORK, str(raised.exception))
+        self.assertIn("internal: false", str(raised.exception))
 
     def test_any_service_the_lab_defines_may_be_published(self) -> None:
         for name in ("vulnerable", "patched", "validator"):
             with self.subTest(name=name):
                 self.assertEqual(
                     policy.manual_port_override(model(), name, 3000)["services"],
-                    {name: {"ports": ["127.0.0.1::3000"]}},
+                    {name: {
+                        "networks": {"lab": None, "cvelab-manual": None},
+                        "ports": ["127.0.0.1::3000"],
+                    }},
                 )
 
     def test_a_service_the_lab_does_not_define_is_refused(self) -> None:
@@ -458,7 +553,10 @@ class ManualPortTests(unittest.TestCase):
         value = model(vulnerable=service(expose=["9000"]), patched=service(), validator=service())
         self.assertEqual(
             policy.manual_port_override(value, "vulnerable", 8080)["services"],
-            {"vulnerable": {"ports": ["127.0.0.1::8080"]}},
+            {"vulnerable": {
+                "networks": {"lab": None, "cvelab-manual": None},
+                "ports": ["127.0.0.1::8080"],
+            }},
         )
 
     def test_a_model_written_ports_is_still_refused(self) -> None:
@@ -489,12 +587,30 @@ class ManualPortTests(unittest.TestCase):
         # Proof the two cannot be reconciled by accident: feed the override
         # back through the lab's own policy and it is refused. It reaches
         # Compose as a second -f, the way the limits do, never as lab text.
-        published = self.override()["services"]["vulnerable"]
+        #
+        # Both halves of it now, and each for its own reason: the port
+        # because `ports` is not a key a lab may write, and the network
+        # because every network in a lab's own file must be internal and
+        # may not set driver options. A lab that wrote this file's contents
+        # into its docker-compose.yml is refused three times over.
+        override = self.override()
         merged = model()
-        merged["services"]["vulnerable"].update(published)
+        merged["services"]["vulnerable"].update(override["services"]["vulnerable"])
+        merged["networks"].update(override["networks"])
+        refused = "\n".join(policy.check_model(merged, LAB))
+        self.assertIn("service 'vulnerable': ports is not allowed", refused)
         self.assertIn(
-            "service 'vulnerable': ports is not allowed",
-            "\n".join(policy.check_model(merged, LAB)),
+            f"network '{policy.MANUAL_NETWORK}': must declare internal: true", refused
+        )
+        self.assertIn(
+            f"network '{policy.MANUAL_NETWORK}': driver_opts is not allowed", refused
+        )
+        # And the service is refused for being on it, so there is no reading
+        # of the lab's own file under which this network is acceptable.
+        self.assertIn(
+            f"service 'vulnerable': joins network '{policy.MANUAL_NETWORK}', which is "
+            "not an internal lab network",
+            refused,
         )
 
 
@@ -603,6 +719,129 @@ class DockerComposeTests(unittest.TestCase):
         resolved = policy.enforce(compose_command(docker, lab), lab, docker_environment(docker))
         self.assertEqual(resolved["name"], "cve-2026-0001")
         self.assertEqual(resolved["services"]["vulnerable"]["environment"], {"A": "default"})
+
+
+@pytest.mark.docker
+class PublishedPortTests(unittest.TestCase):
+    """The defect no assertion about the override could have failed.
+
+    `manual_port_override` emitted a loopback `ports` entry for a service
+    whose only network was `internal: true`, and everything checkable about
+    it was correct: the entry was in the override, Compose carried it through
+    the merge, and `config` resolved it to `{mode: ingress, host_ip:
+    127.0.0.1, target: 8080, protocol: tcp}`. Docker then discarded the
+    publication at `up` without a word -- `ps` showed `8080/tcp` with no
+    mapping, `docker compose port` printed `:0`, and `manual.sh` printed that
+    as the address to hand the PoC. Nothing short of starting a container
+    could tell, so these start one.
+    """
+
+    PROJECT = "cvelab-manual-port-check"
+    # Enough of a server to answer once per connection, from an image with no
+    # build: busybox nc, reopened in a loop.
+    LISTENER = (
+        "while true; do printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 3\\r\\n"
+        "Connection: close\\r\\n\\r\\nok\\n' | nc -l -p 8080; done"
+    )
+    LAB_YAML = (
+        "services:\n"
+        "  vulnerable:\n"
+        "    image: alpine:3.20\n"
+        '    command: ["sh", "-c", "' + LISTENER + '"]\n'
+        "    networks:\n"
+        "      lab:\n"
+        "        aliases: [product.canary.local]\n"
+        "networks:\n"
+        "  lab:\n"
+        "    internal: true\n"
+    )
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.lab = Path(temporary.name) / "manual-port"
+        self.lab.mkdir()
+        (self.lab / "docker-compose.yml").write_text(self.LAB_YAML, encoding="utf-8")
+        self.docker = shutil.which("docker") or "docker"
+
+    def started(self, override: dict) -> list[str]:
+        """The lab up with that override merged, torn down afterwards."""
+        path = self.lab / "override.json"
+        path.write_text(json.dumps(override), encoding="utf-8")
+        command = [
+            self.docker, "compose", "-p", self.PROJECT,
+            "-f", str(self.lab / "docker-compose.yml"), "-f", str(path),
+            "--project-directory", str(self.lab),
+        ]
+        self.addCleanup(
+            subprocess.run, [*command, "down", "--remove-orphans"],
+            capture_output=True, timeout=300, check=False,
+        )
+        done = self.ran(command, "up", "-d")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return command
+
+    def ran(self, command: list[str], *arguments: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [*command, *arguments], cwd=self.lab, capture_output=True, text=True,
+            timeout=300, check=False,
+        )
+
+    def resolved(self, command: list[str]) -> dict:
+        done = self.ran(command, "config", "--format", "json")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return json.loads(done.stdout)
+
+    def test_the_override_publishes_a_port_the_host_can_reach(self) -> None:
+        command = self.started(
+            policy.manual_port_override(
+                self.resolved([
+                    self.docker, "compose", "-p", self.PROJECT,
+                    "-f", str(self.lab / "docker-compose.yml"),
+                    "--project-directory", str(self.lab),
+                ]),
+                "vulnerable",
+                8080,
+            )
+        )
+        published = self.ran(command, "port", "vulnerable", "8080").stdout.strip()
+        # The whole measurement in one line: a host address, with a port the
+        # kernel assigned, where `:0` used to be.
+        self.assertRegex(published, r"^127\.0\.0\.1:[1-9]\d{3,4}$")
+        self.assertIn(f"{published}->8080/tcp", self.ran(command, "ps").stdout)
+        answered = ""
+        for _ in range(40):
+            try:
+                with urllib.request.urlopen(f"http://{published}/", timeout=2) as reply:
+                    answered = reply.read().decode("utf-8", "replace").strip()
+                break
+            except OSError:
+                time.sleep(0.5)
+        self.assertEqual(answered, "ok")
+        # The alias the lab declared on its own network is still there: the
+        # override copies the endpoint out of the model rather than replacing
+        # the key with its own network alone.
+        self.assertEqual(
+            self.resolved(command)["services"]["vulnerable"]["networks"]["lab"],
+            {"aliases": ["product.canary.local"]},
+        )
+
+    def test_ports_alone_resolve_correctly_and_publish_nothing(self) -> None:
+        """Why the network is in the override, kept measurable.
+
+        This is the override as it was: correct `ports`, no network. If a
+        Docker release ever starts publishing for an internal-only service,
+        or refusing instead of discarding, this is the test that says so.
+        """
+        command = self.started(
+            {"services": {"vulnerable": {"ports": [f"{policy.MANUAL_BIND}::8080"]}}}
+        )
+        self.assertEqual(
+            self.resolved(command)["services"]["vulnerable"]["ports"],
+            [{"mode": "ingress", "host_ip": "127.0.0.1", "target": 8080, "protocol": "tcp"}],
+        )
+        self.assertEqual(self.ran(command, "port", "vulnerable", "8080").stdout.strip(), ":0")
+        self.assertNotIn("->", self.ran(command, "ps").stdout)
 
 
 if __name__ == "__main__":

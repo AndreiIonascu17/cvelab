@@ -607,6 +607,49 @@ def setup_override(
 #: processes already on the machine.
 MANUAL_BIND = "127.0.0.1"
 
+#: The network the published port lands on, added in manual mode and nowhere else.
+#:
+#: Without it the publication is discarded and nothing says so. Every network
+#: a lab may declare is `internal: true` -- _check_networks refuses any other
+#: kind -- and Docker will not publish a host port for a service whose
+#: networks are all internal: it drops the mapping and leaves the container
+#: running as though nothing had been asked. Measured on a generated
+#: lab: `docker compose config` over the lab plus this override showed the
+#: entry surviving the merge intact, `{mode: ingress, host_ip: 127.0.0.1,
+#: target: 8080, protocol: tcp}`, while `docker compose ps` reported
+#: `8080/tcp` with no mapping and `docker compose port vulnerable 8080`
+#: printed `:0`, which is what `manual.sh` then printed as the address. All
+#: three port forms did the same thing -- the ephemeral short form, a long
+#: form with `published: "0"`, and an explicit `127.0.0.1:18080:8080` -- so
+#: neither the merge nor the form was ever the fault. With this network added
+#: and the published service joined to it beside the lab's own, the same lab
+#: reported `127.0.0.1:32768->8080/tcp` and the carried PoC printed
+#: REPRODUCED against that address.
+MANUAL_NETWORK = "cvelab-manual"
+
+#: Why that network carries no NAT.
+#:
+#: A plain bridge does not only let the host in, it lets the lab out.
+#: Measured from the published build on one: `1.1.1.1:443` connected, so did
+#: port 80 on the gateway of the laptop's own LAN, and `example.com`
+#: resolved -- a build whose whole purpose is to be exploitable, holding a
+#: route into whatever network the owner is sitting on, which at a client site
+#: is the client's. Dropping the masquerade rule leaves the inbound DNAT
+#: alone: on the same lab the assigned port still answered 200 on
+#: `/health` and the PoC still printed REPRODUCED, while both of those
+#: outbound probes timed out. `gw_priority: -100` on this endpoint was tried
+#: first and does nothing -- an internal network offers no gateway, so Docker
+#: takes the default route from this one however the priority is written.
+#:
+#: It narrows the exception rather than closing it, and `manual_port_override`
+#: says below what stays open.
+#:
+#: `driver_opts` is refused in a lab's own network definition
+#: (NETWORK_REASONS) and stays refused, for the reason `ports` is: the lab
+#: does not choose driver options. This is CVELab choosing one, for a network
+#: CVELab creates, in a file only a person's `manual.sh` run merges.
+MANUAL_NETWORK_DRIVER_OPTS = {"com.docker.network.bridge.enable_ip_masquerade": "false"}
+
 
 def manual_port_override(model: dict, service: str, container_port: int) -> dict:
     """A Compose override publishing one service's port on loopback, for manual mode.
@@ -630,28 +673,54 @@ def manual_port_override(model: dict, service: str, container_port: int) -> dict
 
     WHAT IT MAY ASK FOR
 
-    One short-form entry, `127.0.0.1::<container port>`, for one service.
-    The address is fixed (MANUAL_BIND) and the host side is left empty, so
-    the kernel assigns an ephemeral port: nothing collides with a port the
-    owner is already using, and nothing the model wrote picks a host-side
-    number. The caller reads the assignment back with `docker compose port
-    <service> <container port>` and hands it to the PoC as its argument. A
-    host-side number, a range, and any other address are all absent from
-    what this builds rather than validated out of it.
+    One short-form entry, `127.0.0.1::<container port>`, for one service, and
+    the one network that entry needs in order to mean anything. The address is
+    fixed (MANUAL_BIND) and the host side is left empty, so the kernel assigns
+    an ephemeral port: nothing collides with a port the owner is already
+    using, and nothing the model wrote picks a host-side number. The caller
+    reads the assignment back with `docker compose port <service> <container
+    port>` and hands it to the PoC as its argument. A host-side number, a
+    range, and any other address are all absent from what this builds rather
+    than validated out of it.
+
+    The network is MANUAL_NETWORK, and the published service joins it BESIDE
+    the networks it already declares, read back out of the model: a lab's own
+    network is not necessarily called `lab`, and its endpoint can carry the
+    aliases the lab reaches itself by. Why a second network is needed at all,
+    and why it carries no NAT, is recorded on those two constants; both
+    answers were measured, and the first is why this function published
+    nothing for as long as it emitted `ports` alone.
 
     WHAT IT GIVES UP
 
-    A real one. For as long as the lab is up, any process on the host --
-    every browser tab, every other container with a host-gateway route,
-    anything else running as the owner -- can reach the vulnerable build
-    through loopback, and reach it unauthenticated, because being reachable
-    without credentials is usually the point of the lab. The isolation the
-    rest of this module maintains is that the lab can be reached only from
-    inside its own internal network; that is now untrue of one port of one
-    service, by request. What survives is the direction: the network stays
-    `internal: true`, so the lab still cannot reach out, and nothing outside
-    the host can reach in. That is narrower than no exception at all, and
-    calling it unchanged would be a lie.
+    A real one, and more than the first version of this said. For as long as
+    the lab is up, any process on the host -- every browser tab, every other
+    container with a host-gateway route, anything else running as the owner --
+    can reach the vulnerable build through loopback, and reach it
+    unauthenticated, because being reachable without credentials is usually
+    the point of the lab. The isolation the rest of this module maintains is
+    that the lab can be reached only from inside its own internal network;
+    that is now untrue of one port of one service, by request.
+
+    The second network is the part that cannot be waved through, because
+    attaching a service to a network changes what that service can reach, and
+    this one is a service built around a working weakness. Measured, with the
+    options above: the lab's own network stays `internal: true` and nothing
+    about the lab's own file changes; outbound TCP along an ordinary route is
+    as dead as it was -- the internet and the owner's LAN both timed out,
+    where a plain bridge had reached both -- and the host's own address on the
+    new bridge is on-link, so whatever the host's input policy allows there is
+    now reachable from the lab (on the machine this was measured on, nothing:
+    a listener on 0.0.0.0 was never reached). What is genuinely new is
+    external name resolution: on the internal network alone `example.com`
+    fails with EAI_AGAIN, and through this one it resolves, which is a channel
+    out of the lab for anything that can be spelled into a hostname.
+
+    That trade is for a demonstration a person starts, watches, and tears
+    down -- the same person-at-the-keyboard argument the `ports` exception
+    itself rests on, and `cleanup` removes the network with the project. It is
+    not a posture to leave running, and the automatic path still never merges
+    any of it.
 
     WHERE THE PORT COMES FROM
 
@@ -704,8 +773,50 @@ def manual_port_override(model: dict, service: str, container_port: int) -> dict
             "Compose policy refused this lab:\n  - container port "
             f"{container_port!r} is not a port; it must be an integer from 1 to 65535"
         )
-    # A sequence, which Compose appends to across `-f` files rather than
-    # replacing -- the merge hazard setup_override is written around. Safe
-    # here only because `enforce` has already refused a `ports:` of the
-    # lab's own, so there is nothing for this to be appended to.
-    return {"services": {service: {"ports": [f"{MANUAL_BIND}::{container_port}"]}}}
+    attached = (services.get(service) or {}).get("networks")
+    if isinstance(attached, dict):
+        attached = dict(attached)
+    elif isinstance(attached, (list, tuple)):
+        attached = dict.fromkeys(attached)
+    else:
+        attached = {}
+    # The one name in this file that is CVELab's rather than the lab's. A lab
+    # that declares a network under it would have `internal: false` and a
+    # driver option written onto a network of its own by the lines below,
+    # which is the one thing this override must never do -- so it is refused
+    # instead, and the refusal says which name is taken.
+    if MANUAL_NETWORK in attached or MANUAL_NETWORK in (model.get("networks") or {}):
+        raise PolicyError(
+            "Compose policy refused this lab:\n  - the lab declares a network named "
+            f"'{MANUAL_NETWORK}', which is the name manual mode publishes through; "
+            "CVELab would be setting internal: false on a network of the lab's instead "
+            "of adding one of its own"
+        )
+    return {
+        "networks": {MANUAL_NETWORK: {
+            # Spelled out rather than left to default, because this is the
+            # line the whole exception turns on and a reader of the shipped
+            # file should not have to know Compose's default to see it.
+            "internal": False,
+            "driver_opts": dict(MANUAL_NETWORK_DRIVER_OPTS),
+        }},
+        "services": {service: {
+            # The endpoints the service already has, copied out of the
+            # resolved model rather than named: `lab` is this generator's name
+            # for it, a lab copied from someone else can call it anything, and
+            # an endpoint can carry the aliases a validator's canary is
+            # reached by. Copied whole rather than rewritten as nulls so the
+            # entry says the same thing under either merge rule -- measured on
+            # Compose 5.6.1, which normalises the short list form to a mapping
+            # before merging and so keeps an alias that a `null` of ours sat
+            # beside, while an older Compose that replaced the key outright is
+            # still handed the complete set.
+            "networks": {**attached, MANUAL_NETWORK: None},
+            # A sequence, which Compose appends to across `-f` files rather
+            # than replacing -- the merge hazard setup_override is written
+            # around. Safe here only because `enforce` has already refused a
+            # `ports:` of the lab's own, so there is nothing for this to be
+            # appended to.
+            "ports": [f"{MANUAL_BIND}::{container_port}"],
+        }},
+    }

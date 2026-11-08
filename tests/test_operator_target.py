@@ -323,9 +323,45 @@ class TheAddressPathTests(unittest.TestCase):
             said, complained, code = run_fixture(
                 [address, "id", "extra"], address, {}
             )
+        # Not 0. Refusing to run is not a run, and a usage line over a zero
+        # status tells whatever read the status that the proof succeeded --
+        # measured on a generated lab, whose `PoC.py <address> id` on a lab
+        # that declares no command execution printed its usage and exited 0.
         self.assertEqual(code, 2)
         self.assertIn("usage", complained)
         self.assertEqual(asked, [])
+
+    def test_the_usage_line_names_the_file_it_was_run_as(self) -> None:
+        """The same script, under both of the names it is delivered with.
+
+        It is `validator/validator.py` inside the lab and `artifacts/PoC.py`
+        in the operator's hands -- byte for byte apart from a docstring -- so
+        a name written into the text is wrong in one of the two places. A
+        generated lab printed `usage: validator.py [<host>:<port>]` to a
+        reader whose guide tells them to run `PoC.py`.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            for name in ("PoC.py", "validator.py"):
+                copy = Path(temporary) / name
+                copy.write_text(FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+                finished = subprocess.run(
+                    [sys.executable, "-I", str(copy), "a", "b", "c"],
+                    capture_output=True, text=True, timeout=60,
+                )
+                with self.subTest(name=name):
+                    self.assertEqual(finished.returncode, 2)
+                    self.assertIn(f"usage: {name} ", finished.stderr)
+
+    def test_a_usage_line_with_a_filename_in_it_is_refused(self) -> None:
+        from tests.test_sourcegen_contract import generated_files
+
+        named = fixture_source().replace(
+            '"usage: %s [<host>:<port>] [command]" % os.path.basename(argv[0])',
+            '"usage: validator.py [<host>:<port>] [command]"',
+        )
+        self.assertIn("usage: validator.py", named)
+        with self.assertRaisesRegex(RuntimeError, "usage line"):
+            sourcegen._validate_generated(generated_files(named))
 
     def test_the_contract_checks_accept_a_script_written_to_it(self) -> None:
         """The fixture is held to the same gate a generated validator is.
@@ -393,6 +429,10 @@ class TheGenerationContractSaysSoTests(unittest.TestCase):
             "evidence_type is code_execution",
             "optional SECOND positional argument",
             "For every other evidence_type there is no second argument",
+            # An argument the script will not act on, and the status that
+            # says so. One generated lab printed its usage and exited 0.
+            "Never exit 0 there",
+            "os.path.basename(sys.argv[0])",
             # And the lab itself is not loosened by any of it.
             "internal: true",
         ):
@@ -535,9 +575,13 @@ class ThePublishedOverrideTests(unittest.TestCase):
     """
 
     def _prepared(self, port: int | None, services: tuple[str, ...]) -> tuple[dict, list[str]]:
+        # Resolved shape, including each service's own network membership:
+        # the override has to carry that through, and the name is `labnet`
+        # here on purpose -- a lab's network is not necessarily called `lab`.
         model = {
             "services": {
-                name: {"build": {"context": "."}} for name in (*services, "validator")
+                name: {"build": {"context": "."}, "networks": {"labnet": None}}
+                for name in (*services, "validator")
             },
             "networks": {"labnet": {"internal": True}},
         }
@@ -571,11 +615,33 @@ class ThePublishedOverrideTests(unittest.TestCase):
         self.assertEqual(sorted(written["services"]), ["patched", "vulnerable"])
         for name, definition in written["services"].items():
             with self.subTest(service=name):
-                self.assertEqual(definition, {"ports": ["127.0.0.1::8080"]})
+                self.assertEqual(definition, {
+                    # Beside the lab's own, not instead of it, and under the
+                    # name the model gave rather than a guess at it.
+                    "networks": {"labnet": None, policy.MANUAL_NETWORK: None},
+                    "ports": ["127.0.0.1::8080"],
+                })
                 # Never 0.0.0.0, which is what a short form with no address
                 # binds: that would put an exploitable build on whatever
                 # network the owner's laptop is on at a client site.
                 self.assertTrue(definition["ports"][0].startswith(policy.MANUAL_BIND))
+
+    def test_the_file_brings_the_network_that_makes_the_port_real(self) -> None:
+        """One network for the file, and the only thing in it not internal.
+
+        Without it the two `ports` entries above resolve correctly and
+        publish nothing: Docker drops a publication for a service whose
+        networks are all internal, which is how `manual.sh` came to print
+        `:0` as the address of a container with no host port.
+        """
+        written, _ = self._prepared(8080, ("vulnerable", "patched"))
+        self.assertEqual(written["networks"], {policy.MANUAL_NETWORK: {
+            "internal": False,
+            "driver_opts": dict(policy.MANUAL_NETWORK_DRIVER_OPTS),
+        }})
+        # The lab's own network is not in the file at all, so merging it
+        # cannot turn `internal: true` off for anything of the lab's.
+        self.assertNotIn("labnet", written["networks"])
 
     def test_a_vulnerable_only_lab_publishes_the_one_build_it_has(self) -> None:
         written, _ = self._prepared(8080, ("vulnerable",))
