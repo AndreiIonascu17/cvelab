@@ -95,6 +95,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "reached the same condition another way" apart instead of inferring one from
   the other.
 
+### Changed (one PoC)
+
+- The two scripts are one artifact, `artifacts/PoC.py`, with two modes. With no
+  argument it is the lab's own differential, byte for byte the
+  `validator/validator.py` beside it: the same environment variables, the same
+  Compose service names, the same output and the same exit codes, which is the
+  path automatic validation takes. Given one address it is the single-instance
+  script, proved per CVE against the lab's two builds before it was written --
+  and where the drafter could not prove one, that mode refuses with the
+  drafter's own recorded reason and exits 2 without sending anything. The
+  artifact's own header states both claims, and the four states `LAB-POC.md`
+  reports are now the four states of one script's remote mode rather than
+  whether a second file is there.
+
+  Measured, and the reason it exists: across 148 validated labs the drafter was
+  asked on 104 and shipped on 26, so three labs in four carried only the
+  lab-only program under the name `PoC.py` -- whose own header said it was
+  "designed for the generated Docker lab, not remote targets" -- while the
+  script that did take a target sat beside it as `Manual-PoC.py`. The file a
+  reader opened made no claim, and the claim was in a file nobody opened.
+
+- `Manual-PoC.py`, `Manual-PoC.md` and `Manual-PoC.json` are no longer written.
+  The first two are the modes and the header of `PoC.py`; the third is
+  `report.json`'s `manual_poc_field`, which now carries the proved spec, the
+  container port and the lab's own values for the inputs it declares. That is
+  what makes asking the same lab twice give the same answer: a drafted spec is
+  sampled, so without a record `cvelab manual` on a downloaded lab drafts
+  afresh and can reach a different verdict with nothing having changed.
+  `Manual-PoC.json` could never travel -- it was deliberately withheld -- and
+  `report.json` is in `upload.ALWAYS` and in `upload.REQUIRED_TO_SHARE`. The
+  three old names are still read off an archived lab, so a lab generated before
+  this keeps the spec it proved, and they are removed when such a lab is
+  re-rendered rather than left beside a `PoC.py` that has absorbed them.
+
+- The merged script travels to the shared corpus whole, remote mode included.
+  The project owner reversed the earlier decision on 2026-11-08; the
+  consequence, recorded because it was chosen rather than drifted into, is that
+  free-target exploit code is distributed to everyone who downloads a lab.
+  Nothing was added to `upload.ALWAYS` or `upload.EXPLOIT` to do it: `PoC.py`
+  was already on both as the lab-only script, and what changed is what the name
+  contains. `--no-poc` still withholds it.
+
+- `--lab-address`, which is how the command form survives the merge. `PoC.py
+  --lab-address 127.0.0.1:32801 id` runs the lab program against this lab's own
+  published build and prints what one command on it returns; a bare address is
+  remote mode, which is proved per CVE or refuses. The flag is lab mode with an
+  address, so the artifact's header describes it there, in the same breath as
+  the sentence that it reaches a build CVELab made and shows nothing about any
+  other host. An address that is not on loopback is refused, because loopback is
+  where `manual.sh` publishes; which loopback port is this lab's the script
+  cannot check, and its help says so rather than guessing. `--lab-address` with
+  `--input` is refused as a contradiction, since which of the two the person
+  wants decides whether they are testing their own application or this lab. It
+  is emitted only for a lab whose contract declares a service port -- the
+  validator of a lab that declares none reads no argument, so the flag would run
+  the differential and call it a demonstration.
+
+  The reason it is behind a flag at all: that mode was the carried validator's
+  own, and the lab adapter's route is a constant in that validator, so a bare
+  address aimed at a client would send a route that is not there and print
+  BLOCKED -- a false negative dressed as a test.
+
+- `--no-poc` now does what it says. It promised "leaving the entry
+  non-runnable"; measured on a validated lab, what it filed was REPORT.md,
+  WALKTHROUGH.md, EVIDENCE.json, report.json and analysis.json, and between them
+  the route and method the attack used, the payload's construction in prose, the
+  canary the effect is recognised by, the raw observations of both builds, and
+  after the PoC merge every request the single-instance script sends, verbatim,
+  under `manual_poc_field.spec`.
+
+  None of those five can be withheld: `site/worker/gate.js` requires
+  EVIDENCE.json, report.json, REPORT.md and WALKTHROUGH.md even of a withheld
+  run and refuses one that arrives without them. So they are redacted in the
+  payload instead, by an allowlist -- `upload.DESCRIBED_ONLY` names what may
+  travel, field by field and section by section, and anything unnamed is
+  withheld and said to be withheld, in the document. What is left says what was
+  found; the request, the route, the body, the payload, the predicate, the
+  steps that run it and everything the manual runner printed are gone, and so
+  are the canary and the lab's own recorded input values wherever the model's
+  prose quoted them. The lab on disk is untouched and an upload without the
+  flag is byte for byte what it was.
+
+  Two of those were found by review rather than by the first cut, and both are
+  worth the record. `manual_poc_checks` was allowed wholesale while
+  `validation.*.observations` was dropped, and each of its entries holds what
+  the runner printed -- status, every response header, both builds' bodies --
+  so the same material travelled from one key away; the allowlist takes `*`
+  segments now and keeps only the pass, the exit code and the expected
+  verdict. And the scrub ran over the serialized document while its needles
+  are decoded strings, so a needle holding a quote, a backslash or a
+  non-ASCII character could not match: measured on one archived lab, a
+  `--no-poc` report.json still carried the traversal filename, which is the
+  payload. It walks the parsed document now, and 30 needles in the archive
+  carry such a character.
+
+  The flag's help text and `cvelab doctor` now also say what it is not: the
+  repository, both revisions and the CVE still travel, by design, so this is
+  not the same as a reader being unable to reproduce the finding.
+
 ### Fixed
 
 - The manual-PoC drafter no longer declines for reasons that are not true. Of

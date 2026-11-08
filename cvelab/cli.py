@@ -79,20 +79,21 @@ def _named_values(given: list[str]) -> dict[str, str]:
 
 
 def add_manual_poc_options(command: argparse.ArgumentParser) -> None:
-    """Flags for asking, after a lab reproduces, for the artifact beside it.
+    """Flags for asking, after a lab reproduces, for the artifact's remote mode.
 
     Off by default. Generating a lab and demonstrating a vulnerability on
-    someone's server are separate jobs: a batch run wants the lab and its
-    PoC.py and nothing else, and the single-target script is a deliberate
-    step taken for one engagement, which `cvelab manual-poc` is. The provider
-    can be chosen apart from the lab's own, because lab generation and this
-    request are judged separately under each provider's policy.
+    someone's server are separate jobs: a batch run wants the lab and the lab
+    mode of its PoC.py, and remote mode is a deliberate step taken for one
+    engagement, which `cvelab manual` is. Without it, PoC.py is written with
+    remote mode refusing and the reason "not requested". The provider can be
+    chosen apart from the lab's own, because lab generation and this request
+    are judged separately under each provider's policy.
     """
     command.add_argument(
         "--manual-poc",
         action="store_true",
         help="Also ask whether the confirmed effect can be shown on one instance, and "
-             "write the single-target script if it proves (one extra model call)",
+             "give PoC.py a working remote mode if it proves (one extra model call)",
     )
     command.add_argument(
         "--manual-poc-provider",
@@ -138,7 +139,11 @@ def add_upload_flags(command: argparse.ArgumentParser) -> None:
     command.add_argument(
         "--no-poc",
         action="store_true",
-        help="Upload the report without the exploit, leaving the entry non-runnable",
+        help="File the entry as described rather than as runnable: the exploit, the "
+             "plan and the reproduction steps are withheld, and the records that "
+             "have to travel are sent with the attack redacted out of them. It "
+             "does not make the finding unreproducible -- the repository, the fix "
+             "commit and the CVE still travel",
     )
 
 
@@ -255,7 +260,11 @@ def parser() -> argparse.ArgumentParser:
     upload_cmd.add_argument(
         "--no-poc",
         action="store_true",
-        help="Upload the report without the exploit, leaving the entry non-runnable",
+        help="File the entry as described rather than as runnable: the exploit, the "
+             "plan and the reproduction steps are withheld, and the records that "
+             "have to travel are sent with the attack redacted out of them. It "
+             "does not make the finding unreproducible -- the repository, the fix "
+             "commit and the CVE still travel",
     )
     upload_cmd.add_argument(
         "--provider", choices=SELECTABLE, help="Provider that produced this lab"
@@ -298,8 +307,8 @@ def parser() -> argparse.ArgumentParser:
 
     manual_poc = sub.add_parser(
         "manual",
-        help="Write the single-target script for a lab you already built: name the CVE "
-             "and where its PoC lives",
+        help="Prove remote mode for a lab you already built, and write it into that "
+             "lab's PoC.py: name the CVE and where its PoC lives",
     )
     manual_poc.add_argument("cve")
     manual_poc.add_argument(

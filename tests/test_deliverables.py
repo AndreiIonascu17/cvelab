@@ -22,14 +22,30 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cvelab import core, upload
+from cvelab import core, field, upload
 from cvelab.deliverables import (
     LAB_POC_GUIDE_NAME,
-    MANUAL_POC_GUIDE_NAME,
-    MANUAL_POC_NAME,
-    _write_generic_manual_assets,
+    POC_NAME,
     create_deliverables,
 )
+
+#: A spec that was proved, as `report.manual_poc_field` carries one. The
+#: three keys `field.poc_standing` reads are the three a half-written record
+#: used to be missing, so the tests below carry all of them.
+_PROVED_SPEC = {
+    "strategy": "direct_observation",
+    "observable_effect": "a protected canary returned to an unauthenticated requester",
+    "transport": "http",
+    "inputs": ["target_path"],
+    "checks": [{
+        "label": "spec",
+        "discover": [],
+        "probe": [{"method": "GET", "path": "{{target_path}}"}],
+        "expect": {"status": 200},
+    }],
+    "auth": {},
+    "health_timeout": 120,
+}
 
 
 class DeliverableContractTests(unittest.TestCase):
@@ -367,11 +383,18 @@ class _DeliveredLabHarness(unittest.TestCase):
         report_extra: dict,
         plan_extra: dict | None = None,
         proof_quality: str = "security_effect_observed",
+        legacy_record: dict | None = None,
     ) -> tuple[str, dict]:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         lab = Path(temporary.name) / self.CVE
         (lab / "validator").mkdir(parents=True)
+        if legacy_record is not None:
+            # Where an archived lab keeps what it proved. Read, never written.
+            (lab / "artifacts").mkdir(parents=True, exist_ok=True)
+            (lab / "artifacts" / field.LEGACY_MANUAL_POC_RECORD_NAME).write_text(
+                json.dumps(legacy_record), encoding="utf-8"
+            )
         plan = {
             "cve": self.CVE,
             "cwe": "CWE-22",
@@ -545,8 +568,13 @@ class TheLabDocumentStatesItsReachTests(_DeliveredLabHarness):
     is why none of this needed a change to core.py.
     """
 
-    def guide(self, report_extra: dict, plan_extra: dict | None = None) -> str:
-        self.deliver(report_extra, plan_extra)
+    def guide(
+        self,
+        report_extra: dict,
+        plan_extra: dict | None = None,
+        legacy_record: dict | None = None,
+    ) -> str:
+        self.deliver(report_extra, plan_extra, legacy_record=legacy_record)
         return (
             self.lab / "artifacts" / LAB_POC_GUIDE_NAME
         ).read_text(encoding="utf-8")
@@ -587,12 +615,13 @@ class TheLabDocumentStatesItsReachTests(_DeliveredLabHarness):
         )
         guide = self.guide({"manual_poc_field": {"shipped": False, "reason": reason}})
 
-        self.assertIn("There is **no** single-instance script for this lab", self.flat(guide))
+        self.assertIn("for this lab it refuses", self.flat(guide))
         self.assertIn("recorded why", self.flat(guide))
         self.assertIn("> " + reason, guide)
-        self.assertIn("be pointed at a server you did not build here", self.flat(guide))
-        # And it does not advertise an artifact this lab does not have.
-        self.assertNotIn(MANUAL_POC_NAME, guide)
+        self.assertIn("exits 2 without sending anything", self.flat(guide))
+        # And it does not advertise the artifact this one replaced, which 45
+        # of the archived labs still hold beside them.
+        self.assertNotIn(field.LEGACY_MANUAL_POC_NAME, guide)
 
     def test_a_multi_line_reason_stays_inside_the_quote(self) -> None:
         """A blank line in the prose would end the blockquote.
@@ -626,20 +655,26 @@ class TheLabDocumentStatesItsReachTests(_DeliveredLabHarness):
         self.assertIn("because one was never asked for", self.flat(guide))
         self.assertIn("--manual-poc", self.flat(guide))
         self.assertNotIn("not requested", self.flat(guide))
-        self.assertNotIn("tried to write one", self.flat(guide))
+        self.assertNotIn("could not stand", self.flat(guide))
 
-    def test_a_shipped_script_is_named_so_the_reader_can_find_it(self) -> None:
-        guide = self.guide({"manual_poc_field": {"shipped": True, "reason": None}})
+    def test_a_proved_remote_mode_is_named_so_the_reader_can_find_it(self) -> None:
+        guide = self.guide({"manual_poc_field": {
+            "shipped": True, "container_port": 8080, "spec": _PROVED_SPEC,
+        }})
 
-        self.assertIn("**does** exist", self.flat(guide))
-        self.assertIn(MANUAL_POC_NAME, guide)
-        self.assertIn(MANUAL_POC_GUIDE_NAME, guide)
+        self.assertIn("has two modes, and the argument chooses", self.flat(guide))
+        self.assertIn(POC_NAME, guide)
         self.assertIn("stayed silent on the fixed one", self.flat(guide))
+        # The header of that one file is the handover document now, so the
+        # guide sends the reader to it rather than to a document beside it.
+        self.assertIn("own header is the handover document", self.flat(guide))
 
     def test_a_vulnerable_only_lab_claims_no_differential_it_never_had(self) -> None:
         """One build, so nothing can have "stayed silent on the fixed one"."""
         guide = self.guide(
-            {"manual_poc_field": {"shipped": True, "reason": None}},
+            {"manual_poc_field": {
+                "shipped": True, "container_port": 8080, "spec": _PROVED_SPEC,
+            }},
             {"lab_type": "VULNERABLE_ONLY_REPRODUCTION",
              "revisions": {"vulnerable": "a" * 40, "patched": None}},
         )
@@ -659,31 +694,25 @@ class TheLabDocumentStatesItsReachTests(_DeliveredLabHarness):
         guide = self.guide({})
 
         self.assertIn("kept no record of a single-instance script either way", self.flat(guide))
-        self.assertNotIn("tried to write one", self.flat(guide))
-        self.assertNotIn("**does** exist", self.flat(guide))
+        self.assertNotIn("drafted a single-instance script", self.flat(guide))
+        self.assertNotIn("has two modes", self.flat(guide))
 
-    def test_a_script_on_disk_is_believed_over_a_report_that_lacks_the_field(self) -> None:
+    def test_an_archived_labs_own_record_is_read_when_the_report_has_none(self) -> None:
         """An archived lab re-rendered by `cvelab deliverables` still reads true.
 
-        field.write_manual_poc runs as run_lab's after_validation callback,
-        before create_deliverables, so by the time the document is written the
-        script is already on disk. Trusting disk first keeps the document
-        honest about what the reader actually has, even for a report written
-        before manual_poc_field existed. The report here carries no such
-        field, so only the file can answer; without it this is the "no record"
-        case above.
+        The proved spec lives in report.manual_poc_field now, and it did not
+        carry one before the merge: 45 of the archived labs keep theirs in
+        Manual-PoC.json beside the lab, 29 of those with a spec that shipped.
+        Reading only this run's report would turn every one of those into a
+        refusal on re-render, which is the one direction this document must
+        never drift.
         """
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        lab = Path(temporary.name) / self.CVE
-        artifacts = lab / "artifacts"
-        artifacts.mkdir(parents=True)
-        (artifacts / MANUAL_POC_NAME).write_text("# shipped\n", encoding="utf-8")
+        guide = self.guide({}, legacy_record={
+            "cve": self.CVE, "shipped": True, "container_port": 8080,
+            "spec": _PROVED_SPEC,
+        })
 
-        _write_generic_manual_assets(self.CVE, lab, artifacts, False, {})
-        guide = (artifacts / LAB_POC_GUIDE_NAME).read_text(encoding="utf-8")
-
-        self.assertIn("**does** exist", self.flat(guide))
+        self.assertIn("has two modes, and the argument chooses", self.flat(guide))
         self.assertNotIn("kept no record", self.flat(guide))
 
     def test_the_walkthrough_points_at_the_document_by_its_new_name(self) -> None:

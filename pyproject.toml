@@ -77,7 +77,12 @@ target-version = "py311"
 src = ["cvelab", "tests"]
 # The end-to-end fixture is a stand-in for a generated lab, so its files are
 # written the way one arrives rather than the way this project writes Python.
-extend-exclude = ["tests/fixtures/e2e-lab"]
+# The operator validator is the same kind of file for the same reason: it is
+# the smallest script `sourcegen._OPERATOR_CONTRACT` admits, and what the
+# tests measure with it is that a script written to that contract is accepted
+# -- so it has to be written the way a generated validator is, `%` formatting
+# and all, rather than the way UP031 would have it.
+extend-exclude = ["tests/fixtures/e2e-lab", "tests/fixtures/operator_validator.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4"]

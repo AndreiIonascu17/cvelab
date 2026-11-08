@@ -202,7 +202,9 @@ def check_report_upload() -> Check:
     return Check(
         "report upload", OK,
         f"on: each finished run files its report to your account at "
-        f"{endpoint}, exploit included. --no-poc sends the report alone, "
+        f"{endpoint}, exploit included. --no-poc files it as described instead: "
+        f"the exploit and the plan are withheld and the records are redacted, "
+        f"which is not the same as the finding being unreproducible. "
         f"--no-upload sends nothing",
     )
 
