@@ -521,7 +521,7 @@ The report is sent when the run finishes. What travels:
 
 | | Sent |
 |---|---|
-| `REPORT.md`, `WALKTHROUGH.md`, `EVIDENCE.json`, `report.json`, `analysis.json` | yes |
+| `REPORT.md`, `WALKTHROUGH.md`, `EVIDENCE.json`, `report.json`, `analysis.json` | yes, redacted under `--no-poc` |
 | CVE, repository, fixed revision, model, token counts, cost | yes |
 | `PoC.py`, `manual.sh`, `PoC.ps1`, `LAB-POC.md`, `plan.json`, `cvelab-setup.json`, `cvelab-manual-ports.json` | yes, unless `--no-poc` |
 | Your provider key | never |
@@ -529,8 +529,20 @@ The report is sent when the run finishes. What travels:
 
 **The exploit travels with the report.** A validated run becomes an entry in
 a shared corpus that subscribers can open and run, and an entry without the
-exploit is a description of a lab rather than a lab. `--no-poc` uploads the
-report alone; the entry is kept, and marked as not runnable.
+exploit is a description of a lab rather than a lab. `--no-poc` files it as
+that description: the artifacts in the third row are withheld, and the five
+documents in the first are sent with the attack taken out of them -- the
+request, the route, the body, the predicate, the single-instance spec, both
+builds' raw observations in `validation` and whatever the manual runner
+printed under `manual_poc_checks`, and the canary and the lab's own recorded
+values wherever the prose quotes them. Each one
+says in the document what was taken out. The control plane requires four of
+the five even of a withheld run, which is why they are redacted rather than
+withheld, and it keeps such an entry private rather than sharing it.
+
+What `--no-poc` does not do is make the finding unreproducible: the
+repository, both revisions and the CVE travel either way, because an entry
+without them describes nothing.
 
 The key is not in the payload, and anything that looks like a registered
 credential is replaced with `[REDACTED]` before the request is built. The
@@ -735,7 +747,7 @@ the script asks you for it:
 ```
 
 ```bash
-python3 Manual-PoC.py --target 10.0.0.5:8080 --input credential=...
+python3 PoC.py --target 10.0.0.5:8080 --input credential=...
 ```
 
 A missing value is refused before the first request, rather than sending
@@ -910,7 +922,7 @@ This is the one strategy that leaves the target worse than it found it, so the
 script **refuses to run without `--allow-disruption`**:
 
 ```bash
-python3 Manual-PoC.py 10.0.0.5:8080 --allow-disruption --input target_path=/render
+python3 PoC.py 10.0.0.5:8080 --allow-disruption --input target_path=/render
 ```
 
 Without the flag it sends nothing and says why. That is a refusal, not a
@@ -987,7 +999,7 @@ one of those, ask for the script separately, once the lab has been validated:
 cvelab manual CVE-YYYY-NNNNN --poc out \
   --spec spec.json --container-port 8000
 # then, from out/CVE-YYYY-NNNNN/artifacts:
-python3 Manual-PoC.py --target 10.0.0.5:8080 --show-bodies
+python3 PoC.py --target 10.0.0.5:8080 --show-bodies
 ```
 
 `--spec` is optional. Without it CVELab asks for one itself, in a call of its
@@ -1010,17 +1022,25 @@ otherwise it is read from the lab's own healthcheck or from the drafted answer.
 
 ### What you get
 
-`Manual-PoC.py` is a single file that runs the way a published PoC does:
+This is remote mode of the lab's own `PoC.py`, not a second file. Given an
+address it runs the way a published PoC does:
 
 ```bash
-python3 Manual-PoC.py 10.0.0.5:8080 --show-bodies
+python3 PoC.py 10.0.0.5:8080 --show-bodies
 ```
 
-Its header names the CVE, the effect, the affected and fixed package versions
-the lab installed, the fix commit, the strategy, any `--input` it needs, and
-that CVELab proved it against a build before and after the fix. The spec it
-sends is embedded as readable JSON, so every request can be read -- and edited
--- before it is run. It needs nothing installed beyond Python.
+Given no argument at all it is the lab program automatic validation runs, bound
+to the Compose service names and reaching nothing else. The header states both,
+and for remote mode it names the CVE, the effect, the affected and fixed package
+versions the lab installed, the fix commit, the strategy, any `--input` it
+needs, and that CVELab proved it against a build before and after the fix. The
+spec it sends is embedded as readable JSON, so every request can be read -- and
+edited -- before it is run. It needs nothing installed beyond Python.
+
+Where the attempt was refused, remote mode refuses too: given an address it
+prints the drafter's own recorded reason and exits 2 without sending anything.
+That is three labs in four, so it is the case to expect. A remote mode that
+looked available and had never been proved would be pressed at a client.
 
 CVELab's half is the proof. It brings up the lab's two builds, runs that exact
 script against each from a sidecar joined to the container's network namespace,
@@ -1028,42 +1048,51 @@ and writes it only if it observed the effect on the vulnerable revision and
 stayed silent on the fixed one. A script that fires on both is watching normal
 behaviour rather than the bug; one that crashed observed nothing because it
 never looked. Neither is handed over, and the run that refused your spec is
-kept in `artifacts/Manual-PoC.json` so you can see what to change.
+kept in `report.json` under `manual_poc_field` so you can see what to change --
+with the spec it proved, where it proved one, which is what makes asking the
+same lab twice give the same answer instead of sampling a new draft.
 
 This is a command of its own, so it cannot cost a lab anything: the lab's status
 and its own deliverables are untouched whatever happens here, and you can ask
 for the script on any lab you already have, including one someone else built. A
 lab that never reproduced is refused -- it has no demonstrated effect to hand
 over -- and so is one with no fixed build to go silent against, because half the
-proof would be missing. `Manual-PoC.py`, `Manual-PoC.md` and `Manual-PoC.json`
-stay local; none of them is uploaded with the lab.
+proof would be missing.
 
-### Which of the two documents you are holding
+`Manual-PoC.py`, `Manual-PoC.md` and `Manual-PoC.json` are gone: the two
+scripts are one file, and the record is in `report.json`. Those three stayed
+local, and `PoC.py` does not -- it travels with every shared lab, remote mode
+included, so a proved single-instance exploit is distributed to everyone who
+downloads one. `--no-poc` withholds it.
 
-A validated lab's `artifacts/` can hold two step-by-step documents, and they
-reach different distances. Both say so in their own first section, because the
-difference matters more than anything else in either of them:
+### Which mode you are holding
 
-| | Runs against | Travels with the lab |
+One script, two modes, and they reach different distances:
+
+| | Runs against | Proved before it was handed over |
 |---|---|---|
-| `LAB-POC.md` | this lab's own Docker builds, by Compose service name -- `manual.sh` takes no address; the `PoC.py` beside it takes one optional `host:port` | yes |
-| `Manual-PoC.md` | one instance whose address you supply, with `--target` | no |
+| `python3 PoC.py` | this lab's own Docker builds, by Compose service name | yes, by the lab's own differential |
+| `python3 PoC.py <address>` | one instance whose address you supply | per CVE: this is what `cvelab manual` proves, and where it could not, the mode refuses |
 
-Only `Manual-PoC.md` and the script it documents were proved against a single
-instance before being handed over, which is why that is the one to point at a
-server you did not build yourself. Most labs do not have one -- the effect is often
-not observable from outside the process at all. `LAB-POC.md` is written for
-every validated lab and says which case this lab is: if there is no
-single-instance script it says so, and if one was attempted and refused it
-quotes the reason, the same reason `report.json` keeps in
-`manual_poc_field.reason`. That sentence is what stops a demonstration that
-works in the lab being described to a client as one that would work on their
-server.
+Only the second can be pointed at a server you did not build yourself, and only
+where the header says it was proved. Most labs do not have it -- the effect is
+often not observable from outside the process at all.
 
-Until recently these were called `MANUAL-POC.md` and `Manual-PoC.md`, which are
-one file on macOS and on Windows, so a lab with both lost one of them. An
-archived lab generated before the rename still carries the old name and still
-uploads under it.
+`LAB-POC.md` is written for every validated lab and says which case this lab
+is, under "Can this be pointed at a live instance?": proved, refused with the
+drafter's reason quoted, never asked for, or no record either way. It is the
+same reason `report.json` keeps in `manual_poc_field.reason`, and the same four
+states the script's own header gives, decided in one place so they cannot
+disagree. That sentence is what stops a demonstration that works in the lab
+being described to a client as one that would work on their server.
+
+This was two scripts until 2026-11-08, `PoC.py` and `Manual-PoC.py`, with two
+documents: the lab-only one wore the name PoC and the one that could be pointed
+at a target sat beside it under another, so the file a reader opened made no
+claim at all. `MANUAL-POC.md` and `Manual-PoC.md` were also one file on macOS
+and on Windows, so a lab with both lost one of them. An archived lab still
+carries those names; CVELab reads what it can from them, writes none of them,
+and removes them when it re-renders such a lab.
 
 ### Without a fixed build
 

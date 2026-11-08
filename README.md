@@ -374,9 +374,11 @@ Key files:
 - `e2e/result.json`: the verifiable result and reproduction statuses.
 - `e2e/`: the product-specific E2E runner and probes, if used by the profile.
 - `validator/validator.py`: the executable PoC/validator for the generated adapter.
-- `artifacts/PoC.py` (or the profile-specific payload): the inspectable local PoC. It takes one
-  optional `host:port` and, where the weakness is command execution, a command after it; with no
-  argument it runs exactly as automatic validation runs it, inside the lab's own network.
+- `artifacts/PoC.py` (or the profile-specific payload): the one inspectable PoC, in two modes.
+  With no argument it runs exactly as automatic validation runs it, inside the lab's own network.
+  Given one address it is the single-instance script, which is proved per CVE and refuses, with
+  the recorded reason, for a lab where it was not. Its own header says which of the two this
+  lab has.
 - `artifacts/manual.sh`: the Linux runner with separate `setup`, `exploit`, `verify`, `address`, and
   `cleanup` actions.
 - `artifacts/PoC.ps1`: the same actions on Windows, run through WSL.
@@ -391,8 +393,8 @@ Key files:
   declared a port ship no such file.
 - `artifacts/LAB-POC.md`: manual reproduction instructions for both shells. `manual.sh` drives
   this lab's own builds and nothing outside them, and the section on `PoC.py` says what pointing
-  it at an address of your own does and does not prove. It also says whether a single-instance
-  script exists for this lab, and where one was refused, the recorded reason.
+  it at an address of your own does and does not prove: whether its remote mode was proved for
+  this lab, and where it was refused, the recorded reason.
 - `artifacts/EVIDENCE.json`: structured evidence and provenance.
 - `artifacts/WALKTHROUGH.md`: manual reproduction steps.
 - `artifacts/REPORT.md`: the technical report, limitations, and conclusion.

@@ -462,14 +462,42 @@ def fixture_source() -> str:
     return text.split("# limitations under the License.\n", 1)[1]
 
 
-def written_kit(port: int | None, executes: bool = False, seeds: bool = False) -> dict:
+#: A record of a proved remote mode, as report.manual_poc_field carries one.
+#: The kit says different things about the published address depending on
+#: whether there is anything to point at it, so the shape is a fixture here.
+PROVED = {
+    "shipped": True,
+    "container_port": 8080,
+    "spec": {
+        "strategy": "direct_observation",
+        "transport": "http",
+        "observable_effect": "a protected canary returned to an unauthenticated requester",
+        "inputs": ["target_path"],
+        "checks": [{
+            "label": "spec",
+            "discover": [],
+            "probe": [{"method": "GET", "path": "{{target_path}}"}],
+            "expect": {"status": 200},
+        }],
+        "auth": {},
+        "health_timeout": 120,
+    },
+    "lab_values": {"target_path": "/canary"},
+}
+
+
+def written_kit(
+    port: int | None,
+    seeds: bool = False,
+    record: dict | None = None,
+) -> dict:
     """The handed-over kit for one lab shape, as files, written to a temp dir."""
     with tempfile.TemporaryDirectory() as temporary:
         lab = Path(temporary)
         artifacts = lab / "artifacts"
         artifacts.mkdir()
         deliverables._write_generic_manual_assets(
-            "CVE-2026-0001", lab, artifacts, False, {}, seeds, port, executes
+            "CVE-2026-0001", lab, artifacts, False, seeds, port, record
         )
         return {
             item.name: item.read_text(encoding="utf-8")
@@ -489,7 +517,7 @@ class TheRunnerPublishesOnePortTests(unittest.TestCase):
     """
 
     def test_it_merges_the_override_and_reads_the_address_back(self) -> None:
-        runner = written_kit(port=8080)["manual.sh"]
+        runner = written_kit(port=8080, record=PROVED)["manual.sh"]
         self.assertIn(
             f'PORTS="$LAB_ROOT/artifacts/{core.SHIPPED_MANUAL_PORTS_FILE}"', runner
         )
@@ -501,15 +529,23 @@ class TheRunnerPublishesOnePortTests(unittest.TestCase):
         )
         self.assertIn('echo "This build is reachable on $POC_AT"', runner)
         self.assertIn(
-            'echo "  python3 \\"$LAB_ROOT/artifacts/PoC.py\\" $POC_AT"', runner
+            'echo "  python3 \\"$LAB_ROOT/artifacts/PoC.py\\" $POC_AT'
+            ' --input target_path=/canary"',
+            runner,
         )
         self.assertIn("setup|exploit|verify|address|cleanup", runner)
 
-    def test_a_command_execution_lab_gets_the_command_in_the_hint(self) -> None:
-        runner = written_kit(port=8080, executes=True)["manual.sh"]
-        self.assertIn(
-            'echo "  python3 \\"$LAB_ROOT/artifacts/PoC.py\\" $POC_AT id"', runner
-        )
+    def test_a_lab_with_no_proved_remote_mode_is_offered_no_command(self) -> None:
+        """A printed command that exits 2 reads as a broken kit.
+
+        Remote mode refuses for three labs in four, and the refusal is the
+        drafter's own recorded judgement rather than a fault. The hint says so
+        and sends the reader to the document that carries the reason.
+        """
+        runner = written_kit(port=8080)["manual.sh"]
+        self.assertIn('echo "This build is reachable on $POC_AT"', runner)
+        self.assertIn("nothing here may be pointed at that address", runner)
+        self.assertNotIn(r'python3 \"$LAB_ROOT', runner)
 
     def test_a_lab_that_declared_no_port_publishes_nothing(self) -> None:
         """An archived lab gets the runner it always had.
@@ -521,12 +557,12 @@ class TheRunnerPublishesOnePortTests(unittest.TestCase):
         runner = written_kit(port=None)["manual.sh"]
         self.assertIn('SERVICE_PORT=""', runner)
         self.assertNotIn("__SERVICE_PORT__", runner)
-        self.assertNotIn("__COMMAND_HINT__", runner)
+        self.assertNotIn("__POC_HINT__", runner)
 
     def test_no_substitution_is_left_unfilled(self) -> None:
         for port in (8080, None):
             with self.subTest(port=port):
-                kit = written_kit(port=port, executes=True, seeds=True)
+                kit = written_kit(port=port, seeds=True, record=PROVED)
                 for name, text in kit.items():
                     with self.subTest(file=name):
                         self.assertNotIn("__", text.replace("__pycache__", ""))
@@ -534,7 +570,7 @@ class TheRunnerPublishesOnePortTests(unittest.TestCase):
     def test_the_runner_and_the_wrapper_are_valid(self) -> None:
         """`bash -n` on the shell and the new action in the PowerShell set."""
         for port in (8080, None):
-            kit = written_kit(port=port, executes=True, seeds=True)
+            kit = written_kit(port=port, seeds=True, record=PROVED)
             with tempfile.TemporaryDirectory() as temporary:
                 script = Path(temporary) / "manual.sh"
                 script.write_text(kit["manual.sh"], encoding="utf-8")
@@ -701,50 +737,59 @@ class TheGuideSaysWhatIsTrueTests(unittest.TestCase):
         self.assertNotIn("no arbitrary or remote target option", DELIVERABLES)
 
     def test_the_reach_section_names_the_argument_and_the_authorization(self) -> None:
-        guide = written_kit(port=8080)["LAB-POC.md"]
+        guide = written_kit(port=8080, record=PROVED)["LAB-POC.md"]
         head = " ".join(guide.split("## How the steps work")[0].split())
         # Still true, and still first: the runner takes a service name.
         self.assertIn("not an address", head)
         self.assertIn("be pointed at a client's server", head)
         # And now the part that is new, in the same breath.
-        self.assertIn("`PoC.py` beside it takes one optional address", head)
+        self.assertIn("runs against those same builds when it is given no argument", head)
+        self.assertIn("`PoC.py`'s remote mode", head)
         self.assertIn("only where you are authorized to test it", head)
 
     def test_the_closing_line_says_which_artifact_takes_what(self) -> None:
-        guide = " ".join(written_kit(port=8080)["LAB-POC.md"].split())
+        guide = " ".join(written_kit(port=8080, record=PROVED)["LAB-POC.md"].split())
         self.assertIn(
-            "`manual.sh` takes Docker service names only; `PoC.py` takes one "
-            "optional address, and where you point it is yours to answer for "
-            "-- only a host your engagement authorizes.",
+            "`manual.sh` takes Docker service names only. `PoC.py` takes no "
+            "argument for lab mode and one address for remote mode, and where "
+            "you point that is yours to answer for -- only a host your "
+            "engagement authorizes.",
             guide,
         )
 
     def test_the_section_shows_the_exact_invocation(self) -> None:
-        guide = written_kit(port=8080)["LAB-POC.md"]
-        self.assertIn("## Running PoC.py yourself", guide)
+        guide = written_kit(port=8080, record=PROVED)["LAB-POC.md"]
+        self.assertIn("## The address this lab publishes", guide)
         self.assertIn(
-            'python3 PoC.py "$(bash manual.sh address vulnerable)"', guide
+            'python3 PoC.py "$(bash manual.sh address vulnerable)"'
+            " --input target_path=/canary",
+            guide,
         )
         self.assertIn("container port 8080 on loopback", guide)
         flat = " ".join(guide.split())
         self.assertIn("holds one session for the whole run", flat)
-        self.assertIn("performs this lab's declared setup steps itself", flat)
+        # The value in that command is the lab's own route, and a client's is
+        # not: a command copied to a client would test a path that is not
+        # there and report NOT_OBSERVED, which reads as "not vulnerable".
+        self.assertIn("Against anyone else's instance they are theirs", flat)
 
-    def test_the_command_argument_is_offered_only_where_it_means_something(self) -> None:
-        executes = written_kit(port=8080, executes=True)["LAB-POC.md"]
-        self.assertIn(
-            'python3 PoC.py "$(bash manual.sh address vulnerable)" id', executes
-        )
-        self.assertIn("declared evidence is command execution", executes)
-        other = written_kit(port=8080, executes=False)["LAB-POC.md"]
-        self.assertNotIn("command execution", other)
-        self.assertNotIn('vulnerable)" id', other)
+    def test_a_refused_lab_is_shown_no_command_for_the_address(self) -> None:
+        """The address is still real; what may be pointed at it is not.
+
+        Remote mode refuses for three labs in four, so this is the common
+        case, and the section says which of the two modes is unaffected.
+        """
+        guide = " ".join(written_kit(port=8080)["LAB-POC.md"].split())
+        self.assertIn("## The address this lab publishes", guide)
+        self.assertIn("Remote mode refuses for this lab", guide)
+        self.assertIn("exits 2 without sending anything", guide)
+        self.assertIn("Lab mode -- `PoC.py` with no argument", guide)
+        self.assertNotIn('python3 PoC.py "$(bash manual.sh address', guide)
 
     def test_a_lab_with_no_declared_port_says_so_instead(self) -> None:
-        guide = " ".join(written_kit(port=None)["LAB-POC.md"].split())
-        self.assertIn("## Running PoC.py yourself", guide)
+        guide = " ".join(written_kit(port=None, record=PROVED)["LAB-POC.md"].split())
+        self.assertIn("## The address this lab publishes It does not.", guide)
         self.assertIn("generated before the contract asked for the port", guide)
-        self.assertIn("the script here reads no argument", guide)
         self.assertNotIn("bash manual.sh address", guide)
 
     def test_the_step_list_names_the_new_action(self) -> None:
@@ -868,7 +913,7 @@ def ran_address(port: int | None, published: str) -> str | None:
         artifacts.mkdir()
         (lab / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
         deliverables._write_generic_manual_assets(
-            "CVE-2026-0001", lab, artifacts, False, {}, False, port, False
+            "CVE-2026-0001", lab, artifacts, False, False, port
         )
         (artifacts / ".manual-state").write_text("vulnerable", encoding="utf-8")
         if port is not None:

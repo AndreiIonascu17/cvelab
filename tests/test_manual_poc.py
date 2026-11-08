@@ -19,8 +19,10 @@ from __future__ import annotations
 import ast
 import contextlib
 import json
+import os
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from collections.abc import Iterator
@@ -28,7 +30,16 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from cvelab import autoflow, cli, closed, core, field, sourcegen, upload
+from cvelab import (
+    autoflow,
+    cli,
+    closed,
+    core,
+    deliverables,
+    field,
+    sourcegen,
+    upload,
+)
 
 
 def _spec(**extra: Any) -> dict[str, Any]:
@@ -55,6 +66,28 @@ def _run(observed: bool, ran: bool) -> dict[str, Any]:
     }
 
 
+#: The lab program the merged artifact carries underneath remote mode. A real
+#: one is model-written and runs a differential between two Compose services;
+#: what every test here needs of it is that it is a program, that it is not
+#: CVELab's own text, and that `diff` can find it again under the marker.
+_LAB_MODE = (
+    "#!/usr/bin/env python3\n"
+    "# CVELab validator for the lab in this directory.\n"
+    "import os, sys\n"
+    "def main():\n"
+    "    print(os.environ.get('CVELAB_MANUAL_ACTION', 'differential'))\n"
+    "    return 0\n"
+    "if __name__ == '__main__':\n"
+    "    sys.exit(main())\n"
+)
+
+
+def _held(lab_dir: Path) -> dict[str, Any]:
+    """The record, where it lives now: report.json's manual_poc_field."""
+    report = json.loads((lab_dir / "report.json").read_text(encoding="utf-8"))
+    return report.get("manual_poc_field") or {}
+
+
 @contextlib.contextmanager
 def _lab(
     *,
@@ -62,26 +95,34 @@ def _lab(
     lab_type: str = "SOURCE_REPRODUCTION",
     spec: dict[str, Any] | None = None,
     record: dict[str, Any] | None = None,
+    legacy_record: dict[str, Any] | None = None,
 ) -> Iterator[Path]:
-    """A lab on disk, as `cvelab run` leaves one."""
+    """A lab on disk, as `cvelab run` leaves one.
+
+    `record` goes where the proved spec now lives: report.json's
+    `manual_poc_field`. `legacy_record` goes in the old file beside the lab,
+    which 45 of the archived labs hold and which is still read.
+    """
     with tempfile.TemporaryDirectory() as root:
         lab_dir = Path(root) / "CVE-2026-0001"
-        lab_dir.mkdir(parents=True)
+        (lab_dir / "validator").mkdir(parents=True)
+        (lab_dir / "validator" / "validator.py").write_text(_LAB_MODE)
         (lab_dir / "plan.json").write_text(json.dumps({
             "cve": "CVE-2026-0001",
             "lab_type": lab_type,
             "repository": "https://example.invalid/p.git",
             "startup_services": ["vulnerable", "patched"],
         }))
-        (lab_dir / "report.json").write_text(json.dumps({
-            "real_poc_verified": reproduced
-        }))
+        (lab_dir / "report.json").write_text(json.dumps(
+            {"real_poc_verified": reproduced}
+            | ({"manual_poc_field": record} if record is not None else {})
+        ))
         if spec is not None:
             (lab_dir / "spec.json").write_text(json.dumps(spec))
-        if record is not None:
+        if legacy_record is not None:
             (lab_dir / "artifacts").mkdir(exist_ok=True)
-            (lab_dir / "artifacts" / field.MANUAL_POC_RECORD_NAME).write_text(
-                json.dumps(record)
+            (lab_dir / "artifacts" / field.LEGACY_MANUAL_POC_RECORD_NAME).write_text(
+                json.dumps(legacy_record)
             )
         yield lab_dir
 
@@ -355,6 +396,8 @@ class ProofTests(unittest.TestCase):
         }
         outcomes = {"cid-v": _run(*vulnerable), "cid-p": _run(*patched)}
         with mock.patch.object(
+            field, "_lab_validator", return_value=_LAB_MODE
+        ), mock.patch.object(
             field, "_service_container",
             side_effect=lambda c, name, d, e: ids.get(name, ""),
         ), mock.patch.object(
@@ -405,13 +448,30 @@ class ProofTests(unittest.TestCase):
         self.assertEqual(sorted(out["output"]), ["patched", "vulnerable"])
 
     def test_an_exception_anywhere_becomes_a_reason(self) -> None:
-        with mock.patch.object(field, "emit_field_poc", side_effect=OSError("disk gone")):
+        with mock.patch.object(
+            field, "_lab_validator", return_value=_LAB_MODE
+        ), mock.patch.object(field, "emit_poc", side_effect=OSError("disk gone")):
             out = field.prove_manual_poc(
                 "CVE-2026-0001", field.validate_spec(_spec()), 8000,
                 Path("/lab"), ["docker", "compose"], {},
             )
         self.assertIs(out["shipped"], False)
         self.assertIn("OSError", out["reason"])
+
+    def test_a_lab_with_no_program_of_its_own_is_said_plainly(self) -> None:
+        """The proof runs the whole merged file, so it needs both halves.
+
+        Nothing in a generated lab reaches this -- validator/validator.py is
+        what the validator image runs -- and a lab directory without one is
+        not a lab. Said as a refusal rather than proving half a file, because
+        the claim the proof makes is about the bytes the operator receives.
+        """
+        out = field.prove_manual_poc(
+            "CVE-2026-0001", field.validate_spec(_spec()), 8000,
+            Path("/lab"), ["docker", "compose"], {},
+        )
+        self.assertIs(out["shipped"], False)
+        self.assertIn("No lab mode to carry", out["reason"])
 
 
 class OperatorSpecTests(unittest.TestCase):
@@ -439,22 +499,24 @@ class OperatorSpecTests(unittest.TestCase):
         ):
             return field.run_manual_poc(lab_dir, lab_dir / spec_name, 8000, **kwargs)
 
-    def test_a_proved_spec_writes_the_script_the_guide_and_the_record(self) -> None:
+    def test_a_proved_spec_writes_one_artifact_carrying_its_own_guide(self) -> None:
         with _lab(spec=_spec()) as lab_dir:
             result = self._call(lab_dir)
             artifacts = lab_dir / "artifacts"
             self.assertIs(result["ok"], True)
-            self.assertTrue((artifacts / field.MANUAL_POC_NAME).is_file())
-            self.assertTrue((artifacts / field.MANUAL_POC_GUIDE_NAME).is_file())
-            self.assertTrue((artifacts / field.MANUAL_POC_RECORD_NAME).is_file())
-            guide = (artifacts / field.MANUAL_POC_GUIDE_NAME).read_text()
+            self.assertTrue((artifacts / field.POC_NAME).is_file())
+            # The trio is gone: one script, and the record in report.json.
+            for name in field.LEGACY_MANUAL_POC_NAMES:
+                self.assertFalse((artifacts / name).exists(), name)
+            self.assertEqual(_held(lab_dir)["container_port"], 8000)
+            guide = (artifacts / field.POC_NAME).read_text()
             # It must say where it may be pointed, and that a negative result
             # is not a clean bill.
             self.assertIn("keep that permission in writing", guide)
-            self.assertIn("not the same as", guide)
+            self.assertIn("not the same", guide)
             self.assertIn("demo-target", guide)
 
-    def test_the_record_keeps_a_refusal_but_writes_no_script(self) -> None:
+    def test_the_record_keeps_a_refusal_and_remote_mode_refuses(self) -> None:
         with _lab(spec=_spec()) as lab_dir:
             result = self._call(lab_dir, outcome={
                 "shipped": False, "reason": "the script did not tell the two builds apart",
@@ -462,9 +524,12 @@ class OperatorSpecTests(unittest.TestCase):
             })
             artifacts = lab_dir / "artifacts"
             self.assertIs(result["ok"], False)
-            self.assertFalse((artifacts / field.MANUAL_POC_NAME).exists())
-            record = json.loads((artifacts / field.MANUAL_POC_RECORD_NAME).read_text())
+            record = _held(lab_dir)
             self.assertIn("did not tell the two builds apart", record["reason"])
+            # The artifact is still written, because lab mode is still true.
+            poc = (artifacts / field.POC_NAME).read_text()
+            self.assertIn("did not tell the two builds apart", poc)
+            self.assertIn("raise SystemExit(2)", poc)
 
     def test_a_lab_that_never_reproduced_is_refused(self) -> None:
         with _lab(spec=_spec(), reproduced=False) as lab_dir:
@@ -528,6 +593,8 @@ class DemoTargetTests(unittest.TestCase):
         ), mock.patch.object(
             field, "_bring_up"
         ) as brought_up, mock.patch.object(
+            field, "_lab_validator", return_value=_LAB_MODE
+        ), mock.patch.object(
             field, "_service_container", return_value="cid-v"
         ), mock.patch.object(
             field, "_container_address", return_value="172.19.0.2"
@@ -619,12 +686,654 @@ class ContainerLookupTests(unittest.TestCase):
                     )
 
 
-class StaysLocalTests(unittest.TestCase):
-    """The lab travels to the corpus; a free-target script does not."""
+class OneArtifactTwoModesTests(unittest.TestCase):
+    """`PoC.py` is both programs, and each says what it is worth.
 
-    def test_the_target_script_is_not_among_the_uploaded_documents(self) -> None:
-        for name in (field.MANUAL_POC_NAME, field.MANUAL_POC_GUIDE_NAME,
-                     field.MANUAL_POC_RECORD_NAME):
+    WHAT WAS MEASURED
+
+    A validated lab shipped two scripts. `artifacts/PoC.py` was
+    `validator/validator.py` with a six-line docstring prepended and nothing
+    else changed -- across 89 archived labs `diff` printed `0a1,6` and
+    stopped -- and its own header said it was "designed for the generated
+    Docker lab, not remote targets". Beside it, for 26 of 148 validated labs,
+    sat the script that did take a target. So three labs in four carried only
+    the lab-only program under the name `PoC.py`, and a reader who opened the
+    file called PoC found no claim at all; the claim was in a file nobody
+    opened.
+
+    WHAT THESE TESTS HOLD
+
+    Lab mode first and hardest, because a regression there breaks validation
+    rather than a deliverable: the lower half of the file is this lab's own
+    validator, byte for byte, and running the merged file with no argument
+    does what running the validator does. Then remote mode's standing: proved
+    and usable, or refused in the drafter's own words with nothing sent.
+    """
+
+    SPEC = {
+        "strategy": "direct_observation",
+        "observable_effect": "an admin route answering 200 to an unauthenticated requester",
+        "probe": [{"method": "GET", "path": "{{target_path}}"}],
+        "expect": {"status": 200},
+        "inputs": ["target_path"],
+    }
+    PLAN = {
+        "cve": "CVE-2026-0001",
+        "lab_type": "SOURCE_REPRODUCTION",
+        "scenario": "default",
+        "repository": "https://example.invalid/p.git",
+        "revisions": {"vulnerable": "a" * 40, "patched": "b" * 40},
+    }
+
+    def artifact(self, record: dict[str, Any], validator: str = _LAB_MODE) -> str:
+        return field.emit_poc("CVE-2026-0001", self.PLAN, validator, record)
+
+    def proved(self) -> dict[str, Any]:
+        return {
+            "shipped": True,
+            "container_port": 8080,
+            "spec": field.validate_spec(self.SPEC),
+            "lab_values": {"target_path": "/admin"},
+        }
+
+    def ran(self, text: str, *argv: str) -> subprocess.CompletedProcess:
+        """The artifact run as a file, which is how it is run.
+
+        Not with -c: Windows caps a command line at about 32 KB and the
+        deliverable is larger, so passing it as an argument fails with
+        WinError 206 before Python sees it.
+        """
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        path = Path(root.name) / field.POC_NAME
+        path.write_text(text, encoding="utf-8")
+        return subprocess.run(
+            [sys.executable, str(path), *argv],
+            capture_output=True, text=True, timeout=60,
+            env={"PATH": os.environ["PATH"]},
+        )
+
+    # --- lab mode ---------------------------------------------------------
+
+    def test_the_lower_half_is_the_validator_byte_for_byte(self) -> None:
+        for record in (self.proved(), {"shipped": False, "reason": "no"}, {}):
+            with self.subTest(standing=field.poc_standing(record)):
+                carried = self.artifact(record).partition(
+                    field.POC_LAB_MODE_MARKER
+                )[2]
+                self.assertEqual(carried, _LAB_MODE)
+
+    def test_lab_mode_does_what_the_validator_does(self) -> None:
+        """The non-negotiable, measured rather than read.
+
+        Same stdout, same exit code, and the environment the validator takes
+        its instructions from still reaches it: `manual.sh exploit` sets
+        CVELAB_MANUAL_ACTION, and the merged file must pass it through
+        untouched.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            alone = Path(root) / "validator.py"
+            alone.write_text(_LAB_MODE, encoding="utf-8")
+            merged = Path(root) / field.POC_NAME
+            for record in (self.proved(), {"shipped": False, "reason": "no"}):
+                for action in ("", "exploit"):
+                    with self.subTest(
+                        standing=field.poc_standing(record), action=action
+                    ):
+                        environment = {"PATH": os.environ["PATH"]}
+                        if action:
+                            environment["CVELAB_MANUAL_ACTION"] = action
+                        merged.write_text(self.artifact(record), encoding="utf-8")
+                        one = subprocess.run(
+                            [sys.executable, str(merged)], capture_output=True,
+                            text=True, timeout=60, env=environment,
+                        )
+                        two = subprocess.run(
+                            [sys.executable, str(alone)], capture_output=True,
+                            text=True, timeout=60, env=environment,
+                        )
+                        self.assertEqual(one.stdout, two.stdout)
+                        self.assertEqual(one.returncode, two.returncode)
+                        self.assertEqual(one.stdout, f"{action or 'differential'}\n")
+
+    def test_a_future_import_in_the_lab_half_is_hoisted(self) -> None:
+        """2 of 281 archived validators carry one.
+
+        A future statement must precede every other statement in a file, and
+        this file holds two programs, so leaving it where it was is a
+        SyntaxError that would reach the operator as a PoC that does not
+        parse.
+        """
+        validator = "from __future__ import annotations\n" + _LAB_MODE
+        merged = self.artifact(self.proved(), validator)
+        ast.parse(merged)
+        upper, _, lower = merged.partition(field.POC_LAB_MODE_MARKER)
+        self.assertIn("from __future__ import annotations\n", upper)
+        self.assertIn("# from __future__ import annotations", lower)
+        self.assertNotIn("\nfrom __future__", lower)
+
+    # --- remote mode ------------------------------------------------------
+
+    def test_a_proved_remote_mode_runs_and_still_demands_the_inputs(self) -> None:
+        """The honest part of the old script, kept.
+
+        CVELab does not know where in someone's application the vulnerable
+        call receives user input, so the script refuses to start without it
+        rather than sending the placeholder literally and reporting a clean
+        target.
+        """
+        text = self.artifact(self.proved())
+        refused = self.ran(text, "10.0.0.5:8080")
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("needs values it cannot know: target_path", refused.stderr)
+        # And the target itself is validated before anything is sent.
+        rubbish = self.ran(text, "http://10.0.0.5:8080/some/path")
+        self.assertNotEqual(rubbish.returncode, 0)
+        self.assertIn("--target", rubbish.stderr)
+
+    def test_a_refused_remote_mode_says_the_drafters_reason_and_sends_nothing(self) -> None:
+        """A remote mode that looks available and was never proved is worse
+        than two files, because someone presses it at a client."""
+        reason = (
+            "A stock application that calls the affected helper does not report "
+            "that state."
+        )
+        done = self.ran(
+            self.artifact({"shipped": False, "reason": reason}),
+            "10.0.0.5:8080",
+        )
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("has no remote mode", done.stderr)
+        self.assertIn("does not report", done.stderr)
+        self.assertEqual(done.stdout, "")
+
+    def test_the_three_refusals_read_differently(self) -> None:
+        """Refused, never asked for, and no record are three answers.
+
+        Rendering "not requested" as a refusal would attribute to the model a
+        judgement it was never asked to make.
+        """
+        said = {
+            standing: self.ran(self.artifact(record), "10.0.0.5:8080").stderr
+            for standing, record in (
+                (field.POC_REFUSED, {"shipped": False, "reason": "the effect is internal"}),
+                (field.POC_NOT_REQUESTED,
+                 {"shipped": False, "reason": field.NOT_REQUESTED_REASON}),
+                (field.POC_NO_RECORD, {}),
+            )
+        }
+        self.assertIn("recorded why", said[field.POC_REFUSED])
+        self.assertIn("never asked for", said[field.POC_NOT_REQUESTED])
+        self.assertIn("kept no record", said[field.POC_NO_RECORD])
+        self.assertEqual(len(set(said.values())), 3)
+        self.assertNotIn(
+            field.NOT_REQUESTED_REASON, said[field.POC_NOT_REQUESTED]
+        )
+
+    def test_a_half_written_record_claims_nothing(self) -> None:
+        """`shipped` without a spec and a port is no claim.
+
+        The spec and the port are what remote mode is made of, and the record
+        is read back off disk from a lab an older CVELab may have written.
+        """
+        for record in (
+            {"shipped": True},
+            {"shipped": True, "spec": field.validate_spec(self.SPEC)},
+            {"shipped": True, "spec": field.validate_spec(self.SPEC),
+             "container_port": "8080"},
+        ):
+            with self.subTest(record=sorted(record)):
+                self.assertEqual(field.poc_standing(record), field.POC_NO_RECORD)
+                self.assertIn(
+                    "kept no record",
+                    self.ran(self.artifact(record), "10.0.0.5:8080").stderr,
+                )
+
+    def test_the_header_states_its_standing_either_way(self) -> None:
+        proved = self.artifact(self.proved()).split('"""')[1]
+        self.assertIn(
+            "Tested        : proven by CVELab against a build of this project", proved
+        )
+        self.assertIn("Strategy      : direct_observation", proved)
+        self.assertIn("Needs         : --input target_path=...", proved)
+        header = self.artifact(
+            {"shipped": False, "reason": "the effect is internal"}
+        ).split('"""')[1]
+        self.assertIn("no remote mode", header)
+        # And it claims none of what it was not: those four lines are about a
+        # run against one instance, and there was none.
+        for absent in ("Tested ", "Strategy ", "Transport ", "Needs "):
+            self.assertNotIn(absent, header)
+        # The facts about the weakness are facts either way.
+        self.assertIn("Project       : https://example.invalid/p.git", header)
+
+    def test_a_triple_quote_in_the_drafters_reason_cannot_end_the_docstring(self) -> None:
+        """The one text in the artifact CVELab did not write."""
+        merged = self.artifact(
+            {"shipped": False, "reason": 'the adapter prints """ around it'}
+        )
+        ast.parse(merged)
+        self.assertIn("'" * 3, merged.split('"""')[1])
+        self.assertEqual(2, self.ran(merged, "10.0.0.5:8080").returncode)
+
+    # --- the two writers agree --------------------------------------------
+
+    def test_the_proved_artifact_and_the_rendered_one_are_the_same_bytes(self) -> None:
+        """Two writers, one file.
+
+        field.write_manual_poc writes it as run_lab's after_validation hook,
+        from the record it has just proved; deliverables.create_deliverables
+        writes it again for every validated lab, from the record it reads
+        back. The claim "the script CVELab proved is byte for byte the one the
+        operator receives" rests on those two agreeing.
+        """
+        with _lab() as lab_dir:
+            outcome = {
+                "shipped": True, "proof_checks": {}, "runs": {},
+                "script": "ignored: write_manual_poc re-emits it",
+                "lab_values": {"target_path": "/admin"},
+            }
+            field.write_manual_poc(
+                "CVE-2026-0001", lab_dir, self.PLAN,
+                field.validate_spec(self.SPEC), 8080, outcome,
+            )
+            written = (lab_dir / "artifacts" / field.POC_NAME).read_text()
+            rendered = field.emit_poc(
+                "CVE-2026-0001", self.PLAN,
+                (lab_dir / "validator" / "validator.py").read_text(),
+                field.poc_record(lab_dir),
+            )
+        self.assertEqual(written, rendered)
+
+    def test_an_archived_labs_proved_spec_survives_a_re_render(self) -> None:
+        """29 of the 45 archived records carry a spec that shipped.
+
+        That spec was in Manual-PoC.json and nowhere else -- this key did not
+        carry one -- so reading only the report would turn every one of those
+        labs into a refusal the next time its deliverables were written.
+        """
+        held = dict(self.proved(), cve="CVE-2026-0001")
+        with _lab(legacy_record=held) as lab_dir:
+            record = field.poc_record(lab_dir)
+            self.assertEqual(field.poc_standing(record), field.POC_SHIPPED)
+            self.assertIn(
+                "REMOTE MODE -- one instance",
+                field.emit_poc("CVE-2026-0001", self.PLAN, _LAB_MODE, record),
+            )
+
+    def test_this_runs_refusal_wins_over_an_archived_claim(self) -> None:
+        """The report is this run's answer; the old file is a fallback.
+
+        A lab whose remote mode was proved once and refused on a later run
+        must not keep advertising the first answer.
+        """
+        held = dict(self.proved(), cve="CVE-2026-0001")
+        with _lab(
+            legacy_record=held,
+            record={"shipped": False, "reason": "the second run told them apart"},
+        ) as lab_dir:
+            record = field.poc_record(lab_dir)
+        self.assertEqual(field.poc_standing(record), field.POC_REFUSED)
+        self.assertIn("told them apart", record["reason"])
+
+
+class TheLabAddressFlagTests(unittest.TestCase):
+    """The command form, kept because showing impact is what it is for.
+
+    WHAT WAS MEASURED
+
+    `PoC.py <addr> id` ran a command through the weakness and printed its
+    output -- `uid=10001(app) gid=10001(app) groups=10001(app)` on a freshly
+    generated code-execution lab. It was the carried validator's own mode and
+    was never proved against anything but this lab's route, which is a
+    constant in that validator: aimed at a client it would send that route,
+    find it absent and print BLOCKED, a false negative dressed as a test. A
+    bare address now means remote mode, which is proved per CVE or refuses.
+
+    The owner's reason for keeping it is that without it they cannot show a
+    client what the vulnerability does. That is a job on a lab they brought
+    up themselves, so the flag names the lab, refuses an address this lab
+    cannot have published, and says in its own help what it cannot check.
+    """
+
+    PLAN = {
+        "cve": "CVE-2026-0001",
+        "lab_type": "SOURCE_REPRODUCTION",
+        "scenario": "default",
+        "repository": "https://example.invalid/p.git",
+        "exploit_contract": {"service_port": 8080, "evidence_type": "code_execution"},
+    }
+    #: A lab program that reports the argv it was handed, which is the whole
+    #: of what this flag does to it: the real one is the lab's validator and
+    #: reads `[addr]` or `[addr, command]` by its own generation contract.
+    LAB = (
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "def main():\n"
+        "    if len(sys.argv) > 1:\n"
+        "        print('lab program against %s, command=%s'\n"
+        "              % (sys.argv[1], sys.argv[2:] or None))\n"
+        "        return 0\n"
+        "    print(os.environ.get('CVELAB_MANUAL_ACTION', 'differential'))\n"
+        "    return 0\n"
+        "if __name__ == '__main__':\n"
+        "    sys.exit(main())\n"
+    )
+
+    def artifact(self, record: dict[str, Any] | None = None, plan: dict | None = None) -> str:
+        proved = {
+            "shipped": True, "container_port": 8080,
+            "spec": field.validate_spec(_spec(
+                inputs=["target_path"],
+                probe=[{"method": "GET", "path": "{{target_path}}"}],
+            )),
+        }
+        return field.emit_poc(
+            "CVE-2026-0001", self.PLAN if plan is None else plan, self.LAB,
+            proved if record is None else record,
+        )
+
+    def ran(self, text: str, *argv: str) -> subprocess.CompletedProcess:
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        path = Path(root.name) / field.POC_NAME
+        path.write_text(text, encoding="utf-8")
+        return subprocess.run(
+            [sys.executable, str(path), *argv],
+            capture_output=True, text=True, timeout=60,
+            env={"PATH": os.environ["PATH"]},
+        )
+
+    def test_it_reaches_the_lab_program_with_the_address_and_the_command(self) -> None:
+        for text in (self.artifact(), self.artifact({"shipped": False, "reason": "no"})):
+            with self.subTest(standing=field.poc_standing(
+                {"shipped": False, "reason": "no"} if "REMOTE_MODE_REFUSED" in text else {}
+            )):
+                done = self.ran(text, "--lab-address", "127.0.0.1:32768", "id")
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(
+                    done.stdout,
+                    "lab program against 127.0.0.1:32768, command=['id']\n",
+                )
+
+    def test_the_equals_spelling_works_too(self) -> None:
+        done = self.ran(self.artifact(), "--lab-address=127.0.0.1:32768", "id")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("127.0.0.1:32768", done.stdout)
+
+    def test_the_flag_is_read_only_ahead_of_the_command(self) -> None:
+        """A second spelling of the flag must not eat the command.
+
+        Read anywhere in argv, it did: the later spelling overwrote the
+        address and left the command list empty, which the operator contract
+        defines as "run the lab's own harmless canary command". So the
+        command vanished and the file printed the canary's observation and
+        REPRODUCED on stdout at exit 0 -- a success status for work nobody
+        asked for, from an argument the operator meant as a command, and
+        reachable from any caller that passes operator text through to this
+        entry point.
+
+        Both directions are checked, because a fix that refused everything
+        flag-shaped would break the other one: an argument that merely
+        CONTAINS the flag is a word in the command and has to arrive whole.
+        """
+        text = self.artifact()
+        for twice in (["--lab-address", "127.0.0.1:32768", "--lab-address=127.0.0.1:32768"],
+                      ["--lab-address", "127.0.0.1:32768", "--lab-address", "127.0.0.1:9999"],
+                      ["--lab-address=127.0.0.1:32768", "--lab-address=127.0.0.1:9999"]):
+            with self.subTest(argv=twice):
+                done = self.ran(text, *twice)
+                self.assertEqual(done.returncode, 2, done.stderr)
+                self.assertEqual(done.stdout, "", "nothing may be sent or claimed")
+                self.assertNotIn("REPRODUCED", done.stdout)
+                self.assertIn("given twice", done.stderr)
+        carried = "cd /tmp && echo --lab-address=not-a-flag-here"
+        done = self.ran(text, "--lab-address", "127.0.0.1:32768", carried)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn(carried, done.stdout)
+
+    def test_an_address_this_lab_cannot_have_published_is_refused(self) -> None:
+        """The half of the question that can be answered cheaply.
+
+        `manual.sh` publishes 127.0.0.1 with the port left to the kernel, so
+        a host that is not loopback is certainly not this lab's. Which
+        loopback port is this lab's is knowable only by asking Docker, which
+        the artifact does not do -- so that half is said rather than guessed.
+        """
+        for where in ("10.0.0.5:8080", "app.example.com", "https://app.example.com",
+                      "[2001:db8::1]:443", "127.0.0.1.example.com:80"):
+            with self.subTest(target=where):
+                done = self.ran(self.artifact(), "--lab-address", where, "id")
+                self.assertEqual(done.returncode, 2)
+                self.assertEqual(done.stdout, "")
+                self.assertIn("not an address this lab published", done.stderr)
+                self.assertIn("manual.sh address", done.stderr)
+        for where in ("127.0.0.1:32768", "127.0.0.1", "localhost:8080", "[::1]:8080"):
+            with self.subTest(target=where):
+                self.assertEqual(
+                    0, self.ran(self.artifact(), "--lab-address", where).returncode
+                )
+
+    def test_it_cannot_be_used_without_an_address(self) -> None:
+        for argv in (["--lab-address"], ["--lab-address", "--show-bodies"],
+                     ["--lab-address="]):
+            with self.subTest(argv=argv):
+                done = self.ran(self.artifact(), *argv)
+                self.assertEqual(done.returncode, 2)
+                self.assertIn("takes the address this lab was published on", done.stderr)
+                self.assertIn("not optional", done.stderr)
+
+    def test_it_refuses_to_be_mixed_with_remote_mode(self) -> None:
+        """Which of the two the person wants decides what is being tested."""
+        done = self.ran(
+            self.artifact(), "--lab-address", "127.0.0.1:1",
+            "--input", "target_path=/theirs",
+        )
+        self.assertEqual(done.returncode, 2)
+        self.assertEqual(done.stdout, "")
+        self.assertIn("different jobs", done.stderr)
+        self.assertIn("--input belongs to remote", done.stderr)
+        self.assertIn("--lab-address runs against this lab's", done.stderr)
+
+    def test_the_help_says_what_it_reaches_and_what_it_cannot_check(self) -> None:
+        said = " ".join(self.ran(self.artifact(), "--help").stdout.split())
+        self.assertIn("--lab-address ADDRESS [COMMAND]", said)
+        self.assertIn("against this lab's own build on ADDRESS", said)
+        self.assertIn("shows nothing about any other host", said)
+        self.assertIn("is not something this file can check", said)
+        # And on a lab with no remote mode there is no argparse to print it,
+        # so --help prints the header, which carries the same sentences.
+        refused = self.ran(
+            self.artifact({"shipped": False, "reason": "the effect is internal"}),
+            "--help",
+        )
+        self.assertEqual(refused.returncode, 0)
+        self.assertIn(
+            "shows nothing about any other host", " ".join(refused.stdout.split())
+        )
+        self.assertIn("--lab-address", refused.stdout)
+
+    def test_the_header_says_it_in_the_same_breath_as_lab_mode(self) -> None:
+        header = self.artifact().split('"""')[1]
+        lab = header[header.index("LAB MODE"):header.index("REMOTE MODE")]
+        flat = " ".join(lab.split())
+        self.assertIn("--lab-address 127.0.0.1:32768 id", flat)
+        self.assertIn("reaches a build CVELab made", flat)
+        self.assertIn("shows nothing about any other host", flat)
+        self.assertIn("has to be on loopback", flat)
+        self.assertIn("not something this file can check", flat)
+
+    def test_a_lab_that_declares_no_port_has_no_such_flag(self) -> None:
+        """Its validator reads no argument, so the flag would run the
+        differential and call it a demonstration. 89 archived labs are that
+        lab.
+        """
+        plan = dict(self.PLAN)
+        plan.pop("exploit_contract")
+        text = self.artifact(plan=plan)
+        self.assertNotIn("--lab-address", text)
+        done = self.ran(text, "--lab-address", "127.0.0.1:32768", "id")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("unrecognized arguments", done.stderr)
+
+    def test_a_lab_with_no_command_evidence_is_offered_no_command(self) -> None:
+        plan = dict(self.PLAN, exploit_contract={
+            "service_port": 8080, "evidence_type": "unauthorized_read",
+        })
+        header = self.artifact(plan=plan).split('"""')[1]
+        self.assertIn("--lab-address 127.0.0.1:32768\n", header)
+        self.assertNotIn("--lab-address 127.0.0.1:32768 id", header)
+        self.assertNotIn("one command to run", header)
+
+    def test_no_argument_at_all_is_still_untouched(self) -> None:
+        """The non-negotiable, with the flag in the file."""
+        with tempfile.TemporaryDirectory() as root:
+            alone = Path(root) / "validator.py"
+            alone.write_text(self.LAB, encoding="utf-8")
+            for action in ("", "exploit"):
+                with self.subTest(action=action):
+                    environment = {"PATH": os.environ["PATH"]}
+                    if action:
+                        environment["CVELAB_MANUAL_ACTION"] = action
+                    merged = Path(root) / field.POC_NAME
+                    merged.write_text(self.artifact(), encoding="utf-8")
+                    one = subprocess.run(
+                        [sys.executable, str(merged)], capture_output=True,
+                        text=True, timeout=60, env=environment,
+                    )
+                    two = subprocess.run(
+                        [sys.executable, str(alone)], capture_output=True,
+                        text=True, timeout=60, env=environment,
+                    )
+                    self.assertEqual(one.stdout, two.stdout)
+                    self.assertEqual(one.returncode, two.returncode)
+
+    def test_the_kit_prints_the_command_where_the_operator_is_looking(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            lab = Path(root)
+            artifacts = lab / "artifacts"
+            artifacts.mkdir()
+            deliverables._write_generic_manual_assets(
+                "CVE-2026-0001", lab, artifacts, False, False, 8080,
+                {"shipped": False, "reason": "the effect is internal"}, True,
+            )
+            runner = (artifacts / "manual.sh").read_text()
+            guide = (artifacts / field.LAB_POC_GUIDE_NAME).read_text()
+        # Available whether or not remote mode was proved: it is this lab's
+        # own build either way.
+        self.assertIn("--lab-address $POC_AT id", runner)
+        self.assertIn('python3 PoC.py --lab-address "$(bash manual.sh address', guide)
+        self.assertIn("shows nothing about any other host", " ".join(guide.split()))
+
+
+class EverythingTravelsTests(unittest.TestCase):
+    """The merged script goes to the shared corpus whole, remote mode included.
+
+    This class replaces StaysLocalTests, "The lab travels to the corpus; a
+    free-target script does not", which asserted that Manual-PoC.py, its
+    guide and its record were absent from both upload allowlists. The project
+    owner reversed that decision on 2026-11-08, when the two scripts were
+    merged into one `PoC.py`. The consequence, stated plainly because it was
+    chosen rather than drifted into: free-target exploit code is distributed
+    to everyone who downloads a lab. Where the drafter proved a
+    single-instance script, that script is inside the `PoC.py` on
+    `upload.ALWAYS`, and anyone with the lab can point it at any host they
+    like. `--no-poc` still withholds it, since `PoC.py` is on
+    `upload.EXPLOIT` as well -- and the records it cannot withhold are
+    redacted, because moving the proved spec into report.json put the
+    requests remote mode sends into a document the control plane requires.
+
+    Nothing was added to either list to make this happen, and that is worth
+    recording too: `PoC.py` was already on both, as the lab-only script, and
+    what changed is what the name contains.
+    """
+
+    def test_the_one_artifact_travels_and_is_withheld_by_no_poc(self) -> None:
+        self.assertIn(field.POC_NAME, upload.ALWAYS)
+        self.assertIn(field.POC_NAME, upload.EXPLOIT)
+        self.assertIn(field.POC_NAME, upload.REQUIRED_TO_SHARE)
+
+    def test_the_record_travels_with_it(self) -> None:
+        """The proved spec is in report.json now, which is shared.
+
+        `Manual-PoC.json` never left the machine, so `cvelab manual-poc` on a
+        downloaded lab had nothing to reuse and drafted afresh -- a model call
+        and a sampled answer, so the same lab could get a different verdict on
+        a different day.
+        """
+        self.assertIn("report.json", upload.ALWAYS)
+        self.assertIn("report.json", upload.REQUIRED_TO_SHARE)
+
+    def test_a_shipped_lab_sends_remote_mode_in_the_body(self) -> None:
+        """Measured on the document that is actually collected, not the list."""
+        with _lab() as lab_dir:
+            artifacts = lab_dir / "artifacts"
+            artifacts.mkdir(exist_ok=True)
+            (artifacts / field.POC_NAME).write_text(
+                field.emit_poc(
+                    "CVE-2026-0001", {}, _LAB_MODE,
+                    {"shipped": True, "container_port": 8000,
+                     "spec": field.validate_spec(_spec())},
+                ),
+                encoding="utf-8",
+            )
+            payload = upload.collect(
+                lab_dir, {"ok": True, "cve": "CVE-2026-0001"},
+                provider="anthropic", model="m", include_poc=True,
+            )
+            withheld = upload.collect(
+                lab_dir, {"ok": True, "cve": "CVE-2026-0001"},
+                provider="anthropic", model="m", include_poc=False,
+            )
+        sent = {document["name"]: document["text"] for document in payload["documents"]}
+        self.assertIn("--target", sent[field.POC_NAME])
+        self.assertIn("REMOTE MODE", sent[field.POC_NAME])
+        self.assertNotIn(
+            field.POC_NAME, {d["name"] for d in withheld["documents"]}
+        )
+
+    def test_no_poc_withholds_the_script_and_the_spec_it_sends(self) -> None:
+        """The record travels, and `--no-poc` takes the attack out of it.
+
+        Moving the proved spec into report.json put every request remote mode
+        sends into a document that `--no-poc` could not withhold, because the
+        control plane requires it. Measured when that landed: a `--no-poc`
+        upload filed `manual_poc_field.spec` in full, which is the script in
+        all but name. It is redacted out now, with the rest of the attack --
+        `tests/test_upload.py::WhatNoPocFilesTests` is the measurement, name
+        by name.
+        """
+        with _lab() as lab_dir:
+            artifacts = lab_dir / "artifacts"
+            artifacts.mkdir(exist_ok=True)
+            report = json.loads((lab_dir / "report.json").read_text())
+            report["manual_poc_field"] = {
+                "shipped": True, "container_port": 8000,
+                "spec": field.validate_spec(_spec()),
+                "lab_values": {"account": "seeded-user"},
+            }
+            # The copy upload reads is the one in artifacts/, written by the
+            # deliverables pass from the same dict as the lab's own.
+            (artifacts / "report.json").write_text(json.dumps(report))
+            (artifacts / field.POC_NAME).write_text("# the artifact\n", encoding="utf-8")
+            payload = upload.collect(
+                lab_dir, {"ok": True, "cve": "CVE-2026-0001"},
+                provider="anthropic", model="m", include_poc=False,
+            )
+        sent = {document["name"]: document["text"] for document in payload["documents"]}
+        self.assertNotIn(field.POC_NAME, sent)
+        self.assertIn("report.json", sent)
+        self.assertNotIn("inband_differential", sent["report.json"])
+        self.assertNotIn("seeded-user", sent["report.json"])
+        held = json.loads(sent["report.json"])
+        self.assertNotIn("spec", held["manual_poc_field"])
+        self.assertIn(
+            "manual_poc_field.spec", held["withheld_by_no_poc"]["fields"]
+        )
+
+    def test_the_names_it_replaced_are_still_absent(self) -> None:
+        """Nothing writes them, and an archived lab's copies do not travel."""
+        for name in field.LEGACY_MANUAL_POC_NAMES:
             with self.subTest(name=name):
                 self.assertNotIn(name, upload.ALWAYS)
                 self.assertNotIn(name, upload.EXPLOIT)
@@ -649,13 +1358,14 @@ class NamesCannotCollideTests(unittest.TestCase):
 
     #: Every name CVELab writes into a lab's artifacts/ directory, in the
     #: spelling it writes. Collected from the constants where there are
-    #: constants and spelled out where the writer spells it out.
+    #: constants and spelled out where the writer spells it out. Three names
+    #: left this list when the two scripts were merged, which is three fewer
+    #: chances to collide -- but the merged name has to be checked too, and
+    #: `PoC.py` against `PoC.ps1` is the pair that is nearly one.
     ARTIFACT_NAMES = (
-        field.MANUAL_POC_NAME,
-        field.MANUAL_POC_GUIDE_NAME,
-        field.MANUAL_POC_RECORD_NAME,
+        field.POC_NAME,
         field.LAB_POC_GUIDE_NAME,
-        "PoC.py", "PoC.ps1", "manual.sh",
+        "PoC.ps1", "manual.sh",
         "REPORT.md", "WALKTHROUGH.md",
         "EVIDENCE.json", "report.json", "plan.json", "contract.json",
         "analysis.json", "field-poc.py", "field-spec.json",
@@ -675,7 +1385,7 @@ class NamesCannotCollideTests(unittest.TestCase):
         """The exact pair that collided, asserted the way the bug happened."""
         self.assertNotEqual(
             field.LAB_POC_GUIDE_NAME.lower(),
-            field.MANUAL_POC_GUIDE_NAME.lower(),
+            field.LEGACY_MANUAL_POC_GUIDE_NAME.lower(),
         )
         # And the old name really is gone from what gets written. It survives
         # only in upload's allowlists, for archived labs that still hold it.
@@ -684,7 +1394,7 @@ class NamesCannotCollideTests(unittest.TestCase):
         )
         self.assertEqual(
             field.LEGACY_LAB_POC_GUIDE_NAME.lower(),
-            field.MANUAL_POC_GUIDE_NAME.lower(),
+            field.LEGACY_MANUAL_POC_GUIDE_NAME.lower(),
             "the legacy name is kept precisely because it DID collide; if this "
             "stops being true the comments explaining the rename are wrong",
         )
@@ -709,7 +1419,11 @@ class NamesCannotCollideTests(unittest.TestCase):
         # that an archived lab holding it still ships it. A read-only name
         # cannot overwrite anything, so it is exempt here -- and exempt by
         # name, in one place, rather than by loosening the scan.
-        exempt = {field.LEGACY_LAB_POC_GUIDE_NAME}
+        # And the three the merge absorbed, for the same reason: nothing
+        # writes them, field.py reads one of them off an archived lab, and a
+        # name that is only ever read cannot overwrite anything. Exempt by
+        # name, in one place, rather than by loosening the scan.
+        exempt = {field.LEGACY_LAB_POC_GUIDE_NAME, *field.LEGACY_MANUAL_POC_NAMES}
         found: dict[str, tuple[str, str]] = {}
         for source in sorted(Path(field.__file__).parent.glob("*.py")):
             for name in quoted.findall(source.read_text(encoding="utf-8")):
@@ -947,8 +1661,7 @@ class AfterValidationHookTests(unittest.TestCase):
                 "CVE-2026-0001", lab_dir, {"repository": "r"}, ["docker"], {}, True
             )
             self.assertIs(out["shipped"], True)
-            self.assertTrue((lab_dir / "artifacts" / field.MANUAL_POC_NAME).is_file())
-            self.assertTrue((lab_dir / "artifacts" / field.MANUAL_POC_GUIDE_NAME).is_file())
+            self.assertTrue((lab_dir / "artifacts" / field.POC_NAME).is_file())
 
     def test_the_script_never_reaches_the_report(self) -> None:
         """run_lab puts this outcome in report.json verbatim.
@@ -967,16 +1680,18 @@ class AfterValidationHookTests(unittest.TestCase):
         self.assertNotIn("script", outcome)
         self.assertIn("deliverables", outcome)
 
-    def test_a_refusal_writes_the_record_and_no_script(self) -> None:
+    def test_a_refusal_writes_the_record_and_a_refusing_remote_mode(self) -> None:
         with _lab() as lab_dir:
             outcome = {"shipped": False, "reason": "did not tell them apart"}
             field.write_manual_poc(
                 "CVE-2026-0001", lab_dir, {}, field.validate_spec(_spec()), 8000, outcome
             )
-            artifacts = lab_dir / "artifacts"
-            self.assertFalse((artifacts / field.MANUAL_POC_NAME).exists())
-            record = json.loads((artifacts / field.MANUAL_POC_RECORD_NAME).read_text())
+            record = _held(lab_dir)
             self.assertIn("did not tell them apart", record["reason"])
+            poc = (lab_dir / "artifacts" / field.POC_NAME).read_text()
+            self.assertIn("did not tell them apart", poc)
+            # And no embedded spec: there is nothing to send.
+            self.assertNotIn("SPEC = json.loads", poc)
 
 
 class HookOptionsTests(unittest.TestCase):
@@ -1061,6 +1776,8 @@ class NoFixedBuildTests(unittest.TestCase):
             },
         }[strategy]
         with mock.patch.object(
+            field, "_lab_validator", return_value=_LAB_MODE
+        ), mock.patch.object(
             field, "_service_container", side_effect=lambda c, n, d, e: f"cid-{n}"
         ), mock.patch.object(
             field, "_still_serving", return_value="127.0.0.1"
@@ -1101,6 +1818,8 @@ class NoFixedBuildTests(unittest.TestCase):
     def test_only_the_vulnerable_service_is_asked_for(self) -> None:
         seen: list[str] = []
         with mock.patch.object(
+            field, "_lab_validator", return_value=_LAB_MODE
+        ), mock.patch.object(
             field, "_service_container",
             side_effect=lambda c, n, d, e: (seen.append(n), f"cid-{n}")[1],
         ), mock.patch.object(
@@ -1119,61 +1838,62 @@ class NoFixedBuildTests(unittest.TestCase):
 
     def test_the_guide_says_the_evidence_is_weaker(self) -> None:
         """A report should not read as if a patch was shown to remove it."""
-        guide = field._manual_poc_guide(
+        guide = field._remote_mode_note(
             "CVE-2026-0001", field.validate_spec(_spec()),
             {"lab_type": "VULNERABLE_ONLY_REPRODUCTION", "repository": "r"}, 8000,
         )
         self.assertIn("no fixed revision to compare against", guide)
         self.assertIn("weaker evidence", guide)
         self.assertIn("not that a fix removes it", guide)
-        with_fix = field._manual_poc_guide(
+        with_fix = field._remote_mode_note(
             "CVE-2026-0001", field.validate_spec(_spec()), {"repository": "r"}, 8000,
         )
         self.assertIn("stayed silent on the fixed one", with_fix)
         self.assertNotIn("weaker evidence", with_fix)
 
-    def test_the_guide_says_what_it_runs_against_and_names_the_other_one(self) -> None:
+    def test_the_header_says_which_mode_reaches_a_live_server(self) -> None:
         """The one fact a reader taking this to a client needs first.
 
-        This document and the lab's one both opened with the identical line
+        The two scripts both opened with the identical line
         `# <CVE> Manual PoC`, so neither the heading, the filename nor the
         first paragraph told the reader which of the two could be pointed at a
-        live server. Only this one can.
+        live server. There is one file now, and the first thing in it is which
+        of its two modes does.
         """
-        guide = field._manual_poc_guide(
-            "CVE-2026-0001", field.validate_spec(_spec()), {"repository": "r"}, 8000,
+        header = field._poc_header(
+            "CVE-2026-0001",
+            {"repository": "r", "lab_type": "SOURCE_REPRODUCTION"},
+            {"shipped": True, "container_port": 8000,
+             "spec": field.validate_spec(_spec())},
+            field.POC_SHIPPED,
         )
-        flat = " ".join(guide.split())
+        flat = " ".join(header.split())
 
-        self.assertTrue(guide.startswith("# CVE-2026-0001 Manual PoC"))
-        self.assertIn("## What this runs against", guide)
-        self.assertIn("One instance whose address you supply, with `--target`", flat)
-        self.assertIn("pointed at a server you did not build yourself", flat)
-        # And it names the other document, so the reader can find the one
-        # whose reach was only ever this lab's own builds.
-        self.assertIn(field.LAB_POC_GUIDE_NAME, guide)
-        self.assertIn("and nothing outside them", flat)
-        # That document's `PoC.py` now takes an optional address as well, so
-        # what separates the two is which was PROVED against a single
-        # instance, not which could be aimed at one. Saying otherwise here
-        # would be the overclaim this whole section exists to prevent.
-        self.assertIn("nothing proved it against one", flat)
+        self.assertIn("Two modes, and the argument chooses.", flat)
+        self.assertLess(flat.index("LAB MODE"), flat.index("REMOTE MODE"))
+        self.assertIn("REMOTE MODE -- one instance whose address you supply", flat)
+        self.assertIn("by Compose service name -- `vulnerable` and `patched`", flat)
+        self.assertIn("shows nothing about any other host", flat)
 
-    def test_the_guide_does_not_credit_one_build_with_a_second(self) -> None:
-        """A vulnerable-only lab has one build for the other document to drive.
+    def test_the_header_does_not_credit_one_build_with_a_second(self) -> None:
+        """A vulnerable-only lab has one build for lab mode to reach.
 
-        Saying "two Docker builds" there would promise a differential that the
-        trust section three paragraphs later explicitly denies, in the same
-        document.
+        Saying "two Docker builds" there would promise a differential that
+        the trust section further down explicitly denies, in the same file.
         """
-        guide = field._manual_poc_guide(
-            "CVE-2026-0001", field.validate_spec(_spec()),
-            {"lab_type": "VULNERABLE_ONLY_REPRODUCTION", "repository": "r"}, 8000,
+        header = field._poc_header(
+            "CVE-2026-0001",
+            {"repository": "r", "lab_type": "VULNERABLE_ONLY_REPRODUCTION"},
+            {"shipped": True, "container_port": 8000,
+             "spec": field.validate_spec(_spec())},
+            field.POC_SHIPPED,
         )
-        flat = " ".join(guide.split())
+        flat = " ".join(header.split())
 
-        self.assertIn("this lab's own build and nothing outside them", flat)
+        self.assertIn("this lab's own one Docker build", flat)
+        self.assertIn("by Compose service name -- `vulnerable` --", flat)
         self.assertNotIn("two Docker builds", flat)
+        self.assertNotIn("`patched`", flat)
 
 
 class EvidenceLabelTests(unittest.TestCase):
@@ -1247,13 +1967,21 @@ class ProvenSpecIsReusedTests(unittest.TestCase):
     changed, which is the one piece of this instability that is ours.
     """
 
-    def _record(self, lab_dir: Path, **extra: Any) -> None:
+    def _record(self, lab_dir: Path, legacy: bool = False, **extra: Any) -> None:
         held = {"cve": "CVE-2026-0001", "shipped": True, "container_port": 8000,
                 "spec": field.validate_spec(_spec())}
         held.update(extra)
-        artifacts = lab_dir / "artifacts"
-        artifacts.mkdir(exist_ok=True)
-        (artifacts / field.MANUAL_POC_RECORD_NAME).write_text(json.dumps(held))
+        if legacy:
+            # Where an archived lab kept it. Read, never written.
+            artifacts = lab_dir / "artifacts"
+            artifacts.mkdir(exist_ok=True)
+            (artifacts / field.LEGACY_MANUAL_POC_RECORD_NAME).write_text(
+                json.dumps(held)
+            )
+            return
+        report = json.loads((lab_dir / "report.json").read_text())
+        report["manual_poc_field"] = held
+        (lab_dir / "report.json").write_text(json.dumps(report))
 
     def test_a_proven_spec_comes_back(self) -> None:
         with _lab() as lab_dir:
@@ -1277,7 +2005,9 @@ class ProvenSpecIsReusedTests(unittest.TestCase):
                 self.assertIsNone(field._proven_spec(lab_dir))
         with _lab() as lab_dir:
             (lab_dir / "artifacts").mkdir(exist_ok=True)
-            (lab_dir / "artifacts" / field.MANUAL_POC_RECORD_NAME).write_text("{not json")
+            (lab_dir / "artifacts" / field.LEGACY_MANUAL_POC_RECORD_NAME).write_text(
+                "{not json"
+            )
             self.assertIsNone(field._proven_spec(lab_dir))
 
     def test_reuse_asks_the_model_nothing(self) -> None:
@@ -1328,16 +2058,14 @@ class ProvenSpecIsReusedTests(unittest.TestCase):
                        "script": "#!/usr/bin/env python3\n"}
             field.write_manual_poc("CVE-2026-0001", lab_dir, {},
                                    field.validate_spec(_spec()), 8000, outcome)
-            held = json.loads(
-                (lab_dir / "artifacts" / field.MANUAL_POC_RECORD_NAME).read_text())
+            held = _held(lab_dir)
             self.assertIn("spec", held)
             self.assertNotIn("attempted_spec", held)
         with _lab() as lab_dir:
             refused = {"shipped": False, "reason": "x"}
             field.write_manual_poc("CVE-2026-0001", lab_dir, {},
                                    field.validate_spec(_spec()), 8000, refused)
-            held = json.loads(
-                (lab_dir / "artifacts" / field.MANUAL_POC_RECORD_NAME).read_text())
+            held = _held(lab_dir)
             self.assertNotIn("spec", held)
 
     def test_a_refused_spec_is_kept_where_it_can_be_read(self) -> None:
@@ -1352,8 +2080,7 @@ class ProvenSpecIsReusedTests(unittest.TestCase):
             refused = {"shipped": False, "reason": "did not tell them apart"}
             field.write_manual_poc("CVE-2026-0001", lab_dir, {},
                                    field.validate_spec(_spec()), 8000, refused)
-            held = json.loads(
-                (lab_dir / "artifacts" / field.MANUAL_POC_RECORD_NAME).read_text())
+            held = _held(lab_dir)
             self.assertEqual(held["attempted_spec"]["strategy"], "inband_differential")
             # Kept to be read, not to be repeated.
             self.assertIsNone(field._proven_spec(lab_dir))
@@ -1370,6 +2097,8 @@ class ServiceWentAwayTests(unittest.TestCase):
 
     def _prove(self, serving: dict[str, bool]) -> dict[str, Any]:
         with mock.patch.object(
+            field, "_lab_validator", return_value=_LAB_MODE
+        ), mock.patch.object(
             field, "_service_container", side_effect=lambda c, n, d, e: f"cid-{n}"
         ), mock.patch.object(
             field, "_still_serving",
@@ -1405,6 +2134,8 @@ class ServiceWentAwayTests(unittest.TestCase):
         """Running it anyway is how a dead target became a clean bill."""
         ran: list[str] = []
         with mock.patch.object(
+            field, "_lab_validator", return_value=_LAB_MODE
+        ), mock.patch.object(
             field, "_service_container", side_effect=lambda c, n, d, e: f"cid-{n}"
         ), mock.patch.object(
             field, "_still_serving",
@@ -1552,8 +2283,7 @@ class SampledSpecGetsASecondAskTests(unittest.TestCase):
             self.assertNotIn("spec_at_fault", outcome)
             field.write_manual_poc("CVE-2026-0001", lab_dir, {},
                                    field.validate_spec(_spec()), 8000, outcome)
-            held = json.loads(
-                (lab_dir / "artifacts" / field.MANUAL_POC_RECORD_NAME).read_text())
+            held = _held(lab_dir)
         self.assertNotIn("spec_at_fault", held)
 
     def test_asking_can_be_switched_off(self) -> None:
@@ -1566,6 +2296,8 @@ class SampledSpecGetsASecondAskTests(unittest.TestCase):
     def test_a_failed_proof_says_the_spec_was_at_fault(self) -> None:
         """The marker _prove_drafted_spec reads is set where the proof is run."""
         with _lab() as lab_dir, mock.patch.object(
+            field, "_lab_validator", return_value=_LAB_MODE
+        ), mock.patch.object(
             field, "_service_container", return_value="cid",
         ), mock.patch.object(field, "_still_serving", return_value="127.0.0.1"), \
              mock.patch.object(field.sidecar, "ensure_image", return_value="img"), \
@@ -1771,9 +2503,16 @@ class LabValuesLetAnInputSpecBeProvedTests(unittest.TestCase):
                        "runs": {}, "script": "#!/usr/bin/env python3\n",
                        "lab_values": {"account": "seeded-user"}}
             field.write_manual_poc("CVE-2026-0001", lab_dir, {}, spec, 8000, outcome)
-            # report.json takes this outcome verbatim, and one of these is a
-            # credential of the lab's.
-            self.assertNotIn("lab_values", outcome)
+            # They stay in the record, which is report.json now, because an
+            # input spec cannot be re-proved without them -- and they travel
+            # with it, which is the cost of the record travelling at all.
+            # They are the lab's own: the route its adapter serves, the
+            # account its setup created, and plan.json already ships the
+            # contract that created them.
+            self.assertEqual(_held(lab_dir)["lab_values"], {"account": "seeded-user"})
+            # The script is still taken out: it is the one thing a report has
+            # no business carrying, and it is on disk beside it.
+            self.assertNotIn("script", outcome)
             held = field._proven_spec(lab_dir)
         self.assertIsNotNone(held)
         self.assertEqual(held[2], {"account": "seeded-user"})
@@ -1842,6 +2581,8 @@ class SetupPutsTheLabInTheStateTheEffectNeedsTests(unittest.TestCase):
         order: list[str] = []
         spec = field.validate_spec(self._spec())
         with _lab() as lab_dir, mock.patch.object(
+            field, "_lab_validator", return_value=_LAB_MODE
+        ), mock.patch.object(
             field, "_service_container", side_effect=lambda c, name, d, e: f"cid-{name}",
         ), mock.patch.object(field, "_still_serving", return_value="127.0.0.1"), \
              mock.patch.object(field.sidecar, "ensure_image", return_value="img"), \
@@ -1868,6 +2609,8 @@ class SetupPutsTheLabInTheStateTheEffectNeedsTests(unittest.TestCase):
     def test_a_setup_that_cannot_run_stops_the_proof(self) -> None:
         """An unseeded instance answers like a fixed one, so silence here lies."""
         with _lab() as lab_dir, mock.patch.object(
+            field, "_lab_validator", return_value=_LAB_MODE
+        ), mock.patch.object(
             field, "_service_container", return_value="cid",
         ), mock.patch.object(field, "_still_serving", return_value="127.0.0.1"), \
              mock.patch.object(field.sidecar, "ensure_image", return_value="img"), \
@@ -1907,7 +2650,7 @@ class SetupPutsTheLabInTheStateTheEffectNeedsTests(unittest.TestCase):
         self.assertNotIn("the lab is empty", plain)
 
     def test_the_guide_says_a_silent_run_on_an_empty_target_proves_nothing(self) -> None:
-        guide = field._manual_poc_guide(
+        guide = field._remote_mode_note(
             "CVE-2026-0001", field.validate_spec(self._spec()), {"repository": "r"}, 3000
         )
         self.assertIn("started empty", guide)
@@ -1927,6 +2670,7 @@ class SlowStartIsWaitedForAndNamedTests(unittest.TestCase):
 
     def _bring_up(self, ready: bool, running: bool = True) -> str:
         with mock.patch.object(field, "run_docker_stage"), \
+             mock.patch.object(field, "_lab_validator", return_value=_LAB_MODE), \
              mock.patch.object(field, "_service_container", return_value="cid"), \
              mock.patch.object(
                  field, "_reachable_address",
@@ -1963,6 +2707,7 @@ class SlowStartIsWaitedForAndNamedTests(unittest.TestCase):
     def test_a_spec_may_still_ask_for_longer(self) -> None:
         """health_timeout above the floor is the spec's own business."""
         with mock.patch.object(field, "run_docker_stage"), \
+             mock.patch.object(field, "_lab_validator", return_value=_LAB_MODE), \
              mock.patch.object(field, "_service_container", return_value="cid"), \
              mock.patch.object(
                  field, "_reachable_address", return_value="127.0.0.1") as waited:
@@ -2053,6 +2798,8 @@ class BlindRunThatHeardNothingSaysSoTests(unittest.TestCase):
                        "body": {"region": "{{callback}}/{{marker}}"}}],
         } if strategy == "oob_callback" else _spec())
         with _lab() as lab_dir, mock.patch.object(
+            field, "_lab_validator", return_value=_LAB_MODE
+        ), mock.patch.object(
             field, "_service_container", side_effect=lambda c, name, d, e: f"cid-{name}",
         ), mock.patch.object(field, "_still_serving", return_value="127.0.0.1"), \
              mock.patch.object(field.sidecar, "ensure_image", return_value="img"), \
@@ -2108,7 +2855,8 @@ class DraftOnlyTests(unittest.TestCase):
             # Nothing is built, started or proved.
             prepared.assert_not_called()
             proved.assert_not_called()
-            self.assertFalse((lab_dir / "artifacts" / field.MANUAL_POC_RECORD_NAME).exists())
+            self.assertFalse((lab_dir / "artifacts" / field.POC_NAME).exists())
+            self.assertEqual(_held(lab_dir), {})
         return out
 
     def test_a_usable_answer_comes_back_normalised(self) -> None:
@@ -2482,6 +3230,8 @@ class RefusingIsStillTheAnswerWhenItShouldBeTests(unittest.TestCase):
 
     def _prove(self, observed: tuple[bool, bool]) -> dict[str, Any]:
         with _lab() as lab_dir, mock.patch.object(
+            field, "_lab_validator", return_value=_LAB_MODE
+        ), mock.patch.object(
             field, "_service_container", side_effect=lambda c, name, d, e: f"cid-{name}",
         ), mock.patch.object(field, "_still_serving", return_value="127.0.0.1"), \
              mock.patch.object(field.sidecar, "ensure_image", return_value="img"), \
@@ -2924,6 +3674,8 @@ class SetupCanBindWhatItReadsTests(unittest.TestCase):
         """Without this the spec stops at "needs values only you have"."""
         spec = field.validate_spec(self._spec())
         with _lab() as lab_dir, mock.patch.object(
+            field, "_lab_validator", return_value=_LAB_MODE
+        ), mock.patch.object(
             field, "_service_container", return_value="cid",
         ), mock.patch.object(field, "_still_serving", return_value="127.0.0.1"), \
              mock.patch.object(field.sidecar, "ensure_image", return_value="img"), \
@@ -2946,6 +3698,8 @@ class SetupCanBindWhatItReadsTests(unittest.TestCase):
     def test_the_operator_s_own_value_still_wins(self) -> None:
         spec = field.validate_spec(self._spec())
         with _lab() as lab_dir, mock.patch.object(
+            field, "_lab_validator", return_value=_LAB_MODE
+        ), mock.patch.object(
             field, "_service_container", return_value="cid",
         ), mock.patch.object(field, "_still_serving", return_value="127.0.0.1"), \
              mock.patch.object(field.sidecar, "ensure_image", return_value="img"), \

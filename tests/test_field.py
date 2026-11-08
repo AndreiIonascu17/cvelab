@@ -35,6 +35,43 @@ from unittest import mock
 
 from cvelab import field, releases, sidecar
 
+#: A stand-in for the lab program the merged artifact carries underneath
+#: remote mode. Lab mode is this lab's own validator and is pinned where that
+#: matters -- `tests/test_manual_poc.py` compares it with
+#: validator/validator.py byte for byte -- so here it only has to be a
+#: program, because what is under test is the file the operator receives.
+_LAB_MODE = (
+    "import sys\n"
+    "def main():\n"
+    "    print('REPRODUCED')\n"
+    "    return 0\n"
+    "if __name__ == '__main__':\n"
+    "    sys.exit(main())\n"
+)
+
+
+def _artifact(
+    cve: str,
+    spec: dict[str, Any],
+    plan: dict[str, Any] | None = None,
+    port: int = 8080,
+) -> str:
+    """The whole of `PoC.py` for a lab whose remote mode was proved."""
+    return field.emit_poc(
+        cve, plan, _LAB_MODE,
+        {"shipped": True, "spec": spec, "container_port": port},
+    )
+
+
+def _header(
+    cve: str,
+    spec: dict[str, Any],
+    plan: dict[str, Any] | None = None,
+    port: int = 8080,
+) -> str:
+    """Its docstring, which is where both modes state what they are worth."""
+    return _artifact(cve, spec, plan, port).split('"""')[1]
+
 
 def _inband(**extra: Any) -> dict[str, Any]:
     spec = {
@@ -306,7 +343,7 @@ class DiscoveryTests(unittest.TestCase):
 class EmittedScriptTests(unittest.TestCase):
     def test_both_strategies_emit_valid_python(self) -> None:
         for spec in (field.validate_spec(_inband()), field.validate_spec(_marker())):
-            script = field.emit_field_poc("CVE-2026-0001", spec)
+            script = _artifact("CVE-2026-0001", spec)
             with self.subTest(strategy=spec["strategy"]):
                 ast.parse(script)
                 self.assertTrue(script.startswith("#!/usr/bin/env python3"))
@@ -362,9 +399,9 @@ class EmittedScriptTests(unittest.TestCase):
         puts them in the terminal and in whatever captured the output. Port 1
         refuses the connection, so the run cannot get past that point.
         """
-        script = field.emit_field_poc("CVE-2026-0001", field.validate_spec(_inband()))
+        script = _artifact("CVE-2026-0001", field.validate_spec(_inband()))
         with tempfile.TemporaryDirectory() as root:
-            path = Path(root) / "field-poc.py"
+            path = Path(root) / "PoC.py"
             path.write_text(script)
             run = subprocess.run(
                 ["python3", str(path), "--target", "127.0.0.1:1"],
@@ -932,9 +969,7 @@ class PublishedPoCShapeTests(unittest.TestCase):
 
     def test_the_header_names_the_cve_the_versions_and_the_fix(self) -> None:
         """A reader can tell at a glance whether the host is even in range."""
-        header = field.emit_field_poc(
-            "CVE-2026-8404", field.validate_spec(self._spec()), self._PLAN
-        ).split("from __future__")[0]
+        header = _header("CVE-2026-8404", field.validate_spec(self._spec()), self._PLAN)
         self.assertIn("CVE-2026-8404 - an admin route answering 200", header)
         self.assertIn("django <= 6.0.5 (pip), fixed in 6.0.6", header)
         self.assertIn("https://github.com/django/django.git", header)
@@ -942,21 +977,25 @@ class PublishedPoCShapeTests(unittest.TestCase):
         self.assertIn("Strategy      : direct_observation", header)
 
     def test_the_usage_lines_name_the_file_it_is_written_as(self) -> None:
-        header = field.emit_field_poc(
-            "CVE-2026-8404", field.validate_spec(self._spec()), self._PLAN,
-            "Manual-PoC.py",
-        ).split("from __future__")[0]
-        self.assertIn("python3 Manual-PoC.py 10.0.0.5:8080", header)
+        """One artifact, one name in its own usage.
+
+        The name used to be the lab's second script, and the usage text was
+        the reason given for not renaming it. There is one file now, so both
+        modes are shown under the name it is written as, and nothing in it
+        points at a file that is no longer written.
+        """
+        header = _header("CVE-2026-8404", field.validate_spec(self._spec()), self._PLAN)
+        self.assertIn(f"python3 {field.POC_NAME} 10.0.0.5:8080", header)
+        self.assertIn(f"python3 {field.POC_NAME}\n", header)
+        self.assertNotIn(field.LEGACY_MANUAL_POC_NAME, header)
 
     def test_a_lab_without_version_metadata_still_emits(self) -> None:
-        header = field.emit_field_poc(
-            "CVE-2026-8404", field.validate_spec(self._spec()), None
-        ).split("from __future__")[0]
+        header = _header("CVE-2026-8404", field.validate_spec(self._spec()), None)
         self.assertIn("CVE-2026-8404", header)
         self.assertNotIn("Affected", header)
 
     def test_an_input_is_announced_in_the_header(self) -> None:
-        header = field.emit_field_poc(
+        header = _header(
             "CVE-2026-8404",
             field.validate_spec(self._spec(
                 inputs=["credential"],
@@ -964,47 +1003,44 @@ class PublishedPoCShapeTests(unittest.TestCase):
                         "headers": {"Authorization": "Bearer {{credential}}"}}],
             )),
             self._PLAN,
-        ).split("from __future__")[0]
+        )
         self.assertIn("--input credential=...", header)
 
     def test_the_footprint_describes_only_the_strategy_in_use(self) -> None:
         """It claimed a marker roundtrip's footprint on a read-only script."""
-        read_only = field.emit_field_poc(
-            "CVE-2026-8404", field.validate_spec(self._spec()), None
-        ).split("from __future__")[0]
+        read_only = _header("CVE-2026-8404", field.validate_spec(self._spec()), None)
         self.assertIn("It leaves nothing behind", read_only)
         self.assertNotIn("cvelab-<16 hex>", read_only)
-        marker = field.emit_field_poc("CVE-2026-8404", field.validate_spec({
+        marker = _header("CVE-2026-8404", field.validate_spec({
             "strategy": "marker_roundtrip",
             "observable_effect": "a stored reflection",
             "probe": [{"method": "POST", "path": "/c", "body": "{{marker}}"}],
             "observe": {"method": "GET", "path": "/c"},
-        }), None).split("from __future__")[0]
+        }), None)
         self.assertIn("cvelab-<16 hex>", marker)
         self.assertNotIn("It leaves nothing behind", marker)
 
     def test_the_target_is_positional_as_well_as_named(self) -> None:
-        script = field.emit_field_poc(
-            "CVE-2026-8404", field.validate_spec(self._spec()), None
-        )
+        script = _artifact("CVE-2026-8404", field.validate_spec(self._spec()), None)
         namespace: dict[str, Any] = {}
         exec(compile(script, "<f>", "exec"), namespace)
         self.assertIn('"target_positional"', script)
         self.assertIn('p.add_argument("--target"', script)
 
     def test_naming_no_target_or_two_is_refused(self) -> None:
-        script = field.emit_field_poc(
-            "CVE-2026-8404", field.validate_spec(self._spec()), None
-        )
+        script = _artifact("CVE-2026-8404", field.validate_spec(self._spec()), None)
         # Run from a file, not with -c: Windows caps a command line at about
         # 32 KB and the deliverable is larger, so passing it as an argument
         # fails with WinError 206 before Python sees it. A file is also how it
         # is actually run, and how CVELab proves it -- the sidecar passes the
         # script in the environment rather than in argv for the same reason.
         with tempfile.TemporaryDirectory() as root:
-            path = Path(root) / "Manual-PoC.py"
+            path = Path(root) / field.POC_NAME
             path.write_text(script, encoding="utf-8")
-            for argv in ([], ["a", "--target", "b"]):
+            # No argument at all is lab mode, not a missing target, so the
+            # case that used to stand for "named none" is a flag with no
+            # target beside it.
+            for argv in (["--insecure"], ["a", "--target", "b"]):
                 with self.subTest(argv=argv):
                     done = subprocess.run(
                         [sys.executable, str(path), *argv],
@@ -1115,9 +1151,7 @@ class HandshakeTransportTests(unittest.TestCase):
         self.assertLess(main_body.index("_require(needed"), main_body.index("Target("))
 
     def test_the_footprint_says_a_session_carries_the_credential(self) -> None:
-        header = field.emit_field_poc(
-            "CVE-2026-0002", field.validate_spec(self._ssh())
-        ).split("from __future__")[0]
+        header = _header("CVE-2026-0002", field.validate_spec(self._ssh()))
         self.assertIn("credentials travel", header)
         self.assertIn("--input user=...", header)
 
@@ -1965,22 +1999,26 @@ class ServiceCrashSpecTests(unittest.TestCase):
         self.assertIn("service_crash", field.SELF_CONTROLLED)
 
     def test_the_header_says_it_causes_an_outage(self) -> None:
-        script = field.emit_field_poc("CVE-2026-0007", field.validate_spec(_crash()))
-        self.assertIn("STOPS THE SERVICE", script)
-        self.assertIn("--allow-disruption", script)
+        header = _header("CVE-2026-0007", field.validate_spec(_crash()))
+        self.assertIn("STOPS THE SERVICE", header)
+        self.assertIn("--allow-disruption", header)
 
     def test_the_usage_examples_are_ones_that_can_actually_run(self) -> None:
-        """Every command line without the flag is refused, so none is shown."""
-        script = field.emit_field_poc("CVE-2026-0007", field.validate_spec(_crash()))
-        usage = script.split("Usage:")[1].split("Exit 0")[0]
+        """Every command line without the flag is refused, so none is shown.
+
+        Except the one that takes no argument at all, which is lab mode and
+        sends nothing: this strategy's gate is about what reaches a target.
+        """
+        header = _header("CVE-2026-0007", field.validate_spec(_crash()))
+        usage = header.split("REMOTE MODE")[1].split("WHAT IT MEANS")[0]
         for line in usage.splitlines():
             if line.strip().startswith("python3"):
                 self.assertIn("--allow-disruption", line)
 
     def test_an_ordinary_spec_keeps_the_plain_usage_and_says_nothing_about_outages(self) -> None:
-        script = field.emit_field_poc("CVE-2026-0008", field.validate_spec(_inband()))
-        self.assertNotIn("STOPS THE SERVICE", script)
-        self.assertIn("--show-bodies", script.split("Exit 0")[0])
+        header = _header("CVE-2026-0008", field.validate_spec(_inband()))
+        self.assertNotIn("STOPS THE SERVICE", header)
+        self.assertIn("--show-bodies", header.split("WHAT IT MEANS")[0])
 
 
 class ServiceCrashRunTests(unittest.TestCase):
@@ -2252,9 +2290,15 @@ class GuideDescribesTheScriptBesideItTests(unittest.TestCase):
                 self.assertTrue(field._GUIDE_HOW[strategy].strip())
 
     def _guide(self, spec: dict[str, Any]) -> str:
-        validated = field.validate_spec(spec)
-        return field._manual_poc_guide(
-            "CVE-2026-0011", validated, {"repository": "acme/thing"}, 8080
+        """Remote mode's own section of the artifact's header.
+
+        It was `Manual-PoC.md`, a document beside the script. The prose is
+        the same prose; what changed is that it cannot be separated from the
+        program it describes.
+        """
+        return field._remote_mode_note(
+            "CVE-2026-0011", field.validate_spec(spec),
+            {"repository": "acme/thing"}, 8080,
         )
 
     def test_a_crash_guide_leads_with_the_outage_and_the_flag(self) -> None:
@@ -2299,7 +2343,7 @@ class GuideDescribesTheScriptBesideItTests(unittest.TestCase):
                         "body": "http://{{callback}}/{{marker}}"}]},
         ):
             with self.subTest(strategy=spec["strategy"]):
-                self.assertIn("## How it decides", self._guide(spec))
+                self.assertIn("HOW IT DECIDES", self._guide(spec))
 
 
 class LibraryRouteIsAnInputTests(unittest.TestCase):
@@ -2382,8 +2426,9 @@ class GuideShowsACommandThatRunsTests(unittest.TestCase):
     """
 
     def _guide(self, spec: dict[str, Any]) -> str:
-        return field._manual_poc_guide(
-            "CVE-2026-0013", field.validate_spec(spec), {"repository": "acme/thing"}, 8080
+        return field._remote_mode_note(
+            "CVE-2026-0013", field.validate_spec(spec),
+            {"repository": "acme/thing"}, 8080,
         )
 
     def test_every_declared_input_is_in_the_command(self) -> None:
@@ -2395,7 +2440,7 @@ class GuideShowsACommandThatRunsTests(unittest.TestCase):
             "expect": {"status": 200},
             "inputs": ["target_path", "api_token"],
         })
-        command = guide.split("```bash")[1].split("```")[0]
+        command = guide.split("REMOTE MODE")[1].split("The target is one host")[0]
         self.assertIn("--input target_path=", command)
         self.assertIn("--input api_token=", command)
         self.assertIn("refuses to start without them", guide)
@@ -2414,7 +2459,9 @@ class GuideShowsACommandThatRunsTests(unittest.TestCase):
 
     def test_a_spec_with_no_inputs_says_nothing_about_them(self) -> None:
         guide = self._guide(_inband())
-        self.assertNotIn("--input", guide.split("```bash")[1].split("```")[0])
+        self.assertNotIn(
+            "--input", guide.split("REMOTE MODE")[1].split("The target is one host")[0]
+        )
         self.assertNotIn("refuses to start without them", guide)
 
     def test_a_credential_input_gets_no_route_explanation(self) -> None:

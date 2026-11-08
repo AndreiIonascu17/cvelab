@@ -28,12 +28,24 @@ from .core import (
     shipped_setup_gap,
     write_text,
 )
+
 # LAB_POC_GUIDE_NAME is the document this module writes, so it would normally
-# be declared here. It is declared in field.py instead, in one block with the
-# single-instance script's own names, because the two documents used to
-# collide case-insensitively and declaring them in two modules is exactly how
-# that happened. The comment on that block is the whole account.
-from .field import LAB_POC_GUIDE_NAME, MANUAL_POC_GUIDE_NAME, MANUAL_POC_NAME
+# be declared here. It is declared in field.py instead, in one block with
+# every other name a lab's artifacts/ carries, because two of those names used
+# to collide case-insensitively and declaring them in two modules is exactly
+# how that happened. The comment on that block is the whole account.
+from .field import (
+    LAB_POC_GUIDE_NAME,
+    LEGACY_MANUAL_POC_NAMES,
+    POC_NAME,
+    POC_NOT_REQUESTED,
+    POC_REFUSED,
+    POC_SHIPPED,
+    _executes,
+    emit_poc,
+    poc_record,
+    poc_standing,
+)
 
 ANALYSIS_SCHEMA = {
     "type": "object",
@@ -178,10 +190,10 @@ def _manual_poc_verdict(report: dict) -> str:
     return "separate curated runner" if verified is None else str(verified)
 
 
-#: What the lab document says about the other kind, for each of the four
-#: states a lab can be in.
+#: What the lab document says about remote mode, for each of the four states
+#: a lab can be in.
 #:
-#: This is the half that matters more than the rename. A reader opens a file
+#: This is the half that matters more than the merge. A reader opens a file
 #: called "Manual PoC", follows it, watches it work, and learns nothing about
 #: whether any of it can be pointed at the client's server -- and for most
 #: labs it cannot, because the single-instance script was refused. The refusal
@@ -189,23 +201,29 @@ def _manual_poc_verdict(report: dict) -> str:
 #: record ("a stock application that calls the affected helper does not report
 #: that state"), but it lived only in report.json, and nobody reads report.json
 #: before a client meeting. So it goes in the document the reader actually
-#: opens.
-_SHIPPED_NOTE = f"""A single-instance script **does** exist for this lab, beside this document:
-`{MANUAL_POC_NAME}`, with `{MANUAL_POC_GUIDE_NAME}` for how to run it. That one takes
-an address you supply, and it is the artifact to use against a server you are
-permitted to test.
+#: opens, and in the script's own header beside it. The four states are the
+#: same four questions as before, asked of one script's two modes rather than
+#: of whether a second file is there.
+_SHIPPED_NOTE = f"""Yes. `{POC_NAME}` beside this document has two modes, and the argument
+chooses: with none it is the lab program documented below, and given the
+address of an instance you are permitted to test it is the single-instance
+script CVELab proved before writing it here.
 
-{{proof}}"""
+{{proof}}
 
-#: How the shipped script was proved, which differs with the lab. Said here
-#: because "silent on the fixed one" is the whole strength of the claim, and a
+That script's own header is the handover document -- what it sends, what it
+leaves behind, what it needs from you, what each exit code means and what it
+was proved against. Read it before you point it anywhere."""
+
+#: How remote mode was proved, which differs with the lab. Said here because
+#: "silent on the fixed one" is the whole strength of the claim, and a
 #: vulnerable-only lab has no fixed build to have been silent on -- printing
 #: that sentence for one would credit it with a differential it never had.
 _SHIPPED_PROOF = {
-    True: f"""CVELab ran that script against this lab's one build and observed the
+    True: f"""CVELab ran that mode against this lab's one build and observed the
 effect. There was no fixed revision to compare against, so it was never held to
-a differential; `{MANUAL_POC_GUIDE_NAME}` says what stands in for one.""",
-    False: """CVELab built both of this lab's revisions and ran that script against each
+a differential; the `{POC_NAME}` header says what stands in for one.""",
+    False: """CVELab built both of this lab's revisions and ran that mode against each
 before writing it: it observed the effect on the vulnerable build and stayed
 silent on the fixed one. A script that fired on both would be watching normal
 behaviour rather than the bug, and would not have been written.""",
@@ -217,36 +235,48 @@ behaviour rather than the bug, and would not have been written.""",
 #: emitted Markdown is wrapped like the rest of the file instead of wherever
 #: a substitution happened to land.
 _LAB_REACH = {
-    True: """The one Docker build in this lab directory. `manual.sh` takes a Compose
+    True: f"""The one Docker build in this lab directory. `manual.sh` takes a Compose
 service name -- `vulnerable` -- not an address, so there is no host to supply and
-no option that would accept one. `PoC.py` beside it takes one optional address,
-and with none it runs against this same build.""",
-    False: """This lab directory's two Docker builds. `manual.sh` takes a Compose service
+no option that would accept one. `{POC_NAME}` beside it runs against that same
+build when it is given no argument at all.""",
+    False: f"""This lab directory's two Docker builds. `manual.sh` takes a Compose service
 name -- `vulnerable` or `patched` -- not an address, so there is no host to
-supply and no option that would accept one. `PoC.py` beside it takes one
-optional address, and with none it runs against these same builds.""",
+supply and no option that would accept one. `{POC_NAME}` beside it runs against
+those same builds when it is given no argument at all.""",
 }
 
-_NOT_REQUESTED_NOTE = """There is no single-instance script for this lab, because one was never asked
-for. `cvelab run --manual-poc`, or `cvelab manual-poc` on a lab that has already
-validated, attempts one. Until that is run, nothing here has been proved past
-this lab's own builds."""
+#: Said under a rehearsal command that carries this lab's own values, because
+#: the whole point of the inputs is that CVELab cannot know them: the route in
+#: the command below is the one this lab's adapter serves, and copying it to a
+#: client would test a path that does not exist there and report NOT_OBSERVED,
+#: which reads as "not vulnerable".
+_REMOTE_ARGUMENT_NOTE = """Those `--input` values are this lab's own -- the route its adapter serves, the
+account its setup created -- and they are here so the command above runs
+against the build `setup` has just started. Against anyone else's instance they
+are theirs, not these.
 
-_NO_RECORD_NOTE = """This run kept no record of a single-instance script either way, and none is
-present. Treat that as "not available" rather than "refused": a lab driven by
-its own curated runner never attempts one. Everything in this document reaches
-this lab's own builds only: `PoC.py` here accepts an address, and nothing in this
-run proved it against one."""
+"""
 
-_REFUSED_NOTE = """There is **no** single-instance script for this lab. CVELab tried to write one,
-proved it could not, and recorded why:
+_NOT_REQUESTED_NOTE = f"""No, because one was never asked for. `cvelab run --manual-poc`, or
+`cvelab manual` on a lab that has already validated, attempts one: it
+drafts a single-instance spec, proves the script it emits against both of this
+lab's builds, and keeps it only if the effect showed on one and not the other.
+Until that is run, `{POC_NAME}` given an address refuses with exit 2, and nothing
+here has been proved past this lab's own builds."""
 
-{reason}
+_NO_RECORD_NOTE = f"""This run kept no record of a single-instance script either way. Treat that as
+"not available" rather than "refused": a lab driven by its own curated runner
+never attempts one. `{POC_NAME}` given an address refuses with exit 2, and
+everything in this document reaches this lab's own builds only."""
+
+_REFUSED_NOTE = f"""No. `{POC_NAME}` has a remote mode, and for this lab it refuses: given an
+address it prints the reason below and exits 2 without sending anything. CVELab
+drafted a single-instance script, proved it could not stand, and recorded why:
+
+{{reason}}
 
 That sentence is the limit of what this lab can show, and it is the one to
-repeat rather than implying the demonstration below would carry over. `PoC.py`
-here will accept an address, but nothing in this document proves it may be
-pointed at a server you did not build here."""
+repeat rather than implying the demonstration below would carry over."""
 
 
 def _quoted(reason: str) -> str:
@@ -260,35 +290,28 @@ def _quoted(reason: str) -> str:
     return "\n".join(f"> {line}" if line.strip() else ">" for line in reason.splitlines())
 
 
-def _single_instance_note(artifacts: Path, report: dict, vulnerable_only: bool) -> str:
-    """What the lab document says about the single-instance script.
+def _single_instance_note(record: dict, vulnerable_only: bool) -> str:
+    """What the lab document says about the artifact's remote mode.
 
-    Read from `report.manual_poc_field`, which core.run_lab already writes for
-    every run: `{"shipped": bool, "reason": str}`, with
-    `reason: "not requested"` when the step was never asked for. No change to
-    core.py was needed -- create_deliverables is handed the same report dict
-    that run_lab returns, and the field is in it.
-
-    The file on disk is consulted first and wins. The script is written by
-    field.write_manual_poc, which core.run_lab calls as `after_validation`
-    before create_deliverables runs, so by the time this executes the answer
-    is on disk. Trusting disk first also keeps the document honest when it is
-    re-rendered for an archived lab whose report predates the field: the
-    document describes what the reader actually has.
+    `record` is what `field.poc_record` read: `report.manual_poc_field` for a
+    run of this CVELab, falling back to the old `Manual-PoC.json` beside an
+    archived lab. `field.poc_standing` decides which of the four it is, and
+    the same function decides what the script's own header says, so the
+    document and the artifact cannot give different answers -- they were two
+    files written by two modules, which is how a lab came to ship a document
+    about a script that was never there.
     """
-    record = report.get("manual_poc_field")
-    record = record if isinstance(record, dict) else {}
-    if record.get("shipped") is True or (artifacts / MANUAL_POC_NAME).is_file():
+    standing = poc_standing(record)
+    if standing == POC_SHIPPED:
         return _SHIPPED_NOTE.format(proof=_SHIPPED_PROOF[vulnerable_only])
-    reason = str(record.get("reason") or "").strip()
-    if not record:
-        return _NO_RECORD_NOTE
+    if standing == POC_REFUSED:
+        return _REFUSED_NOTE.format(reason=_quoted(str(record.get("reason") or "")))
     # The one reason core.py writes itself, rather than taking from the
     # drafter: the step was never asked for, so there is nothing to quote and
     # quoting it would read as a refusal the model made.
-    if not reason or reason == "not requested":
+    if standing == POC_NOT_REQUESTED:
         return _NOT_REQUESTED_NOTE
-    return _REFUSED_NOTE.format(reason=_quoted(reason))
+    return _NO_RECORD_NOTE
 
 
 #: The handed-over demo, as a template filled by substitution rather than an
@@ -466,15 +489,17 @@ case "$action" in
     seed "$variant"
     printf '%s' "$variant" > "$STATE"
     echo "Manual lab ready: $variant"
-    # The one address, and the one command that uses it, printed where the
-    # operator is already looking. The steps below reach the product by
-    # service name inside the lab's network and need none of this; PoC.py run
-    # by hand on this machine needs exactly this line, and the host port is
-    # assigned at `up` so there is nowhere else it could have been written
-    # down. `address` reprints it.
+    # The one address, and what it is good for, printed where the operator is
+    # already looking. The steps below reach the product by service name
+    # inside the lab's network and need none of this; remote mode run by hand
+    # on this machine needs exactly this line, and the host port is assigned
+    # at `up` so there is nowhere else it could have been written down.
+    # `address` reprints it. The second line is per lab, because for most labs
+    # remote mode refuses: a printed command that exits 2 reads as the kit
+    # being broken rather than as the drafter having refused the proof.
     if POC_AT="$(address "$variant")"; then
       echo "This build is reachable on $POC_AT"
-      echo "  python3 \"$LAB_ROOT/artifacts/PoC.py\" $POC_AT__COMMAND_HINT__"
+__POC_HINT__
     fi
     ;;
   address)
@@ -549,22 +574,43 @@ exit $LASTEXITCODE
 '''
 
 
+def _remote_arguments(record: dict) -> str:
+    """The `--input` flags remote mode needs, with this lab's own values.
+
+    Remote mode refuses to start without every input its spec declares, so a
+    command line printed without them cannot run -- and a library's own route
+    is declared as an input on 19 of the 29 archived specs that shipped. The
+    values are the lab's: the route its adapter serves, the account its setup
+    created. They are what makes the printed command work against the build
+    `manual.sh` has just started, they are already in plan.json's exploit
+    contract and in report.json, and the sentence beside them says a client's
+    are theirs. A name the lab recorded no value for is printed as a
+    placeholder, which is the honest form of "only you have this".
+    """
+    spec = record.get("spec") if isinstance(record.get("spec"), dict) else {}
+    values = record.get("lab_values")
+    values = values if isinstance(values, dict) else {}
+    return "".join(
+        f" --input {name}={values.get(name, '...')}"
+        for name in spec.get("inputs") or ()
+    )
+
+
 def _write_generic_manual_assets(
     cve: str,
     lab_dir: Path,
     artifacts: Path,
     vulnerable_only: bool,
-    report: dict | None = None,
     seeds: bool = False,
     port: int | None = None,
+    record: dict | None = None,
     executes: bool = False,
 ) -> None:
     """Write the kit the lab is handed over with: runner, wrapper and guide.
 
-    `report` is the dict `run_lab` returns. It is read for one thing only --
-    `manual_poc_field`, which is how the guide can say whether a
-    single-instance script exists for this lab and, where one was refused,
-    quote the drafter's own reason for refusing.
+    `record` is what `field.poc_record` read -- `report.manual_poc_field`, or
+    the old file beside an archived lab -- and the whole report is no longer
+    passed, because that one key was the only thing read from it.
 
     `seeds` says whether this lab's contract declares the state its attack
     needs. It changes only the guide: the runner keys on whether the seeding
@@ -579,17 +625,37 @@ def _write_generic_manual_assets(
     rather than parsed out of plan.json by the shell, so the script's only
     dependency stays Docker.
 
-    `executes` says the lab's declared evidence is command execution, which
-    is the one shape where the generated script takes a command as its second
-    argument. It changes what the guide shows and the hint `manual.sh` prints
-    beside the address; a lab of any other shape is shown neither, because
-    there a command has nothing to mean.
+    The record decides what the kit says about the address: whether remote
+    mode is there to be pointed at it, and with which arguments. `executes`
+    is the lab's declared evidence shape, and it decides the other command
+    printed beside the address: `--lab-address`, which runs the lab program
+    against this lab's own published build and prints what one command on it
+    returns. That is the form an owner demonstrates impact with, so it is
+    printed where they are already looking.
     """
+    record = record if isinstance(record, dict) else {}
+    proved = poc_standing(record) == POC_SHIPPED
     targets = ("vulnerable",) if vulnerable_only else ("vulnerable", "patched")
     patched_note = (
         "No patched target is available for this CVE."
         if vulnerable_only
         else "Repeat the same steps with `patched`; successful verification prints `BLOCKED`."
+    )
+    # One echo line per thing that can actually be pointed at this address,
+    # and a line saying so when there is neither: a printed command that
+    # exits 2 reads as the kit being broken rather than as the drafter having
+    # refused the proof.
+    poc = f'python3 \\"$LAB_ROOT/artifacts/{POC_NAME}\\"'
+    offers = []
+    if executes:
+        offers.append(f'      echo "  {poc} --lab-address $POC_AT id"')
+    if proved:
+        offers.append(
+            f'      echo "  {poc} $POC_AT{_remote_arguments(record)}"'
+        )
+    hint = "\n".join(offers) or (
+        f'      echo "  nothing here may be pointed at that address; see '
+        f'{LAB_POC_GUIDE_NAME}"'
     )
     manual_runner = (
         _MANUAL_RUNNER
@@ -597,7 +663,7 @@ def _write_generic_manual_assets(
         .replace("__SETUP_SERVICE__", policy.SETUP_SERVICE)
         .replace("__PORTS_FILE__", SHIPPED_MANUAL_PORTS_FILE)
         .replace("__SERVICE_PORT__", "" if port is None else str(port))
-        .replace("__COMMAND_HINT__", " id" if executes else "")
+        .replace("__POC_HINT__", hint)
         .replace("__USAGE_TARGETS__", "|".join(targets))
         .replace("__CASE_TARGETS__", "|".join(f'"{name}"' for name in targets))
     )
@@ -636,37 +702,62 @@ The steps and what they bind are recorded in `plan.json` under
 `exploit_contract.setup`.
 
 ''' if seeds else ""
-    # The section the whole change exists for: one address, and the line that
-    # uses it. `PoC.py` was `validator.py` with a six-line docstring on top --
-    # byte-identical otherwise in all 89 archived labs -- so this document
-    # told the reader to read it and then run `manual.sh`, which starts the
-    # same code inside the Compose network. Nothing published a host port and
-    # nothing read an argument, so there was no third thing to do with the
-    # script. Both halves are now here: the override `manual.sh` appends, and
-    # the argument the script takes.
+    # The section the whole merge exists for: one address, and what may be
+    # pointed at it. `PoC.py` was `validator.py` with a six-line docstring on
+    # top -- byte-identical otherwise in all 89 archived labs -- so this
+    # document told the reader to read it and then run `manual.sh`, which
+    # starts the same code inside the Compose network. Nothing published a
+    # host port and nothing read an argument, so there was no third thing to
+    # do with the script. Both halves are here now: the override `manual.sh`
+    # appends, and the mode the argument chooses.
+    #
+    # It says "rehearse" rather than "run it yourself", because that is what
+    # it is for. Remote mode is for an instance the operator is permitted to
+    # test, and this lab's own published build is the one such instance that
+    # costs nobody anything -- so the sentence that used to describe a second
+    # thing to do with the lab script now describes seeing the handover run
+    # end to end before it touches a client.
     #
     # Absent for a lab whose plan declares no port, which is every lab
-    # generated before the contract asked for one. The script in such a lab
-    # does not read an argument either, so a section telling its reader to
-    # pass one would describe a lab they do not have.
-    command_block = f'''
-This lab's declared evidence is command execution, so a second argument is one
-command to run on the target:
-
-```bash
-python3 PoC.py "$(bash manual.sh address vulnerable)" id
+    # generated before the contract asked for one.
+    # The command an owner demonstrates impact with, and the one thing on
+    # this page that is neither the lab's differential nor a client's server:
+    # the lab program, against the build `setup` has just published, with one
+    # command to run on it. Shown only where the lab's declared evidence is
+    # command execution, because that is the only shape where the program
+    # takes a command.
+    impact = f'''```bash
+bash manual.sh setup vulnerable
+python3 {POC_NAME} --lab-address "$(bash manual.sh address vulnerable)" id
 ```
 
-It delivers that command through the same weakness the differential proved and
-prints its output. With no command it runs this lab's own harmless canary, so
-the one-argument form is unchanged.
-''' if executes else ""
-    direct_section = f'''## Running PoC.py yourself
+That runs the lab program against this lab's own published build and prints
+what one command on it returns, which is how the impact of a reproduction is
+shown to someone watching. It reaches a build CVELab made and shows nothing
+about any other host: the address has to be on loopback, and an address that
+is not is refused. Which loopback port is this lab's `PoC.py` cannot check, so
+pointing it at another service of your own is yours to answer for.
 
-`PoC.py` is the script `exploit` runs inside the lab, and it takes one optional
-argument: the address of an instance that is already running. Given none it
-behaves exactly as it does inside the lab, which is the path automatic
-validation takes.
+''' if executes else ""
+    rehearsal = impact + f'''```bash
+bash manual.sh setup vulnerable
+python3 {POC_NAME} "$(bash manual.sh address vulnerable)"{_remote_arguments(record)}
+```
+
+{_REMOTE_ARGUMENT_NOTE if _remote_arguments(record) else ""}Remote mode holds one session for the whole run and performs whatever setup
+its own spec declares; CVELab establishes the lab's state for `exploit`, and a
+person running the script by hand has none of it.
+
+Where you point it is yours to answer for. It sends live requests to whatever
+address you give it, so give it only a host your engagement covers, and keep
+that authorization in writing.
+''' if proved else impact + f'''Remote mode refuses for this lab, so there is nothing of yours to point at
+that address: `python3 {POC_NAME} <address>` prints the recorded reason and
+exits 2 without sending anything. The section above carries that reason. Lab
+mode -- `{POC_NAME}` with no argument, which is what `exploit` runs inside the
+lab{', and `--lab-address` above' if executes else ''} -- is unaffected.
+'''
+    direct_section = f'''## The address this lab publishes
 
 `setup` publishes this build's container port {port} on loopback and prints the
 address the kernel assigned it. The host side is assigned at `setup`, so it is
@@ -684,43 +775,32 @@ reachable without credentials for as long as the lab is up, by anything running
 on this machine. `cleanup` removes the network with the project; run it when you
 are done rather than leaving the lab up.
 
-```bash
-bash manual.sh setup vulnerable
-python3 PoC.py "$(bash manual.sh address vulnerable)"
-```
-{command_block}
-Given an address the script holds one session for the whole run and performs this
-lab's declared setup steps itself: CVELab establishes that state for `exploit`
-and a person running the script by hand has none of it.
+{rehearsal}
+''' if port is not None else '''## The address this lab publishes
 
-Where you point it is yours to answer for. It sends live requests to whatever
-address you give it, so give it only a host your engagement covers, and keep
-that authorization in writing.
-
-''' if port is not None else '''## Running PoC.py yourself
-
-This lab was generated before the contract asked for the port the product listens
-on, so `manual.sh` publishes nothing, there is no host address to give `PoC.py`,
-and the script here reads no argument. Drive it with `exploit` and `verify`,
-which reach the product inside the lab's own network. Regenerating the lab
-produces a kit that publishes the port and a script that takes an address.
+It does not. This lab was generated before the contract asked for the port the
+product listens on, so `manual.sh` publishes nothing and there is no address on
+this machine to point anything at. Drive it with `exploit` and `verify`, which
+reach the product inside the lab's own network. Regenerating the lab produces a
+kit that publishes the port.
 
 '''
     # The title and the first two sections say the reach before anything
-    # else, because this document is read standing up. Both documents used to
-    # open with the identical line `# {{cve}} Manual PoC`, so the reader could
-    # not tell from the heading, the filename or the first paragraph which of
-    # the two reaches a live server. Only one does, and it is not this one.
-    single_instance = _single_instance_note(artifacts, report or {}, vulnerable_only)
+    # else, because this document is read standing up. The two documents this
+    # one replaced opened with the identical line `# {{cve}} Manual PoC`, so
+    # the reader could not tell from the heading, the filename or the first
+    # paragraph which of the two reached a live server.
+    single_instance = _single_instance_note(record, vulnerable_only)
     manual_guide = f'''# {cve} Lab PoC
 
 ## What this runs against
 
 {_LAB_REACH[vulnerable_only]} The one thing here that can
 be pointed at a client's server, a staging instance, or anything else outside
-this lab is that argument, and only where you are authorized to test it.
+this lab is `{POC_NAME}`'s remote mode, and only where you are authorized to
+test it.
 
-## Is there a version that runs against a live instance?
+## Can this be pointed at a live instance?
 
 {single_instance}
 
@@ -731,23 +811,25 @@ but leaves setup, exploitation, evidence verification, and cleanup as separate i
 
 Everything below needs Docker and this lab directory. Nothing else: not CVELab,
 and not a network route back to the machine that generated it. The one step that
-wants Python on the host is running `PoC.py` yourself, and it imports only the
-standard library.
+wants Python on the host is running `{POC_NAME}` yourself, and it imports only
+the standard library.
 
 ## Kali/Linux
 
 Run these from the lab's `artifacts/` directory, the one this file is in:
 
 ```bash
-sed -n '1,260p' PoC.py
+sed -n '1,120p' {POC_NAME}
 bash manual.sh setup vulnerable
 bash manual.sh exploit vulnerable
 bash manual.sh verify vulnerable
 bash manual.sh cleanup
 ```
 
-`manual.sh` finds the lab from its own path, so it runs from any directory;
-the block above is written for `artifacts/` because that is where `PoC.py` is.
+The first line is the artifact's own header, which says what each of its two
+modes is worth. `manual.sh` finds the lab from its own path, so it runs from any
+directory; the block above is written for `artifacts/` because that is where
+`{POC_NAME}` is.
 
 A confirmed vulnerable reproduction prints `REPRODUCED`. {patched_note}
 
@@ -780,8 +862,9 @@ distribution itself is another.
 
 {_EXIT_STATUS[vulnerable_only]}
 
-`manual.sh` takes Docker service names only; `PoC.py` takes one optional address, and
-where you point it is yours to answer for -- only a host your engagement authorizes.
+`manual.sh` takes Docker service names only. `{POC_NAME}` takes no argument for
+lab mode and one address for remote mode, and where you point that is yours to
+answer for -- only a host your engagement authorizes.
 '''
     write_text(artifacts / LAB_POC_GUIDE_NAME, manual_guide)
 
@@ -904,15 +987,17 @@ def create_deliverables(
     elif (artifacts / "analysis.json").is_file():
         analysis = json.loads((artifacts / "analysis.json").read_text(encoding="utf-8"))
 
+    # The one artifact, written here as well as by field.write_manual_poc,
+    # from the same validator and the same record, so the two agree byte for
+    # byte. This pass is the one that runs for every validated lab -- a lab
+    # built with no model configured never reaches the other -- and it is also
+    # what re-renders an archived lab, which is why the record is read back
+    # rather than taken from this run's report alone.
     validator = (lab_dir / "validator" / "validator.py").read_text(encoding="utf-8")
-    poc_header = (
-        f'"""Local-only verified exploit PoC for {cve}.\n\n'
-        f'Lab type: {plan["lab_type"]}. Scenario: {plan.get("scenario", "default")}.\n'
-        'This script is designed for the generated Docker lab, not remote targets.\n"""\n\n'
-    )
-    poc_path = artifacts / "PoC.py"
-    write_text(poc_path, poc_header + validator)
-    poc_name = "PoC.py"
+    record = poc_record(lab_dir, report)
+    poc_path = artifacts / POC_NAME
+    write_text(poc_path, emit_poc(cve, plan, validator, record))
+    poc_name = POC_NAME
     # Read once rather than per sentence. It was asked of the plan here and
     # then again below, which is one expression to keep in step with itself
     # for no gain: the manual assets and the prose have to agree about which
@@ -925,20 +1010,15 @@ def create_deliverables(
         # here -- `run_lab` refuses it before anything is built -- and if one
         # somehow did, the guard below is what says so.
         seeds = False
-    # The report goes in so the document can say whether a single-instance
-    # script exists for this lab and, where one was refused, quote the
-    # drafter's own reason. That reason is already in report.manual_poc_field,
-    # which run_lab writes for every run and hands back in the dict this
-    # function is called with -- so core.py needed no change to pass it.
-    # The declared port and the declared evidence shape, both read from the
-    # contract in plan.json and neither inferred. A lab that declares no port
-    # is an archived one, and gets the kit it always had.
-    contract = plan.get("exploit_contract")
-    contract = contract if isinstance(contract, dict) else {}
+    # The record goes in so the document can say whether remote mode was
+    # proved for this lab and, where it was refused, quote the drafter's own
+    # reason -- the same record the artifact's own header was built from, so
+    # the two cannot disagree. The declared port is read from the contract in
+    # plan.json and not inferred; a lab that declares none is an archived one,
+    # and gets the kit it always had.
     _write_generic_manual_assets(
-        cve, lab_dir, artifacts, vulnerable_only, report, seeds,
-        service_port(plan),
-        contract.get("evidence_type") == "code_execution",
+        cve, lab_dir, artifacts, vulnerable_only, seeds, service_port(plan), record,
+        _executes(plan),
     )
     # Where the guard in `core.run_lab` is settled, because this is the line
     # above that makes it answerable.
@@ -957,6 +1037,7 @@ def create_deliverables(
     # two reports disagreeing about one claim.
     shipping_gap = shipped_setup_gap(lab_dir, plan)
     claimed = report.get("manual_poc_status")
+    rewrite = False
     # Only where the manual PoC was claimed at all. "failed" and "not_run"
     # are verdicts on the actions, which this knows nothing about, and the
     # third shape is a report with no manual record of its own.
@@ -965,10 +1046,26 @@ def create_deliverables(
         if (claimed, report.get("manual_poc_shipping_gap")) != (settled, shipping_gap or None):
             report["manual_poc_status"] = settled
             report["manual_poc_shipping_gap"] = shipping_gap or None
-            write_text(
-                lab_dir / "report.json",
-                json.dumps(report, indent=2, ensure_ascii=True) + "\n",
-            )
+            rewrite = True
+    # The record, moved to the home it has now. An archived lab keeps its
+    # proved spec in the file beside it, which this pass has just read and is
+    # about to remove: without writing it here, the next re-render of that
+    # lab would find no spec anywhere and turn a proved remote mode into a
+    # refusal.
+    if record and report.get("manual_poc_field") != record:
+        report["manual_poc_field"] = record
+        rewrite = True
+    if rewrite:
+        write_text(
+            lab_dir / "report.json",
+            json.dumps(report, indent=2, ensure_ascii=True) + "\n",
+        )
+    # The three files the merged artifact absorbed, where an older CVELab
+    # left them. A stale `Manual-PoC.py` claiming to be the handover, beside
+    # a `PoC.py` that now is one, is the pair this merge replaced -- and the
+    # record above is why it is safe to take the third away.
+    for name in LEGACY_MANUAL_POC_NAMES:
+        (artifacts / name).unlink(missing_ok=True)
     write_text(artifacts / "plan.json", json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
 
     source_note = (
@@ -1103,8 +1200,12 @@ def create_deliverables(
 {source_note}
 
 The lab is restricted to a disposable local environment and uses a non-destructive exploit canary.
-The PoC has no arbitrary remote-target option. Automatic evidence is stored in
-`report.json` and `artifacts/EVIDENCE.json`.
+Everything automatic happens inside it: `cvelab run` gives `{poc_name}` no
+argument, which is the mode bound to this lab's Docker service names.
+`{poc_name}` also has a remote mode, for one address the operator supplies;
+`{LAB_POC_GUIDE_NAME}` says whether it was proved for this lab, and where it
+was not, that mode refuses with the recorded reason. Automatic evidence is
+stored in `report.json` and `artifacts/EVIDENCE.json`.
 
 ## Reproduction on Linux
 
@@ -1114,8 +1215,8 @@ cvelab run {cve}
 
 For an inspectable, step-by-step reproduction that keeps the lab running, follow
 `{LAB_POC_GUIDE_NAME}` and use `manual.sh`. Both reach this lab's own {'build' if vulnerable_only else 'two builds'}
-and nothing else; `{LAB_POC_GUIDE_NAME}` says whether a single-instance script
-exists for this lab, and if not, why not.
+and nothing else; `{LAB_POC_GUIDE_NAME}` says whether `{poc_name}` may also be
+pointed at an instance of your own, and if not, why not.
 
 ## Reproduction on Windows/WSL
 
@@ -1142,10 +1243,12 @@ For an inspectable, step-by-step reproduction that keeps the lab running, follow
 
 - `../docker-compose.yml`: isolated vulnerable{'' if vulnerable_only else ', patched'}, and validator services.
 - `../validator/validator.py`: executable real-effect validator.
-- `{poc_name}`: source-backed PoC executed against the vulnerable revision. With no argument it
-  runs as validation ran it; given one `host:port` it runs against that instead.
+- `{poc_name}`: the one PoC, in two modes. With no argument it is this lab's own
+  differential, as validation ran it; given one address it is the single-instance
+  script, which is proved per CVE and refuses where it was not. Its own header
+  says which of the two this lab has.
 - `manual.sh`: Linux runner with separate setup, exploit, verify, address, and cleanup actions.
-- `{LAB_POC_GUIDE_NAME}`: inspectable manual reproduction instructions. `manual.sh` reaches this lab's own {'build' if vulnerable_only else 'two builds'} only, and the guide says what giving the PoC an address of your own does and does not prove.
+- `{LAB_POC_GUIDE_NAME}`: inspectable manual reproduction instructions. `manual.sh` reaches this lab's own {'build' if vulnerable_only else 'two builds'} only, and the guide says what `{poc_name}` given an address of your own does and does not prove.
 - `EVIDENCE.json`: normalized evidence, proof checks, provenance, and fidelity metadata.
 - `REPORT.md`: validation result and limitations.
 
@@ -1389,11 +1492,11 @@ This result does not authorize or establish exploitability of any remote deploym
         "manual_poc": artifacts / "PoC.ps1",
         "manual_guide": artifacts / LAB_POC_GUIDE_NAME,
         "manual_runner": artifacts / "manual.sh",
-        # Written by run_lab, and only when it showed the effect on the
-        # vulnerable build and stayed silent on the fixed one, so its
-        # presence is the claim. Most labs will not have one.
-        "target_poc": artifacts / MANUAL_POC_NAME,
     }
+    # There is no separate single-instance script to list any more, so the
+    # claim is a key rather than a file: remote mode is inside `poc` above,
+    # and whether it was proved for this lab is one of four answers.
+    result["remote_mode"] = poc_standing(record)
     result["deliverables"].update({
         name: str(path) for name, path in optional_deliverables.items() if path.is_file()
     })
