@@ -828,15 +828,36 @@ def create_deliverables(
     automation = report.get("automation", {})
     artifacts = lab_dir / "artifacts"
     fidelity_record = _fidelity(plan)
+    # CVELab's own verdict, and nothing the validator wrote about itself. Two
+    # clauses are gone from this gate. The first required
+    # validation["proof_quality"] to equal one of two literals -- free text
+    # the model's own validator prints about its run -- while core.py had
+    # already removed exactly that string equality from the proof gate it
+    # decides with, and left the field in the report as the claim it is, with
+    # a non-decisive agreement note beside it; see `effect_observed`. So this
+    # file went on enforcing the check the other half of the project had
+    # abandoned, against the field that half had demoted, and the early
+    # return below writes nothing whatever: no PoC, no manual kit, no
+    # report, no walkthrough, no evidence. Measured over one benchmark tree:
+    # 40 labs whose automation.json says VALIDATED hold no artifacts/PoC.py,
+    # against 89 that do, splitting by batch date rather than by lab. Three
+    # read by hand had reproduced differentially and labelled themselves
+    # "wrapper_observed", "state_observation", and a sentence of behavioural
+    # prose about an adapter.
+    #
+    # The second clause asked `attack_executed` a second time. `ok` is
+    # all(proof_checks.values()) in both of core's validation paths, and
+    # attack_executed and security_effect_observed -- the computed answer
+    # that replaced the literal -- are two of those checks, so `ok` carries
+    # both already. Reading security_effect_observed back out of
+    # report["proof_checks"] here would be truthful but would add a third
+    # key whose absence drops the whole kit in silence, which is the defect
+    # and not the fix; the implication `ok` rests on is pinned in core's
+    # source by test_deliverables instead.
     real_poc_verified = (
         result.get("ok") is True
         and plan.get("lab_type") in _SOURCE_BACKED
         and report.get("real_poc_verified") is True
-        and validation.get("attack_executed") is True
-        and validation.get("proof_quality") in {
-            "security_effect_observed",
-            "end_to_end_security_effect_observed",
-        }
     )
     if not real_poc_verified:
         return {

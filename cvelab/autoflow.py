@@ -1329,10 +1329,48 @@ def run_auto_workflow(
                     json.dumps(validated["report"], indent=2, ensure_ascii=True) + "\n",
                 )
                 _record(lab_dir, attempts, "VALIDATED")
-                announce(f"{cve}: exploit, patched control, and manual PoC verified")
+                # Says what the run measured and stops there. It used to say
+                # "verified" and nothing else, printed before the deliverables
+                # were attempted, so the line an operator read as "done" was
+                # the last thing a run printed that shipped an empty artifacts
+                # directory.
+                announce(
+                    f"{cve}: exploit, patched control, and manual PoC verified; "
+                    "writing the deliverables"
+                )
                 delivered = create_deliverables(
                     cve, lab_dir, validated, api_key, model, provider, base_url
                 )
+                # Nobody read this status, and that is the whole of how a
+                # benchmark tree came to hold 40 labs recorded VALIDATED with
+                # no artifacts/PoC.py beside them: `create_deliverables` took
+                # its own refusal path, VALIDATED was already on disk from the
+                # _record above -- it is written before this call, not after
+                # -- and the run returned without a word about the kit it did
+                # not write. The gate it took has been corrected, but the
+                # silence is what let that hide until someone counted PoC.py
+                # files instead of reading statuses, so the contradiction now
+                # reaches both the operator and the record whatever causes it
+                # next.
+                #
+                # The status stays VALIDATED. The lab did reproduce its CVE
+                # differentially, which is what that word records, and
+                # demoting it to punish the packaging would throw the proof
+                # away -- the same reasoning core.run_lab applies to a kit
+                # that cannot seed. What must not survive is the impression
+                # that a kit was shipped, so the failure slot says otherwise.
+                if not delivered.get("ok"):
+                    gap = {
+                        "kind": "deliverables_not_written",
+                        "status": delivered.get("status"),
+                        "reason": delivered.get("reason"),
+                    }
+                    _record(lab_dir, attempts, "VALIDATED", gap)
+                    announce(
+                        f"{cve}: validated, but no deliverables were written "
+                        f"({gap['status'] or 'no status returned'}); there is no "
+                        "PoC, manual kit, report, or walkthrough beside this lab"
+                    )
                 delivered["automation"] = automation
                 return delivered
             report = validated.get("report", validated)

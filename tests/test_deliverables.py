@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import shutil
 import subprocess
@@ -21,7 +22,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cvelab import upload
+from cvelab import core, upload
 from cvelab.deliverables import (
     LAB_POC_GUIDE_NAME,
     MANUAL_POC_GUIDE_NAME,
@@ -705,6 +706,181 @@ class TheLabDocumentStatesItsReachTests(_DeliveredLabHarness):
             str(self.lab / "artifacts" / LAB_POC_GUIDE_NAME),
         )
         self.assertFalse((self.lab / "artifacts" / "MANUAL-POC.md").exists())
+
+
+class TheGateReadsTheComputedVerdictTests(unittest.TestCase):
+    """What decides whether a validated lab gets a kit at all.
+
+    The gate used to require validation["proof_quality"] to be one of two
+    literals. That field is free text the model's own validator prints about
+    its own run, and `core.effect_observed` exists because CVELab removed
+    exactly that string equality from the proof gate -- the thing being
+    judged was also the judge -- keeping the field as a claim with a
+    non-decisive agreement note beside it. deliverables.py kept enforcing it,
+    so a lab that reproduced differentially and then described itself in some
+    other words took the early return, which writes nothing: no PoC, no
+    manual kit, no report, no walkthrough, no evidence. Measured over one
+    benchmark tree, 40 labs recorded VALIDATED hold no artifacts/PoC.py
+    against 89 that do.
+
+    Both directions are pinned here. A lab that did not prove must still get
+    nothing, or the repair is just a wider hole.
+    """
+
+    CVE = "CVE-2099-1003"
+
+    #: Written by validators in the measured tree, none of which the old gate
+    #: accepted, and the last of which is a whole sentence: the field is prose
+    #: and no list of allowed spellings could have been long enough.
+    LABELS = (
+        "wrapper_observed",
+        "state_observation",
+        "behavioral: the published release ran behind an HTTP adapter",
+    )
+
+    def lab(self, proof_quality: str = "wrapper_observed") -> Path:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        lab = Path(temporary.name) / self.CVE
+        (lab / "validator").mkdir(parents=True)
+        plan = {
+            "cve": self.CVE,
+            "cwe": "CWE-22",
+            "lab_type": "SOURCE_REPRODUCTION",
+            "repository": "https://example.invalid/vendor/project.git",
+            "revisions": {"vulnerable": "a" * 40, "patched": "b" * 40},
+            "exploit_contract": {
+                "attack_summary": "Send the local canary request.",
+                "preconditions": ["Docker"],
+                "observable_effect": "Protected canary is returned.",
+                "evidence_type": "unauthorized_read",
+            },
+            "fidelity": {
+                "execution_level": "source_component",
+                "vendor_product_started": False,
+                "exercised_vendor_components": ["vendor parser"],
+                "simulated_components": [],
+                "rationale": "The parser is real.",
+            },
+            "safety": {"target_scope": "internal_docker_network_only"},
+        }
+        (lab / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+        (lab / "dossier.json").write_text(
+            json.dumps({"source": "unit-test", "descriptions": ["Test CVE"]}),
+            encoding="utf-8",
+        )
+        (lab / "validator" / "validator.py").write_text(
+            "# CVELAB_MANUAL_ACTION CVELAB_TARGET exploit verify\n", encoding="utf-8"
+        )
+        self.proof_quality = proof_quality
+        return lab
+
+    def result(self, **overrides: object) -> dict:
+        """The dict core.run_lab returns for a lab that proved.
+
+        Four of the old gate's five conditions, exactly as the measured labs
+        carried them, and the fifth -- the label -- is whatever the validator
+        wrote.
+        """
+        report = {
+            "validated_at": "2099-01-01T00:00:00Z",
+            "validation": {
+                "attack_executed": True,
+                "proof_quality": self.proof_quality,
+                "observable_effect": "Protected canary is returned.",
+                "evidence_type": "unauthorized_read",
+                "vulnerable": {"confirmed": True, "raw_observations": {"status": 200}},
+                "patched": {"confirmed": False, "blocked": True},
+                "differential_confirmed": True,
+            },
+            "proof_contract": {"evidence_type": "unauthorized_read"},
+            "proof_checks": {"vulnerable_confirmed": True, "security_effect_observed": True},
+            "real_poc_verified": True,
+            "product_e2e_verified": False,
+        }
+        report.update(overrides.pop("report_extra", {}) or {})
+        return {"ok": True, "report": report, **overrides}
+
+    #: The whole kit, by the names a reader looks for. The measured labs held
+    #: none of these and reported success.
+    KIT = ("PoC.py", "manual.sh", LAB_POC_GUIDE_NAME, "REPORT.md", "WALKTHROUGH.md", "EVIDENCE.json")
+
+    def test_a_validated_lab_that_labelled_itself_otherwise_still_ships(self) -> None:
+        for label in self.LABELS:
+            with self.subTest(proof_quality=label):
+                lab = self.lab(label)
+
+                delivered = create_deliverables(self.CVE, lab, self.result())
+
+                self.assertTrue(delivered["ok"], delivered)
+                for name in self.KIT:
+                    self.assertTrue((lab / "artifacts" / name).is_file(), name)
+                # The claim still travels, undecided, where a reader can
+                # compare it with what CVELab measured.
+                evidence = json.loads(
+                    (lab / "artifacts" / "EVIDENCE.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(evidence["validation"]["proof_quality"], label)
+
+    def test_a_run_that_did_not_prove_still_gets_nothing(self) -> None:
+        """The early return has to keep firing, or this is a wider hole.
+
+        One case per surviving clause, each otherwise a lab that proved.
+        """
+        failures = {
+            "ok": {"ok": False},
+            "lab_type": {"report_extra": {}},
+            "real_poc_verified": {"report_extra": {"real_poc_verified": False}},
+        }
+        for clause, overrides in failures.items():
+            with self.subTest(clause=clause):
+                lab = self.lab()
+                if clause == "lab_type":
+                    plan = json.loads((lab / "plan.json").read_text(encoding="utf-8"))
+                    plan["lab_type"] = "SYNTHETIC_CLASS_LAB"
+                    (lab / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+
+                delivered = create_deliverables(self.CVE, lab, self.result(**overrides))
+
+                self.assertFalse(delivered["ok"], delivered)
+                self.assertEqual(delivered["status"], "POC_NOT_VERIFIED")
+                for name in self.KIT:
+                    self.assertFalse((lab / "artifacts" / name).exists(), name)
+
+    def test_the_gate_no_longer_reads_the_validators_own_label(self) -> None:
+        """Read off the source, because the behaviour above cannot tell a gate
+        that ignores the field from one that happens to accept every spelling
+        a test thought to try. `proof_quality` is still rendered further down
+        the same function, as a claim, which is why only the gate is read.
+        """
+        source = inspect.getsource(create_deliverables)
+        gate = source[
+            source.index("real_poc_verified = (") : source.index("if not real_poc_verified:")
+        ]
+
+        self.assertNotIn("proof_quality", gate)
+        self.assertIn('result.get("ok") is True', gate)
+        self.assertIn('report.get("real_poc_verified") is True', gate)
+        self.assertIn("proof_quality", source)
+
+    def test_the_implication_the_gate_leans_on_is_still_true_in_core(self) -> None:
+        """`ok` is the computed verdict, so the gate does not re-read it.
+
+        That holds only while every proof check is ANDed into `ok` and
+        `security_effect_observed` is one of them, in both of core's
+        validation paths -- the Docker one and the curated-runner one. If
+        either stops being true, the gate in deliverables.py is reading
+        something weaker than it claims and this test is the notice.
+        """
+        source = Path(core.__file__).read_text(encoding="utf-8")
+
+        self.assertIn("real_source_proof = all(proof_checks.values())", source)
+        self.assertIn("validated = real_source_proof", source)
+        self.assertIn("validated = all(proof_checks.values())", source)
+        self.assertEqual(source.count('"security_effect_observed": effect_held'), 2)
+        self.assertEqual(
+            source.count('"attack_executed": validation.get("attack_executed") is True'), 2
+        )
 
 
 if __name__ == "__main__":

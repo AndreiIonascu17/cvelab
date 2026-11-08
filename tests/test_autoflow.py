@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -161,6 +162,96 @@ class AutonomousWorkflowTests(unittest.TestCase):
             self.assertEqual(result["status"], "AUTO_REPAIR_EXHAUSTED")
             self.assertEqual(run.call_count, 2)
             repair.assert_not_called()
+
+
+class AValidatedLabThatShippedNoKitSaysSoTests(unittest.TestCase):
+    """The status `create_deliverables` returns, which nothing used to read.
+
+    VALIDATED is written to automation.json before the deliverables are
+    attempted, and the call's result was dropped into the returned dict
+    without being looked at. So when the deliverables gate took its refusal
+    path, the run recorded a validated lab, printed a line reading as
+    completion, and returned with nothing in artifacts/ -- measured as 40
+    labs in one benchmark tree against 89 with a kit. The gate that caused
+    it is fixed; this is about the silence, which would hide the next cause
+    just as well.
+    """
+
+    CVE = "CVE-2026-12345"
+
+    REFUSED = {
+        "ok": False,
+        "status": "POC_NOT_VERIFIED",
+        "reason": "The real vulnerable source path did not produce a verified security effect.",
+    }
+
+    def auto(self, delivered: dict) -> tuple[dict, list[str], dict]:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        lab = root / self.CVE
+        generated = {
+            "ok": True,
+            "status": "GENERATED_UNVALIDATED",
+            "lab_dir": str(lab),
+            "plan": {},
+        }
+        passed = {"ok": True, "report": {"proof_checks": {"manual_poc_verified": True}}}
+        lines: list[str] = []
+        with (
+            mock.patch("cvelab.autoflow.generate_source_lab", return_value=generated),
+            mock.patch("cvelab.autoflow.run_lab", return_value=passed),
+            mock.patch("cvelab.autoflow.create_deliverables", return_value=delivered),
+        ):
+            result = run_auto_workflow(
+                self.CVE, root, None, None, None,
+                "key", "model", False, max_attempts=1, progress=lines.append,
+            )
+        return result, lines, json.loads((lab / "automation.json").read_text("utf-8"))
+
+    def test_the_operator_is_told_the_kit_is_missing(self) -> None:
+        _result, lines, _record = self.auto(self.REFUSED)
+
+        said = "\n".join(lines)
+        self.assertIn("validated, but no deliverables were written", said)
+        self.assertIn("POC_NOT_VERIFIED", said)
+        self.assertIn("no PoC, manual kit, report, or walkthrough", said)
+
+    def test_the_record_keeps_the_contradiction(self) -> None:
+        """automation.json is the file a batch operator reads afterwards, and
+        the only place the two halves of this can be compared: the status the
+        validation earned, and the kit that was not written for it.
+
+        The status stays VALIDATED on purpose. The lab reproduced, which is
+        what the word records; what is corrected is the impression that a
+        deliverable exists, so that lands in the failure slot beside it.
+        """
+        _result, _lines, record = self.auto(self.REFUSED)
+
+        self.assertEqual(record["status"], "VALIDATED")
+        self.assertEqual(record["failure"]["kind"], "deliverables_not_written")
+        self.assertEqual(record["failure"]["status"], "POC_NOT_VERIFIED")
+        self.assertIn("verified security effect", record["failure"]["reason"])
+
+    def test_a_run_that_shipped_its_kit_records_no_gap(self) -> None:
+        delivered = {"ok": True, "status": "REAL_SOURCE_POC_VALIDATED", "deliverables": {}}
+
+        result, lines, record = self.auto(delivered)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(record["status"], "VALIDATED")
+        self.assertNotIn("failure", record)
+        self.assertNotIn("no deliverables were written", "\n".join(lines))
+
+    def test_the_verified_line_no_longer_speaks_for_the_kit(self) -> None:
+        """It is printed before `create_deliverables` is called -- it cannot
+        know -- so it says what the run measured and that the kit is next.
+        """
+        _result, lines, _record = self.auto(self.REFUSED)
+
+        verified = [line for line in lines if "manual PoC verified" in line]
+        self.assertEqual(len(verified), 1, lines)
+        self.assertTrue(verified[0].endswith("writing the deliverables"), verified)
 
 
 if __name__ == "__main__":
