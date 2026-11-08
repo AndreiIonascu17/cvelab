@@ -1030,6 +1030,14 @@ SHIPPED_SETUP_FILE = "cvelab-setup.json"
 #: Both builds are in one file. `manual.sh` starts one of them, so the other
 #: service's entry is inert: a `ports` on a service nothing started publishes
 #: nothing.
+#:
+#: It also carries a network of CVELab's, which is what makes the `ports`
+#: entries do anything: a service whose networks are all internal publishes
+#: nothing, and Docker drops the mapping rather than refusing it, so for as
+#: long as this file held `ports` alone `manual.sh` printed `:0` as the
+#: address of a container that had no host port at all.
+#: `policy.MANUAL_NETWORK` holds the measurement; the lab's own
+#: docker-compose.yml still declares one internal network and no ports.
 SHIPPED_MANUAL_PORTS_FILE = "cvelab-manual-ports.json"
 
 
@@ -1228,15 +1236,23 @@ def prepare_compose(
         # manual_port_override for one would raise on a lab that is
         # perfectly well formed.
         published: dict[str, object] = {}
+        # The network the publication lands on, carried out of the override
+        # rather than composed here: one network for the whole file however
+        # many builds it names, and both overrides declare the same one, so
+        # the two updates collapse onto each other. This function goes on
+        # knowing nothing about what publishing a port takes.
+        publishing_network: dict[str, object] = {}
         for build in ("vulnerable", "patched"):
             if build in (model.get("services") or {}):
-                published.update(
-                    policy.manual_port_override(model, build, manual_port)["services"]
-                )
+                override = policy.manual_port_override(model, build, manual_port)
+                published.update(override["services"])
+                publishing_network.update(override["networks"])
         if published:
             write_lab_file(
                 lab_dir / "artifacts" / SHIPPED_MANUAL_PORTS_FILE,
-                json.dumps({"services": published}, indent=2) + "\n",
+                json.dumps(
+                    {"networks": publishing_network, "services": published}, indent=2
+                ) + "\n",
             )
     # Outside the lab directory, which is the lab's to shape: a symlink
     # there would turn this write into one anywhere.

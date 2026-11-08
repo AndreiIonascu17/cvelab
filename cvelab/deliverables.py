@@ -315,11 +315,17 @@ COMPOSE=(docker compose -f "$LAB_ROOT/docker-compose.yml" --project-directory "$
 # The one port this lab publishes, on loopback, with the host side left for
 # the kernel to assign. It is a Compose file of CVELab's merged over the
 # lab's, exactly as the seeding below is -- the lab's own docker-compose.yml
-# still publishes nothing and its network is still internal. Without it the
-# product is reachable only from inside that network, which is where the
-# steps below reach it either way; this is what gives PoC.py an address on
-# this machine. A lab generated before this existed ships no such file, takes
-# neither branch, and runs exactly as it did.
+# still publishes nothing and its own network is still internal, which is why
+# that file also brings a network of CVELab's for the publication to land on:
+# a service whose networks are all internal publishes nothing, and Docker
+# drops the mapping silently rather than refusing it, which is what used to
+# print ":0" here as an address. That network carries no NAT, so this build is
+# reachable from this machine while its own outbound connections still go
+# nowhere an ordinary route can answer, and `cleanup` removes it with the
+# project. Without the file the product is reachable only from inside the
+# lab's network, which is where the steps below reach it either way; this is
+# what gives PoC.py an address on this machine. A lab generated before this
+# existed ships no such file, takes neither branch, and runs exactly as it did.
 if [[ -n "$SERVICE_PORT" && -f "$PORTS" ]]; then
   COMPOSE+=(-f "$PORTS")
 fi
@@ -667,6 +673,17 @@ address the kernel assigned it. The host side is assigned at `setup`, so it is
 different every run and there is no constant to write down -- `address` reprints
 the current one.
 
+That publication is the one loosening in this lab, and it lives in
+`{SHIPPED_MANUAL_PORTS_FILE}` beside this file rather than in
+`docker-compose.yml`: a Compose file `manual.sh` merges and CVELab's own run
+never does. Docker will not publish a port for a service whose networks are all
+internal, so that file also attaches this build to a second network that is not
+internal -- carrying no NAT, so the build is reachable from this machine while
+its own outbound connections still go nowhere an ordinary route answers. It is
+reachable without credentials for as long as the lab is up, by anything running
+on this machine. `cleanup` removes the network with the project; run it when you
+are done rather than leaving the lab up.
+
 ```bash
 bash manual.sh setup vulnerable
 python3 PoC.py "$(bash manual.sh address vulnerable)"
@@ -759,7 +776,7 @@ distribution itself is another.
 - `exploit` sends the exact local attack and prints the raw observation without deciding the result.
 - `verify` repeats the controls and evaluates the declared security effect.
 - `address` reprints the host address this build was published on.
-- `cleanup` removes this Compose project's containers, network, and volumes.
+- `cleanup` removes this Compose project's containers, networks, and volumes.
 
 {_EXIT_STATUS[vulnerable_only]}
 
