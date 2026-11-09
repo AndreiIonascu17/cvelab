@@ -51,7 +51,7 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
-from cvelab import core, deliverables, policy, sourcegen, upload
+from cvelab import core, deliverables, field, policy, sourcegen, upload
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "operator_validator.py"
 PACKAGE = Path(__file__).resolve().parent.parent / "cvelab"
@@ -379,6 +379,143 @@ class TheAddressPathTests(unittest.TestCase):
         without = fixture_source().replace("sys.argv", "ARGV")
         with self.assertRaisesRegex(RuntimeError, "no positional argument"):
             sourcegen._validate_generated(generated_files(without))
+
+
+class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
+    """`--shell`, measured against the script the contract is satisfiable by.
+
+    The fixture beside these tests is the smallest validator
+    `_OPERATOR_CONTRACT` admits, and it implements the one-command form the
+    contract asks for in prose. So the prompt can be measured here the way
+    nothing else in the suite can: a real two-entry-point validator, a real
+    product on a real socket, and a line typed at a prompt arriving as a
+    request.
+
+    What is held: that a typed line reaches the lab program's own address
+    path and nowhere else, that each line is one invocation and therefore one
+    session -- the session the contract makes that path build for itself --
+    and that none of this is reachable with no argument at all, which is the
+    path the automatic differential takes.
+    """
+
+    def plan(self, **extra: object) -> dict:
+        held = {
+            "cve": "CVE-2026-0001",
+            "lab_type": "SOURCE_REPRODUCTION",
+            "repository": "https://example.invalid/p.git",
+            "exploit_contract": contract(),
+            "fidelity": {"simulated_components": ["an adapter over the helper"]},
+        }
+        held.update(extra)
+        return held
+
+    def artifact(self, **extra: object) -> str:
+        return field.emit_poc(
+            "CVE-2026-0001", self.plan(**extra),
+            FIXTURE.read_text(encoding="utf-8"),
+            {"shipped": False, "reason": "nothing was proved against one instance"},
+        )
+
+    def ran(
+        self, text: str, *argv: str, typed: str = "", port: str = ""
+    ) -> tuple[str, str, int]:
+        environment = dict(os.environ)
+        for name in ("CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "CVELAB_BOUND"):
+            environment.pop(name, None)
+        if port:
+            environment["CVELAB_FIXTURE_PORT"] = port
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / field.POC_NAME
+            path.write_text(text, encoding="utf-8")
+            finished = subprocess.run(
+                [sys.executable, str(path), *argv], input=typed,
+                capture_output=True, text=True, timeout=120, env=environment,
+            )
+        return finished.stdout, finished.stderr, finished.returncode
+
+    def test_the_prompt_is_offered_for_a_validator_that_implements_the_form(self) -> None:
+        offered, reason = field.shell_standing(
+            self.plan(), FIXTURE.read_text(encoding="utf-8")
+        )
+        self.assertTrue(offered, reason)
+        self.assertIn("--shell", self.artifact())
+
+    def test_a_typed_line_arrives_at_the_product_as_one_command(self) -> None:
+        with stub(seeded=False) as (address, asked):
+            said, complained, code = self.ran(
+                self.artifact(), "--lab-address", address, "--shell", "--allow-shell",
+                typed="id\n", port=address.rsplit(":", 1)[1],
+            )
+        self.assertEqual(code, 0, complained)
+        # The address path's own session, built for that line and used by it:
+        # the stub refuses /run to a caller that has not logged in.
+        self.assertEqual([path for path, _ in asked], ["/login", "/run"])
+        self.assertEqual(
+            [query.get("cmd") for path, query in asked if path == "/run"], [["id"]]
+        )
+        self.assertIn("uid=0(root)", said)
+        # This validator prints its status line first, which does not read
+        # like the drafter's output header -- so nothing is stripped and
+        # everything it printed is here.
+        self.assertIn("status: 200", said)
+        self.assertIn("REPRODUCED", said)
+
+    def test_each_line_is_its_own_invocation_and_its_own_session(self) -> None:
+        with stub(seeded=False) as (address, asked):
+            said, complained, code = self.ran(
+                self.artifact(), "--lab-address", address, "--shell", "--allow-shell",
+                typed="id\necho two\nexit\n", port=address.rsplit(":", 1)[1],
+            )
+        self.assertEqual(code, 0, complained)
+        self.assertEqual(
+            [path for path, _ in asked], ["/login", "/run", "/login", "/run"]
+        )
+        self.assertEqual(
+            [query.get("cmd") for path, query in asked if path == "/run"],
+            [["id"], ["echo two"]],
+        )
+        self.assertEqual(said.count("REPRODUCED"), 2)
+
+    def test_the_directory_it_tracks_rides_on_the_command_itself(self) -> None:
+        with stub(seeded=False) as (address, asked):
+            self.ran(
+                self.artifact(), "--lab-address", address, "--shell", "--allow-shell",
+                typed="cd /srv\nls\n", port=address.rsplit(":", 1)[1],
+            )
+        self.assertEqual(
+            [query.get("cmd") for path, query in asked if path == "/run"],
+            [["cd /srv && ls"]],
+        )
+
+    def test_the_no_argument_path_is_unchanged_with_the_prompt_in_the_file(self) -> None:
+        """The path every proof rests on, measured with the mode present."""
+        text = self.artifact()
+        self.assertIn("_shell_given(sys.argv)", text)
+        with tempfile.TemporaryDirectory() as temporary:
+            alone = Path(temporary) / "validator.py"
+            alone.write_text(FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+            merged = Path(temporary) / field.POC_NAME
+            merged.write_text(text, encoding="utf-8")
+            environment = dict(os.environ)
+            for name in ("CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "CVELAB_BOUND"):
+                environment.pop(name, None)
+            runs = [
+                subprocess.run(
+                    [sys.executable, str(script)], capture_output=True, text=True,
+                    timeout=60, env=environment,
+                )
+                for script in (merged, alone)
+            ]
+        self.assertEqual(runs[0].stdout, runs[1].stdout)
+        self.assertEqual(runs[0].returncode, runs[1].returncode)
+
+    def test_a_lab_that_declares_no_port_is_offered_no_prompt(self) -> None:
+        text = self.artifact(exploit_contract=None)
+        self.assertNotIn("--shell", text)
+        self.assertNotIn("--allow-shell", text)
+        _, complained, code = self.ran(text, "--shell", "--allow-shell")
+        self.assertEqual(code, 2)
+        self.assertIn("no remote mode", complained)
 
 
 class TheGenerationContractSaysSoTests(unittest.TestCase):
