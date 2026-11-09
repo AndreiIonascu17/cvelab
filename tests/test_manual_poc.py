@@ -1226,6 +1226,629 @@ class TheLabAddressFlagTests(unittest.TestCase):
         self.assertIn("shows nothing about any other host", " ".join(guide.split()))
 
 
+class ThePromptTests(unittest.TestCase):
+    """`--shell`: a prompt over the one-command form, and not a session.
+
+    WHY IT IS A PROMPT AND NOT A CHANNEL
+
+    For a lab whose evidence is command execution, one echoed command proves
+    execution and a terminal proves control -- and the artifact could only do
+    the first: `--lab-address ADDRESS COMMAND` runs one command per
+    invocation, imposed, because `_lab_address` rewrites argv into the shape
+    the lab program already takes. What the lower half implements is a
+    request/response oracle, so the half above it runs that oracle in a loop:
+    one process per line, the lab program's own exit status per line, and no
+    attack of CVELab's anywhere. `sourcegen` is untouched, and "validator.py
+    has two entry points and must have exactly two" stays true.
+
+    WHAT THESE TESTS HOLD
+
+    That each line really does go through `--lab-address` and never as a bare
+    address, which would be remote mode -- a different program against a
+    different spec. That output is printed and the cosmetic strip of the
+    drafter's header line cannot lose any of it. That `cd` is tracked here
+    and said to be. That every refusal exits 2 and says why, including the
+    flag that has to be asked for. And that a lab which cannot support the
+    mode carries no trace of it: the form the prompt drives is asked for in
+    the generation contract's prose with no check behind it, so it is read
+    out of the validator and the reason is printed where the operator reads
+    it when it is missing.
+    """
+
+    CONTRACT = {
+        "service_port": 8080,
+        "evidence_type": "code_execution",
+        "attack_summary": "GET /run?cmd= reaches a shell through the adapter",
+    }
+    PLAN = {
+        "cve": "CVE-2026-0001",
+        "lab_type": "SOURCE_REPRODUCTION",
+        "scenario": "default",
+        "repository": "https://example.invalid/p.git",
+        "exploit_contract": CONTRACT,
+        "fidelity": {
+            "simulated_components": [
+                "HTTP listener adapter/server.js: the project ships no server, so "
+                "the adapter exposes the helper over GET /run",
+            ],
+        },
+    }
+    #: A lab program with the one-command form, written the way the two
+    #: archived labs that have it are: the command is the second positional,
+    #: its output goes under a line of prose saying so, and a command that did
+    #: not run exits non-zero with the observation instead.
+    LAB = (
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "\n"
+        "def main():\n"
+        "    argv = sys.argv\n"
+        "    if len(argv) == 1:\n"
+        "        print(os.environ.get('CVELAB_MANUAL_ACTION', 'differential'))\n"
+        "        return 0\n"
+        "    if len(argv) > 3:\n"
+        "        print('usage: %s [<host>:<port>] [command]'\n"
+        "              % os.path.basename(argv[0]), file=sys.stderr)\n"
+        "        return 2\n"
+        "    print('address in use: ' + argv[1], file=sys.stderr)\n"
+        "    if len(argv) == 2:\n"
+        "        print('REPRODUCED')\n"
+        "        return 0\n"
+        "    command = argv[2]\n"
+        "    if command.startswith('boom'):\n"
+        "        print('observation: the route answered 404')\n"
+        "        print('BLOCKED')\n"
+        "        return 1\n"
+        "    if not command.startswith('quiet'):\n"
+        "        print('the following is the command output:')\n"
+        "    print('ran %s against %s' % (command, argv[1]))\n"
+        "    return 0\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    sys.exit(main())\n"
+    )
+    #: The same program with the second positional refused rather than read,
+    #: which is what 32 of the 34 archived command-execution labs do.
+    NO_COMMAND = (
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "\n"
+        "def main():\n"
+        "    argv = sys.argv\n"
+        "    if len(argv) > 2:\n"
+        "        print('usage: %s [<host>:<port>]'\n"
+        "              % os.path.basename(argv[0]), file=sys.stderr)\n"
+        "        return 2\n"
+        "    if len(argv) == 2:\n"
+        "        print('REPRODUCED')\n"
+        "        return 0\n"
+        "    print(os.environ.get('CVELAB_MANUAL_ACTION', 'differential'))\n"
+        "    return 0\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    sys.exit(main())\n"
+    )
+    #: The same form again, with the command's output printed on its own and
+    #: no line of prose over it. The contract asks for that line in prose and
+    #: checks nothing, so a lab program that prints none is admitted by the
+    #: same reading of the validator that admits the two that do -- and what
+    #: arrives on stdout is then the command's own first line.
+    RAW = (
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "\n"
+        "def main():\n"
+        "    argv = sys.argv\n"
+        "    if len(argv) == 3:\n"
+        "        print(argv[2])\n"
+        "        return 0\n"
+        "    if len(argv) == 2:\n"
+        "        print('REPRODUCED')\n"
+        "        return 0\n"
+        "    return 0\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    sys.exit(main())\n"
+    )
+
+    def artifact(
+        self,
+        record: dict[str, Any] | None = None,
+        plan: dict | None = None,
+        validator: str | None = None,
+    ) -> str:
+        proved = {
+            "shipped": True, "container_port": 8080,
+            "spec": field.validate_spec(_spec()),
+        }
+        return field.emit_poc(
+            "CVE-2026-0001",
+            self.PLAN if plan is None else plan,
+            self.LAB if validator is None else validator,
+            proved if record is None else record,
+        )
+
+    def ran(
+        self, text: str, *argv: str, typed: str = "", name: str = field.POC_NAME
+    ) -> subprocess.CompletedProcess:
+        """The artifact run as a file, with lines typed at it."""
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        path = Path(root.name) / name
+        path.write_text(text, encoding="utf-8")
+        return subprocess.run(
+            [sys.executable, str(path), *argv], input=typed,
+            capture_output=True, text=True, timeout=120,
+            env={"PATH": os.environ["PATH"]},
+        )
+
+    def prompted(self, typed: str, **kept: Any) -> subprocess.CompletedProcess:
+        return self.ran(
+            self.artifact(**kept), "--lab-address", "127.0.0.1:32768",
+            "--shell", "--allow-shell", typed=typed,
+        )
+
+    # --- the line it builds -----------------------------------------------
+
+    def test_each_line_is_one_run_of_the_flag_and_never_a_bare_address(self) -> None:
+        """The one line in this mode that cannot be written another way.
+
+        `_poc_entry` hands a bare argv[1] to remote mode's `main()`, which is
+        a different program drafted against a different spec; `--lab-address`
+        is the only branch that falls through to the lab program with the
+        address where that program reads it. So the invocation is pinned as
+        text, and then measured on a lab with no remote mode, where a bare
+        address prints the recorded reason and sends nothing.
+        """
+        text = self.artifact()
+        self.assertIn(
+            '[sys.executable, __file__, "--lab-address", address, command]', text
+        )
+        refused = self.artifact({"shipped": False, "reason": "the effect is internal"})
+        done = self.ran(
+            refused, "--lab-address", "127.0.0.1:32768", "--shell", "--allow-shell",
+            typed="id\n",
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "ran id against 127.0.0.1:32768\n")
+        self.assertNotIn("the effect is internal", done.stdout)
+        self.assertNotIn("the effect is internal", done.stderr)
+
+    def test_the_address_may_be_given_in_either_spelling(self) -> None:
+        done = self.ran(
+            self.artifact(), "--lab-address=127.0.0.1:32768", "--shell",
+            "--allow-shell", typed="id\n",
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "ran id against 127.0.0.1:32768\n")
+
+    def test_the_output_is_printed_with_the_drafters_header_line_dropped(self) -> None:
+        done = self.prompted("id\npwd\n")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(
+            done.stdout,
+            "ran id against 127.0.0.1:32768\n"
+            "ran pwd against 127.0.0.1:32768\n",
+        )
+        self.assertNotIn("the following is the command output", done.stdout)
+
+    def test_a_first_line_that_is_not_that_header_is_printed_whole(self) -> None:
+        """The strip is cosmetic and must never be able to lose output.
+
+        The contract asks for the line in prose and does not spell it, and
+        the real validator written to it prints `status: 200` first -- so
+        anything that does not read like the header is output and all of it
+        is printed.
+        """
+        done = self.prompted("quiet first\n")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "ran quiet first against 127.0.0.1:32768\n")
+
+    def test_output_that_reads_like_the_header_is_still_output(self) -> None:
+        """The strip is matched as a label, because it can lose output.
+
+        A lab program that prints the output with no line of prose over it --
+        which the contract permits, because it asks for that line in prose and
+        checks nothing -- puts the command's own first line where the label
+        would be. Matched as a phrase, `echo 'command output is here'` lost
+        every byte it produced, silently and at exit 0. Matched as a whole
+        line ending in the colon both written labels end in, it does not: an
+        output line is a line of output and almost never a caption for itself.
+        """
+        done = self.prompted(
+            "command output is here\ncommand output:\n", validator=self.RAW
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "command output is here\n")
+
+    def test_a_line_that_is_the_address_flag_is_refused_before_it_is_sent(self) -> None:
+        """The one line this prompt cannot deliver through the form it drives.
+
+        The typed line is one argument of a run of `--lab-address ADDRESS
+        COMMAND`, and that run reads the flag wherever it appears -- so a line
+        that IS the flag replaces the address and leaves the lab program with
+        no command at all. That program then prints its own differential, so
+        `--lab-address=127.0.0.1:32768` typed as a command used to put
+        `REPRODUCED` on stdout, where the command's output goes, at exit 0.
+        Refused here by name, with nothing sent, and a line that merely
+        contains the flag is still delivered as typed.
+        """
+        done = self.prompted(
+            "--lab-address=127.0.0.1:32768\n--lab-address\necho --lab-address=x\n"
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "ran echo --lab-address=x against 127.0.0.1:32768\n")
+        self.assertNotIn("REPRODUCED", done.stdout)
+        self.assertEqual(done.stderr.count("That line is --lab-address itself"), 2)
+        self.assertIn("Nothing was sent", done.stderr)
+
+    def test_a_line_that_did_not_run_is_not_printed_as_output(self) -> None:
+        """Exit non-zero on this form means the command did not run.
+
+        What the lab program prints then is its own observation -- BLOCKED,
+        or the response it got -- and reading that as the command's answer is
+        the one mistake a prompt makes easy, so it goes to stderr with a line
+        saying what it is.
+        """
+        done = self.prompted("boom\n")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "")
+        self.assertIn("BLOCKED", done.stderr)
+        self.assertIn("the command did not run", done.stderr)
+
+    # --- the directory it tracks ------------------------------------------
+
+    def test_cd_is_tracked_here_and_prefixed_to_every_line(self) -> None:
+        done = self.prompted('cd /srv\npwd\ncd app\npwd\ncd "/a b"\npwd\ncd\npwd\n')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(
+            [line.partition(" against ")[0] for line in done.stdout.splitlines()],
+            [
+                "ran cd /srv && pwd",
+                "ran cd /srv/app && pwd",
+                "ran cd '/a b' && pwd",
+                "ran pwd",
+            ],
+        )
+
+    def test_a_line_that_joins_commands_is_sent_as_it_was_typed(self) -> None:
+        """Its `cd` is real and lasts exactly as long as that one command,
+        which is what the prompt would be claiming if it tracked it.
+        """
+        done = self.prompted("cd /srv && pwd\npwd\n")
+        self.assertEqual(
+            [line.partition(" against ")[0] for line in done.stdout.splitlines()],
+            ["ran cd /srv && pwd", "ran pwd"],
+        )
+
+    def test_the_prompt_says_the_directory_is_simulated(self) -> None:
+        done = self.prompted("cd /srv\n")
+        self.assertIn("[cd simulated] .$", done.stderr)
+        self.assertIn("[cd simulated] /srv$", done.stderr)
+
+    def test_an_empty_line_sends_nothing_and_exit_leaves(self) -> None:
+        for typed in ("exit\n", "quit\n", "\n\n\n", ""):
+            with self.subTest(typed=typed):
+                done = self.prompted(typed)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(done.stdout, "")
+
+    # --- what it says before the first line -------------------------------
+
+    def test_it_says_what_it_is_not_before_anything_is_typed(self) -> None:
+        said = " ".join(self.prompted("").stderr.split())
+        for sentence in (
+            "a prompt, not a session",
+            "Each line you type is ONE command",
+            "no persistent environment",
+            "no interactive programs",
+            "no job control, no signals",
+            "no line editing and no history",
+            "`cd` is simulated",
+        ):
+            with self.subTest(sentence=sentence):
+                self.assertIn(sentence, said)
+
+    def test_it_says_where_the_operator_actually_is(self) -> None:
+        """The honesty this mode is measured against.
+
+        Of the archived labs whose evidence is command execution, none has
+        the vendor's product serving the route the attack goes to. So the
+        prompt names the route, quotes the `simulated_components` entry that
+        declares it, and says what the effect is not evidence of -- in the
+        lab's own words, before the first command is typed and again in the
+        header.
+        """
+        said = " ".join(self.prompted("").stderr.split())
+        header = self.artifact().split('"""')[1]
+        lab = header[header.index("LAB MODE"):header.index("REMOTE MODE")]
+        for text in (said, " ".join(lab.split())):
+            with self.subTest(where="prompt" if text is said else "header"):
+                self.assertIn("GET /run?cmd= reaches a shell through the adapter", text)
+                self.assertIn("declares that route simulated", text)
+                self.assertIn("adapter exposes the helper over GET /run", text)
+                self.assertIn("adapter CVELab's model wrote", text)
+                self.assertIn(
+                    "evidence of nothing at all about any other host", text
+                )
+
+    def test_a_lab_that_recorded_nothing_is_not_told_the_route_is_genuine(self) -> None:
+        """What the silence in the fidelity record is allowed to be read as.
+
+        An empty `simulated_components` is ambiguous, and this file says so
+        itself where it hands the same field to a drafter: it can mean nothing
+        was simulated, which is the best case, or that the lab said nothing.
+        `vendor_product_started` is what tells them apart, and
+        `deliverables._fidelity` resolves the same silence the same way --
+        assuming an unspecified adapter for a lab that recorded none. So the
+        one sentence here that says the route is the product's own is said
+        only where the lab recorded that the product started, and the silence
+        reads as not recorded rather than as real access.
+        """
+        plans = {
+            "no fidelity at all": {
+                key: value for key, value in self.PLAN.items() if key != "fidelity"
+            },
+            "an empty list and nothing else": dict(
+                self.PLAN, fidelity={"simulated_components": []}
+            ),
+            "an empty list and the product not started": dict(
+                self.PLAN,
+                fidelity={
+                    "simulated_components": [], "vendor_product_started": False,
+                },
+            ),
+        }
+        for name, plan in plans.items():
+            with self.subTest(plan=name):
+                said = " ".join(field._shell_where_you_are(plan).split())
+                self.assertIn("does not say what answers this route", said)
+                self.assertIn("Read that as not recorded", said)
+                self.assertNotIn("the route is the product's own", said)
+                self.assertIn(
+                    "evidence of nothing at all about any other host", said
+                )
+        started = dict(
+            self.PLAN,
+            fidelity={"simulated_components": [], "vendor_product_started": True},
+        )
+        said = " ".join(field._shell_where_you_are(started).split())
+        self.assertIn("records the vendor's own product starting", said)
+        self.assertIn("so the route is the product's own", said)
+
+    def test_it_names_the_file_it_was_run_as(self) -> None:
+        """The same artifact is delivered under one name and run under another."""
+        text = self.artifact()
+        for name in (field.POC_NAME, "validator.py"):
+            with self.subTest(name=name):
+                done = self.ran(
+                    text, "--lab-address", "127.0.0.1:32768", "--shell",
+                    "--allow-shell", typed="", name=name,
+                )
+                self.assertIn(f"{name} --lab-address 127.0.0.1:32768 --shell", done.stderr)
+
+    def test_the_header_and_the_help_both_offer_it(self) -> None:
+        header = self.artifact().split('"""')[1]
+        lab = header[header.index("LAB MODE"):header.index("REMOTE MODE")]
+        self.assertIn(
+            "python3 PoC.py --lab-address 127.0.0.1:32768 --shell --allow-shell\n",
+            lab,
+        )
+        said = " ".join(self.ran(self.artifact(), "--help").stdout.split())
+        self.assertIn("--lab-address ADDRESS --shell --allow-shell", said)
+        self.assertIn("--allow-shell is required and not implied", said)
+
+    # --- every refusal ----------------------------------------------------
+
+    def test_it_is_refused_without_the_flag_that_asks_for_it(self) -> None:
+        """The precedent is --allow-disruption: every other mode in the file
+        asks no more of what it is pointed at than an ordinary request.
+        """
+        done = self.ran(
+            self.artifact(), "--lab-address", "127.0.0.1:32768", "--shell",
+            typed="id\n",
+        )
+        self.assertEqual(done.returncode, 2)
+        self.assertEqual(done.stdout, "")
+        self.assertIn("Re-run with --allow-shell", done.stderr)
+        self.assertIn("you are permitted to do it", done.stderr)
+
+    def test_it_refuses_a_command_on_the_command_line(self) -> None:
+        done = self.ran(
+            self.artifact(), "--lab-address", "127.0.0.1:32768", "--shell",
+            "--allow-shell", "id", typed="",
+        )
+        self.assertEqual(done.returncode, 2)
+        self.assertEqual(done.stdout, "")
+        self.assertIn("different jobs", done.stderr)
+        self.assertIn("--lab-address ADDRESS COMMAND", done.stderr)
+
+    def test_it_refuses_to_be_mixed_with_remote_mode(self) -> None:
+        done = self.ran(
+            self.artifact(), "--lab-address", "127.0.0.1:32768", "--shell",
+            "--allow-shell", "--input", "target_path=/theirs", typed="",
+        )
+        self.assertEqual(done.returncode, 2)
+        self.assertEqual(done.stdout, "")
+        self.assertIn("different jobs", done.stderr)
+        self.assertIn("--input belongs to remote", done.stderr)
+
+    def test_it_cannot_be_used_without_an_address(self) -> None:
+        done = self.ran(self.artifact(), "--shell", "--allow-shell", typed="id\n")
+        self.assertEqual(done.returncode, 2)
+        self.assertEqual(done.stdout, "")
+        self.assertIn("not optional", done.stderr)
+
+    def test_an_address_this_lab_cannot_have_published_is_refused(self) -> None:
+        done = self.ran(
+            self.artifact(), "--lab-address", "10.0.0.5:8080", "--shell",
+            "--allow-shell", typed="id\n",
+        )
+        self.assertEqual(done.returncode, 2)
+        self.assertEqual(done.stdout, "")
+        self.assertIn("not an address this lab published", done.stderr)
+
+    # --- the gate ---------------------------------------------------------
+
+    def test_a_lab_that_declares_no_port_carries_no_trace_of_it(self) -> None:
+        plan = dict(self.PLAN)
+        plan.pop("exploit_contract")
+        text = self.artifact(plan=plan)
+        for absent in ("--shell", "--allow-shell", "no prompt in this file"):
+            with self.subTest(absent=absent):
+                self.assertNotIn(absent, text)
+        done = self.ran(text, "--shell", "--allow-shell", typed="id\n")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("unrecognized arguments", done.stderr)
+
+    def test_a_lab_with_no_command_evidence_carries_no_trace_of_it(self) -> None:
+        plan = dict(
+            self.PLAN,
+            exploit_contract=dict(self.CONTRACT, evidence_type="unauthorized_read"),
+        )
+        text = self.artifact(plan=plan)
+        for absent in ("--shell", "--allow-shell", "no prompt in this file"):
+            with self.subTest(absent=absent):
+                self.assertNotIn(absent, text)
+        self.assertEqual(
+            field.shell_standing(plan, self.LAB)[0], False
+        )
+        self.assertIn(
+            "declared evidence is unauthorized_read",
+            field.shell_standing(plan, self.LAB)[1],
+        )
+
+    def test_a_validator_without_the_command_form_gets_no_prompt(self) -> None:
+        """The design amendment, and the whole reason for reading the
+        validator: nothing in generation enforces the one-command form.
+
+        `sourcegen._validate_generated` checks for the bare token `sys.argv`
+        and nothing else, and the second positional is asked for in
+        `_OPERATOR_CONTRACT`'s prose with no check behind it. Of the archived
+        labs that declare a port and command execution, the ones that
+        implement it are the ones generated under the contract. A prompt over
+        a form the lab program refuses is a prompt where every line exits 2.
+        """
+        text = self.artifact(validator=self.NO_COMMAND)
+        for absent in ("--shell", "--allow-shell"):
+            with self.subTest(absent=absent):
+                self.assertNotIn(absent, text)
+        offered, reason = field.shell_standing(self.PLAN, self.NO_COMMAND)
+        self.assertFalse(offered)
+        self.assertIn("takes an address and no command", reason)
+        # And the reason is printed where the operator reads it, not left in
+        # report.json: this lab qualified in every way its own contract
+        # states and the mode is missing anyway.
+        header = text.split('"""')[1]
+        lab = " ".join(
+            header[header.index("LAB MODE"):header.index("REMOTE MODE")].split()
+        )
+        self.assertIn("There is no prompt in this file", lab)
+        self.assertIn("takes an address and no command", lab)
+
+    def test_the_command_form_is_read_through_the_spellings_that_exist(self) -> None:
+        """Conservative, because the two costs are not symmetric.
+
+        A false negative is a missing mode on a lab that would have
+        supported it; a false positive is a shipped shell that cannot work.
+        The three positives are the two archived labs that implement the form
+        and the fixture written to the contract by hand.
+        """
+        found = (
+            "def main():\n    argv = sys.argv\n    print(argv[2])\n",
+            "def main(argv):\n    rest = argv[1:]\n    print(rest[1])\n"
+            "main(sys.argv)\n",
+            "def address_mode(argv):\n    print(argv[1])\n"
+            "address_mode(sys.argv[1:])\n",
+            Path(sourcegen.__file__).parent.parent.joinpath(
+                "tests", "fixtures", "operator_validator.py"
+            ).read_text(encoding="utf-8"),
+        )
+        for source in found:
+            with self.subTest(source=source[:40]):
+                self.assertTrue(field._reads_a_second_positional(source))
+        missing = (
+            "def main():\n    print(sys.argv[1])\n",
+            "def main(argv):\n    print(argv[0], argv[1])\nmain(sys.argv)\n",
+            # A refusal is not an implementation, and a slice is as often one
+            # as the other -- so a slice is never read as an implementation.
+            "def main():\n    if sys.argv[2:]:\n        return 2\n",
+            "def main():\n    print(sys.argv[1:])\n",
+            # Not parseable here is not a reading of the text either.
+            "def main(:\n",
+        )
+        for source in missing:
+            with self.subTest(source=source[:40]):
+                self.assertFalse(field._reads_a_second_positional(source))
+
+    # --- the structure it may not disturb ---------------------------------
+
+    def test_nothing_of_cvelabs_is_below_the_marker(self) -> None:
+        for record in (None, {"shipped": False, "reason": "no"}, {}):
+            with self.subTest(record=record):
+                text = self.artifact({} if record is None else record)
+                self.assertIn("--shell", text)
+                self.assertEqual(
+                    text.partition(field.POC_LAB_MODE_MARKER)[2], self.LAB
+                )
+
+    def test_no_argument_at_all_is_still_untouched(self) -> None:
+        """The non-negotiable, with the prompt in the file."""
+        with tempfile.TemporaryDirectory() as root:
+            alone = Path(root) / "validator.py"
+            alone.write_text(self.LAB, encoding="utf-8")
+            merged = Path(root) / field.POC_NAME
+            merged.write_text(self.artifact(), encoding="utf-8")
+            for action in ("", "exploit"):
+                with self.subTest(action=action):
+                    environment = {"PATH": os.environ["PATH"]}
+                    if action:
+                        environment["CVELAB_MANUAL_ACTION"] = action
+                    one = subprocess.run(
+                        [sys.executable, str(merged)], capture_output=True,
+                        text=True, timeout=60, env=environment,
+                    )
+                    two = subprocess.run(
+                        [sys.executable, str(alone)], capture_output=True,
+                        text=True, timeout=60, env=environment,
+                    )
+                    self.assertEqual(one.stdout, two.stdout)
+                    self.assertEqual(one.returncode, two.returncode)
+
+    def test_the_two_writers_still_agree_byte_for_byte(self) -> None:
+        """The prompt is a pure function of the plan and the validator.
+
+        Two modules write this artifact -- `field.write_manual_poc` from the
+        record it has just proved, `deliverables.create_deliverables` from the
+        record it reads back -- and the claim that the script CVELab proved is
+        the one the operator receives rests on them agreeing. A mode that read
+        a clock, an environment variable or the filesystem would break that.
+        """
+        spec = field.validate_spec(_spec())
+        with tempfile.TemporaryDirectory() as root:
+            lab_dir = Path(root) / "CVE-2026-0001"
+            (lab_dir / "validator").mkdir(parents=True)
+            (lab_dir / "validator" / "validator.py").write_text(
+                self.LAB, encoding="utf-8"
+            )
+            (lab_dir / "report.json").write_text(
+                json.dumps({"real_poc_verified": True}), encoding="utf-8"
+            )
+            field.write_manual_poc(
+                "CVE-2026-0001", lab_dir, self.PLAN, spec, 8080,
+                {"shipped": True, "proof_checks": {}, "runs": {},
+                 "script": "ignored: write_manual_poc re-emits it"},
+            )
+            written = (lab_dir / "artifacts" / field.POC_NAME).read_text()
+            rendered = field.emit_poc(
+                "CVE-2026-0001", self.PLAN,
+                (lab_dir / "validator" / "validator.py").read_text(),
+                field.poc_record(lab_dir),
+            )
+        self.assertEqual(written, rendered)
+        self.assertIn("--shell", written)
+
+
 class EverythingTravelsTests(unittest.TestCase):
     """The merged script goes to the shared corpus whole, remote mode included.
 
