@@ -450,7 +450,7 @@ The patched snapshot is taken back off disk, but only once the answer has
 validated and the demoted `plan.json` is about to be written. Deleting it when
 the demotion was decided meant a provider that declined, or a Ctrl-C, left the
 tree, its stamp and `patched/` gone while `plan.json` still said
-`SOURCE_REPRODUCTION`, and the next `cvelab run` failed its preflight on a lab
+`SOURCE_REPRODUCTION`, and the next validation run failed its preflight on a lab
 that had worked. The stamp is unlinked before the tree it vouches for, so an
 interrupt mid-delete always leaves a state that re-extracts rather than one
 where an intact stamp hides a truncated snapshot, and nothing in the deletion
@@ -1009,9 +1009,9 @@ it gave, or when you know something the lab does not: a credential, a tenant
 id, the one route that matters.
 
 Generating labs and demonstrating one on a server are separate jobs, so
-`run`, `auto`, `source-all` and `all` do **not** do this. A batch run gives you
-the labs and their `PoC.py`, and nothing else. Pass `--manual-poc` to those
-commands if you do want it inline; the answer then lands in `report.json` under
+`auto` does **not** do this. A batch run gives you
+the labs and their `PoC.py`, and nothing else. Pass `--manual-poc` to that
+command if you do want it inline; the answer then lands in `report.json` under
 `manual_poc_field`, and `--manual-poc-provider` sends just that call elsewhere.
 
 Either way "not observable on one instance" is the expected answer for most

@@ -321,17 +321,3 @@ def price_for(model: str) -> tuple[float, float] | None:
         if model in provider.prices:
             return provider.prices[model]
     return None
-
-
-def as_dicts() -> list[dict]:
-    """The table as data, for anything that is not Python."""
-    return [
-        {
-            "name": p.name,
-            "label": p.label,
-            "requires_key": p.requires_key,
-            "web_search": p.web_search,
-            "models": list(p.models),
-        }
-        for p in PROVIDERS.values()
-    ]

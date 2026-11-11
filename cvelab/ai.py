@@ -38,20 +38,6 @@ from .providers import (
 )
 from .providers import get as get_provider
 
-PLAN_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["cwe", "confidence", "rationale", "source_hints", "manual_inputs"],
-    "properties": {
-        "cwe": {"type": "string"},
-        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-        "rationale": {"type": "string"},
-        "source_hints": {"type": "array", "items": {"type": "string"}},
-        "manual_inputs": {"type": "array", "items": {"type": "string"}},
-    },
-}
-
-
 # Derived, never maintained by hand: see cvelab/providers.py.
 SUPPORTED_PROVIDERS = set(SELECTABLE)
 PROVIDER_KEY_VARIABLE = {p.name: p.key_variable for p in PROVIDERS.values()}
@@ -881,38 +867,3 @@ def structured_response(
         result = attempt(other)
     _validate_schema(result, schema)
     return result
-
-
-def plan_with_ai(
-    dossier: dict,
-    api_key: str | None = None,
-    model: str | None = None,
-    provider: str | None = None,
-    base_url: str | None = None,
-) -> dict:
-    return structured_response(
-        api_key=api_key,
-        model=model,
-        max_output_tokens=1800,
-        schema=PLAN_SCHEMA,
-        schema_name="cvelab_plan",
-        instructions=(
-            "You classify CVE metadata for an authorized local defensive research lab. "
-            "Return classification and source hints only; do not design or expand a reproduction procedure. "
-            "Prefer the explicit CWE in the dossier."
-        ),
-        input_text=json.dumps(dossier, ensure_ascii=True),
-        provider=provider,
-        base_url=base_url,
-    )
-
-
-def plan_with_openai(
-    dossier: dict,
-    api_key: str | None = None,
-    model: str | None = None,
-    provider: str | None = None,
-    base_url: str | None = None,
-) -> dict:
-    """Backward-compatible alias for callers using the original public helper."""
-    return plan_with_ai(dossier, api_key, model, provider, base_url)

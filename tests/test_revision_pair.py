@@ -751,60 +751,53 @@ class RepoAloneIsRefusedRatherThanDroppedTests(unittest.TestCase):
     given a repository and nothing else resolved the CVE record's own commit
     instead -- which may belong to a different repository than the one that
     was named, and the operator was told nothing. closed-auto was given a
-    guard for exactly this; the three subcommands that build from source
-    were not.
+    guard for exactly this; the subcommand that builds from source was not.
     """
 
     REPO = "https://github.com/example/widget.git"
 
     def run_cli(self, *arguments: str) -> tuple[int, str]:
         errors = io.StringIO()
-        with mock.patch.object(cli, "generate_source_lab") as generate, \
-                mock.patch.object(cli, "run_auto_workflow") as auto, \
+        with mock.patch.object(cli, "run_auto_workflow") as auto, \
                 redirect_stderr(errors), redirect_stdout(io.StringIO()):
             code = cli.main(list(arguments))
-        generate.assert_not_called()
         auto.assert_not_called()
         return code, errors.getvalue()
 
-    def test_every_source_subcommand_refuses_a_repository_with_no_revision(self) -> None:
-        for command in ("auto", "source", "source-all"):
-            with self.subTest(command=command):
-                code, errors = self.run_cli(command, "CVE-2026-0003", "--repo", self.REPO)
-                self.assertEqual(code, 1)
-                self.assertIn("--repo names a repository to take a revision from", errors)
+    def test_a_repository_with_no_revision_is_refused(self) -> None:
+        code, errors = self.run_cli("auto", "CVE-2026-0003", "--repo", self.REPO)
+        self.assertEqual(code, 1)
+        self.assertIn("--repo names a repository to take a revision from", errors)
 
     def test_a_revision_with_no_repository_is_refused_as_well(self) -> None:
         """The other half of the same silence: `fixed_ref` alone is dropped too."""
-        for command in ("auto", "source", "source-all"):
-            with self.subTest(command=command):
-                code, errors = self.run_cli(command, "CVE-2026-0003", "--fixed-ref", "a" * 40)
-                self.assertEqual(code, 1)
-                self.assertIn("--fixed-ref names a revision in a repository", errors)
+        code, errors = self.run_cli("auto", "CVE-2026-0003", "--fixed-ref", "a" * 40)
+        self.assertEqual(code, 1)
+        self.assertIn("--fixed-ref names a revision in a repository", errors)
 
     def test_a_repository_with_a_vulnerable_revision_is_still_accepted(self) -> None:
         """A vulnerable-only lab is `--repo` with `--vulnerable-ref` and no fix.
 
         The symmetric check closed-auto uses would have refused this, and it
-        is a combination generate_source_lab supports on purpose.
+        is a combination the source generator supports on purpose.
         """
         with mock.patch.object(
-            cli, "generate_source_lab", return_value={"ok": True}
-        ) as generate, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            cli, "run_auto_workflow", return_value={"ok": True}
+        ) as auto, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             code = cli.main([
-                "source", "CVE-2026-0003", "--repo", self.REPO,
-                "--vulnerable-ref", "a" * 40,
+                "auto", "CVE-2026-0003", "--repo", self.REPO,
+                "--vulnerable-ref", "a" * 40, "--no-upload",
             ])
         self.assertEqual(code, 0)
-        generate.assert_called_once()
+        auto.assert_called_once()
 
     def test_neither_flag_is_still_the_ordinary_run(self) -> None:
         with mock.patch.object(
-            cli, "generate_source_lab", return_value={"ok": True}
-        ) as generate, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            code = cli.main(["source", "CVE-2026-0003"])
+            cli, "run_auto_workflow", return_value={"ok": True}
+        ) as auto, redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = cli.main(["auto", "CVE-2026-0003", "--no-upload"])
         self.assertEqual(code, 0)
-        generate.assert_called_once()
+        auto.assert_called_once()
 
 
 if __name__ == "__main__":
