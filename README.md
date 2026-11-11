@@ -304,34 +304,13 @@ This is a proof of the vulnerability, but it does not validate remediation. The 
 | --- | --- |
 | `doctor` | Checks the environment before a run spends time and money. |
 | `auto` | Resolves information, builds the lab, runs the PoC, and produces deliverables. |
-| `run` | Runs a previously generated lab again. |
-| `source` | Generates a source-level lab using explicit Git references. |
-| `source-all` | Generates and runs the source-level lab. |
-| `build` | Generates a CWE-class lab; this is not a real product PoC. |
-| `all` | Generates and runs the CWE-class lab. |
 | `closed-auto` | Resolves requirements for a closed-source product and uses a registered local artifact. |
 | `closed` | Builds the closed-source reproduction from the catalog. |
 
-Run an existing lab again:
+Generate a source-level lab with explicit Git references:
 
 ```powershell
-cvelab --output-root "C:\OffSec Lab\cvelab\generated-labs" run CVE-YYYY-NNNNN
-```
-
-Generate a source-level lab explicitly:
-
-```powershell
-cvelab source CVE-YYYY-NNNNN `
-  --repo https://github.com/owner/project.git `
-  --vulnerable-ref <vulnerable-commit> `
-  --fixed-ref <fix-commit> `
-  --ai on --key --model gpt-5.6-sol
-```
-
-Generate and run in a single command:
-
-```powershell
-cvelab source-all CVE-YYYY-NNNNN `
+cvelab auto CVE-YYYY-NNNNN `
   --repo https://github.com/owner/project.git `
   --vulnerable-ref <vulnerable-commit> `
   --fixed-ref <fix-commit> `
@@ -452,7 +431,7 @@ Do not put the key in files, commits, screenshots, or public examples. If a key 
 
 ## Docker Desktop on Windows
 
-Before running `auto` or `run`, Docker must respond:
+Before running `auto`, Docker must respond:
 
 ```powershell
 docker version
@@ -498,7 +477,7 @@ docker info
 
 - Labs are intended for authorized research.
 - Generated services are restricted to loopback and the internal Docker network.
-- Before any build, `run` checks the resolved Compose model against an allowlist:
+- Before any build, CVELab checks the resolved Compose model against an allowlist:
   internal networks only, no host ports, mounts, devices, capabilities, privileged
   mode, host namespaces, `env_file`, secrets, `include` or `extends`, and builds only
   from inside the lab. Docker gets a minimal environment without your keys or tokens.

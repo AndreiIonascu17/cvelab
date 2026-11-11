@@ -43,7 +43,6 @@ from cvelab.core import (
     runtime_flags,
     runtime_limits,
 )
-from cvelab.templates import compose_yaml
 
 LAB = Path(tempfile.gettempdir()) / "labs" / "CVE-2026-0001"
 
@@ -263,15 +262,6 @@ class SourcePolicyTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertIn(fragment, "\n".join(policy.check_source(text)))
-
-    def test_generated_labs_pass(self) -> None:
-        honest = compose_yaml("CWE-22", "CVELAB-x", 20000, 20001) + (
-            "# a comment\n"
-            "x-h: ['CMD', 'ruby', '-e', 'exit(r.is_a?(Net::HTTPOK) ? 0 : 1)']\n"
-            "x-v: ${CVELAB_TARGET:-}\n"
-            "x-s: \"$$(printf 'x' | od -An -tx1)\"\n"
-        )
-        self.assertEqual(policy.check_source(honest), [])
 
     def test_the_line_is_named(self) -> None:
         self.assertIn("line 3", policy.check_source("services:\n  a:\n    extends: x\n")[0])
@@ -684,10 +674,6 @@ class DockerComposeTests(unittest.TestCase):
         (lab / "docker-compose.yml").write_text(text, encoding="utf-8")
         docker = shutil.which("docker") or "docker"
         return policy.enforce(compose_command(docker, lab), lab, docker_environment(docker))
-
-    def test_the_template_passes(self) -> None:
-        resolved = self.enforce(compose_yaml("CWE-22", "CVELAB-x", 20000, 20001))
-        self.assertIn("validator", resolved["services"])
 
     def test_spellings_the_substring_checks_missed_are_refused(self) -> None:
         base = "services:\n  vulnerable:\n    image: alpine\n    networks: [lab]\n{extra}networks:\n  lab: {{internal: true}}\n"

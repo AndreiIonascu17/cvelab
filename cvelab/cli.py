@@ -28,14 +28,11 @@ from .autoflow import run_auto_workflow
 from .closed import run_closed_lab
 from .closed_auto import run_closed_auto
 from .core import (
-    build_lab,
     normalize_cve,
     redact,
     register_environment_secrets,
     register_secret,
-    run_lab,
 )
-from .deliverables import create_deliverables
 from .doctor import doctor_command
 from .field import (
     draft_only,
@@ -46,7 +43,6 @@ from .field import (
 )
 from .providers import SELECTABLE
 from .providers import get as get_provider
-from .sourcegen import generate_source_lab
 
 
 def _locate_lab(cve: str, where: Path) -> Path:
@@ -186,34 +182,6 @@ def parser() -> argparse.ArgumentParser:
     )
     sub = root.add_subparsers(dest="command", required=True)
 
-    build = sub.add_parser("build", help="Collect metadata and generate a lab")
-    build.add_argument("cve")
-    build.add_argument("--cwe", help="Override CWE when public metadata is incomplete")
-    build.add_argument("--ai", choices=("off", "auto", "on"), default="auto")
-    add_ai_credentials(build)
-
-    source = sub.add_parser("source", help="Generate from vulnerable source, with a fixed revision when public")
-    source.add_argument("cve")
-    source.add_argument("--repo", help="Public GitHub or GitLab HTTPS repository")
-    source.add_argument("--fixed-ref", help="Commit containing the security fix")
-    source.add_argument("--vulnerable-ref", help="Vulnerable commit (default: parent of fixed commit)")
-    add_source_steering(source)
-    add_ai_credentials(source)
-
-    source_all = sub.add_parser(
-        "source-all",
-        help="Generate from source and validate vulnerable versus patched end-to-end",
-    )
-    source_all.add_argument("cve")
-    source_all.add_argument("--repo", help="Public GitHub or GitLab HTTPS repository")
-    source_all.add_argument("--fixed-ref", help="Commit containing the security fix")
-    source_all.add_argument("--vulnerable-ref", help="Vulnerable commit (default: parent of fixed commit)")
-    add_source_steering(source_all)
-    source_all.add_argument("--keep", action="store_true", help="Keep containers running")
-    add_manual_poc_options(source_all)
-    add_ai_credentials(source_all)
-    add_upload_flags(source_all)
-
     auto = sub.add_parser(
         "auto",
         help="Choose the best lab strategy, validate it, and emit PoC, walkthrough, and report",
@@ -275,12 +243,6 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print what would be sent and send nothing",
     )
-
-    run = sub.add_parser("run", help="Build containers and validate the available source variants")
-    run.add_argument("cve")
-    run.add_argument("--keep", action="store_true", help="Keep containers running")
-    add_manual_poc_options(run)
-    add_upload_flags(run)
 
     closed = sub.add_parser(
         "closed",
@@ -378,13 +340,6 @@ def parser() -> argparse.ArgumentParser:
     closed_auto.add_argument("--fixed-ref", help="Commit containing the security fix")
     add_ai_credentials(closed_auto)
 
-    all_cmd = sub.add_parser("all", help="Generate and validate a lab")
-    all_cmd.add_argument("cve")
-    all_cmd.add_argument("--cwe", help="Override CWE when public metadata is incomplete")
-    all_cmd.add_argument("--ai", choices=("off", "auto", "on"), default="auto")
-    add_ai_credentials(all_cmd)
-    all_cmd.add_argument("--keep", action="store_true", help="Keep containers running")
-    add_manual_poc_options(all_cmd)
     return root
 
 
@@ -557,11 +512,11 @@ def _run_command(args: argparse.Namespace) -> int:
                 args.output_root, provider, model, api_key, base_url,
                 args.offline, args.json,
             )
-        if args.command in {"auto", "source", "source-all"}:
+        if args.command == "auto":
             # The same silence closed-auto was given a guard for below, on the
-            # three subcommands that actually build from source. resolve_source
-            # honours `repo` only together with `fixed_ref`, and
-            # generate_source_lab honours it alone only with `--vulnerable-ref`
+            # subcommand that actually builds from source. resolve_source
+            # honours `repo` only together with `fixed_ref`, and the source
+            # generator honours it alone only with `--vulnerable-ref`
             # for a vulnerable-only lab, so `--repo` by itself was accepted,
             # dropped, and the CVE record's own commit used instead -- which
             # may belong to a different repository than the one that was named.
@@ -580,12 +535,7 @@ def _run_command(args: argparse.Namespace) -> int:
                     "--fixed-ref names a revision in a repository: pass --repo with it, "
                     "or pass neither and let the CVE record resolve both"
                 )
-        if args.command == "build":
-            result = build_lab(
-                args.cve, args.output_root, args.cwe, args.ai,
-                api_key, model, provider, base_url,
-            )
-        elif args.command == "auto":
+        if args.command == "auto":
             result = run_auto_workflow(
                 args.cve,
                 args.output_root,
@@ -602,26 +552,6 @@ def _run_command(args: argparse.Namespace) -> int:
                 research_mode=args.research,
                 after_validation=after_validation,
             )
-        elif args.command in {"source", "source-all"}:
-            generated = generate_source_lab(
-                args.cve,
-                args.output_root,
-                args.repo,
-                args.fixed_ref,
-                args.vulnerable_ref,
-                api_key,
-                model,
-                provider,
-                base_url,
-                hint=args.hint,
-                research_mode=args.research,
-            )
-            if args.command == "source-all" and generated.get("ok"):
-                result = run_lab(
-                    args.cve, args.output_root, args.keep, after_validation
-                )
-            else:
-                result = generated
         elif args.command == "closed-auto":
             # One without the other gave the resolver nothing and was dropped
             # in silence: the record's own commit was used instead, which may
@@ -669,21 +599,6 @@ def _run_command(args: argparse.Namespace) -> int:
                 args.container_port,
                 args.health_path,
                 args.contract,
-            )
-        elif args.command == "run":
-            validated = run_lab(
-                args.cve, args.output_root, args.keep, after_validation
-            )
-            result = create_deliverables(
-                args.cve.upper(), args.output_root.resolve() / args.cve.upper(), validated
-            )
-        else:
-            build_lab(
-                args.cve, args.output_root, args.cwe, args.ai,
-                api_key, model, provider, base_url,
-            )
-            result = run_lab(
-                args.cve, args.output_root, args.keep, after_validation
             )
         print(redact(json.dumps(result, indent=2)))
         summary = usage.format_summary()

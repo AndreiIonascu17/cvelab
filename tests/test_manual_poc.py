@@ -4121,17 +4121,14 @@ class HookOptionsTests(unittest.TestCase):
     def test_a_lab_run_gives_the_lab_and_its_own_PoC_and_nothing_else(self) -> None:
         """A batch wants the labs. The extra call is asked for, not assumed."""
         for argv in (
-            ["run", "CVE-2026-0001"],
             ["auto", "CVE-2026-0001"],
-            ["source-all", "CVE-2026-0001"],
-            ["all", "CVE-2026-0001"],
         ):
             with self.subTest(command=argv[0]):
                 self.assertIs(cli.parser().parse_args(argv).manual_poc, False)
 
     def test_it_can_be_asked_for_and_pointed_at_another_provider(self) -> None:
         args = cli.parser().parse_args([
-            "run", "CVE-2026-0001", "--manual-poc",
+            "auto", "CVE-2026-0001", "--manual-poc",
             "--manual-poc-provider", "deepseek", "--manual-poc-model", "deepseek-chat",
         ])
         self.assertIs(args.manual_poc, True)

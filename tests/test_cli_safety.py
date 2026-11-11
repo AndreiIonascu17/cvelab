@@ -37,18 +37,15 @@ class TerminationTests(unittest.TestCase):
     the lab's containers running, because only a `finally` stopped them.
     """
 
-    def run_with(self, fake_run_lab) -> int:
-        with mock.patch.object(cli, "run_lab", side_effect=fake_run_lab), \
-                mock.patch.object(cli, "create_deliverables") as deliver, \
+    def run_with(self, fake_workflow) -> int:
+        with mock.patch.object(cli, "run_auto_workflow", side_effect=fake_workflow), \
                 redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
-            code = cli.main(["run", "CVE-2026-0001", "--no-upload"])
-        deliver.assert_not_called()
-        return code
+            return cli.main(["auto", "CVE-2026-0001", "--no-upload"])
 
     def test_sigterm_runs_the_teardown_and_exits_143(self) -> None:
         events = []
 
-        def fake_run_lab(*_args):
+        def fake_workflow(*_args, **_kwargs):
             try:
                 try:
                     signal.raise_signal(signal.SIGTERM)
@@ -59,20 +56,20 @@ class TerminationTests(unittest.TestCase):
             finally:
                 events.append("teardown")
 
-        self.assertEqual(self.run_with(fake_run_lab), 128 + signal.SIGTERM)
+        self.assertEqual(self.run_with(fake_workflow), 128 + signal.SIGTERM)
         self.assertEqual(events, ["teardown"])
 
     def test_sighup_exits_129(self) -> None:
-        def fake_run_lab(*_args):
+        def fake_workflow(*_args, **_kwargs):
             signal.raise_signal(signal.SIGHUP)
             time.sleep(5)
 
-        self.assertEqual(self.run_with(fake_run_lab), 128 + signal.SIGHUP)
+        self.assertEqual(self.run_with(fake_workflow), 128 + signal.SIGHUP)
 
     def test_a_second_signal_does_not_interrupt_the_teardown(self) -> None:
         events = []
 
-        def fake_run_lab(*_args):
+        def fake_workflow(*_args, **_kwargs):
             try:
                 signal.raise_signal(signal.SIGTERM)
                 time.sleep(5)
@@ -80,7 +77,7 @@ class TerminationTests(unittest.TestCase):
                 signal.raise_signal(signal.SIGTERM)
                 events.append("teardown finished")
 
-        self.assertEqual(self.run_with(fake_run_lab), 128 + signal.SIGTERM)
+        self.assertEqual(self.run_with(fake_workflow), 128 + signal.SIGTERM)
         self.assertEqual(events, ["teardown finished"])
 
     def test_an_ignored_hangup_stays_ignored(self) -> None:
@@ -89,14 +86,13 @@ class TerminationTests(unittest.TestCase):
         self.addCleanup(signal.signal, signal.SIGHUP, previous)
         observed = []
 
-        def fake_run_lab(*_args):
+        def fake_workflow(*_args, **_kwargs):
             observed.append(signal.getsignal(signal.SIGHUP))
             return {"ok": True}
 
-        with mock.patch.object(cli, "run_lab", side_effect=fake_run_lab), \
-                mock.patch.object(cli, "create_deliverables", return_value={"ok": True}), \
+        with mock.patch.object(cli, "run_auto_workflow", side_effect=fake_workflow), \
                 redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
-            cli.main(["run", "CVE-2026-0001", "--no-upload"])
+            cli.main(["auto", "CVE-2026-0001", "--no-upload"])
         self.assertEqual(observed, [signal.SIG_IGN])
 
     def test_the_previous_handlers_are_restored(self) -> None:

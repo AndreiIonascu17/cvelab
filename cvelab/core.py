@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -24,16 +23,12 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-import uuid
 from collections.abc import Callable
 from pathlib import Path
 
 from . import policy, predicate, progress, sidecar, steps
-from .ai import ai_is_configured, plan_with_ai
 from .providers import PROVIDERS
-from .templates import APP_PY, DOCKERFILE, VALIDATOR_DOCKERFILE, VALIDATOR_PY, compose_yaml
 
-SUPPORTED_CWES = {"CWE-22", "CWE-78", "CWE-89", "CWE-284", "CWE-434", "CWE-918"}
 CVE_PATTERN = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 
 
@@ -185,41 +180,6 @@ def collect_cve(cve: str) -> dict:
     }
 
 
-def select_cwe(
-    dossier: dict,
-    override: str | None,
-    ai_mode: str,
-    api_key: str | None = None,
-    model: str | None = None,
-    provider: str | None = None,
-    base_url: str | None = None,
-) -> tuple[str, dict | None]:
-    explicit = normalize_cwe(override)
-    candidates = [explicit] if explicit else dossier.get("cwes", [])
-    for candidate in candidates:
-        if candidate in SUPPORTED_CWES:
-            return candidate, None
-
-    if ai_mode in {"auto", "on"} and ai_is_configured(api_key, model, provider):
-        ai_plan = plan_with_ai(
-            dossier,
-            api_key=api_key,
-            model=model,
-            provider=provider,
-            base_url=base_url,
-        )
-        candidate = normalize_cwe(ai_plan.get("cwe"))
-        if candidate in SUPPORTED_CWES:
-            return candidate, ai_plan
-        if ai_mode == "on":
-            raise RuntimeError(f"AI selected unsupported CWE: {candidate}")
-    elif ai_mode == "on":
-        raise RuntimeError("--ai on requires a configured AI provider and CVELAB_MODEL")
-
-    found = ", ".join(dossier.get("cwes", [])) or "none"
-    raise RuntimeError(f"No supported CWE found (metadata: {found}). Use --cwe with one of {sorted(SUPPORTED_CWES)}")
-
-
 _SECRETS: set[str] = set()
 
 # Shorter values would match ordinary words and redact harmless text.
@@ -282,69 +242,6 @@ def register_environment_secrets() -> None:
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(redact(content), encoding="utf-8", newline="\n")
-
-
-def select_scenario(dossier: dict, cwe: str) -> str:
-    description = " ".join(dossier.get("descriptions", [])).lower()
-    if cwe == "CWE-284" and (
-        "destination namespace" in description
-        or "endpointslice" in description
-        or "serviceimport" in description
-    ):
-        return "namespace_injection"
-    if cwe == "CWE-284":
-        return "generic_access_control"
-    return "default"
-
-
-def build_lab(
-    cve_value: str,
-    output_root: Path,
-    cwe_override: str | None,
-    ai_mode: str,
-    api_key: str | None = None,
-    model: str | None = None,
-    provider: str | None = None,
-    base_url: str | None = None,
-) -> dict:
-    cve = normalize_cve(cve_value)
-    dossier = collect_cve(cve)
-    cwe, ai_plan = select_cwe(
-        dossier, cwe_override, ai_mode, api_key, model, provider, base_url
-    )
-    lab_dir = output_root.resolve() / cve
-    digest = int(hashlib.sha256(cve.encode()).hexdigest()[:6], 16)
-    vulnerable_port = 20000 + (digest % 18000)
-    patched_port = vulnerable_port + 1
-    marker = "CVELAB-" + uuid.uuid4().hex
-    scenario = select_scenario(dossier, cwe)
-    plan = {
-        "cve": cve,
-        "cwe": cwe,
-        "lab_type": "SYNTHETIC_CLASS_LAB",
-        "marker": marker,
-        "scenario": scenario,
-        "ports": {"vulnerable": vulnerable_port, "patched": patched_port},
-        "safety": {
-            "target_scope": "loopback_and_internal_docker_network_only",
-            "payload": "marker_only",
-            "limitations": "Demonstrates the CWE class; it is not vendor-source reproduction.",
-        },
-        "ai_plan": ai_plan,
-    }
-
-    write_text(lab_dir / "app" / "app.py", APP_PY)
-    write_text(lab_dir / "app" / "Dockerfile", DOCKERFILE)
-    write_text(lab_dir / "validator" / "validator.py", VALIDATOR_PY)
-    write_text(lab_dir / "validator" / "Dockerfile", VALIDATOR_DOCKERFILE)
-    write_text(
-        lab_dir / "docker-compose.yml",
-        compose_yaml(cwe, marker, vulnerable_port, patched_port, scenario),
-    )
-    write_text(lab_dir / "dossier.json", json.dumps(dossier, indent=2, ensure_ascii=True) + "\n")
-    write_text(lab_dir / "plan.json", json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
-    write_text(lab_dir / "validator" / "plan.json", json.dumps(plan, indent=2, ensure_ascii=True) + "\n")
-    return {"ok": True, "lab_dir": str(lab_dir), "plan": plan}
 
 
 def docker_executable() -> str:
@@ -662,18 +559,6 @@ def run_docker_stage(
     raise RuntimeError(
         f"Docker stage '{stage}' failed with exit code {result.returncode}{suffix}"
     )
-
-
-def wait_health(port: int) -> None:
-    url = f"http://127.0.0.1:{port}/health"
-    for _ in range(40):
-        try:
-            with urllib.request.urlopen(url, timeout=2) as response:
-                if response.status == 200:
-                    return
-        except Exception:
-            time.sleep(1)
-    raise RuntimeError(f"Lab service did not become healthy on port {port}")
 
 
 #: Opt-in for a plan.json runner, which executes a lab's script on the host.

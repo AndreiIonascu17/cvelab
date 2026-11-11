@@ -50,7 +50,6 @@ DEFAULT_ENDPOINT = "https://cvelab.tech"
 ENDPOINT_VARIABLE = "CVELAB_ENDPOINT"
 
 TOKEN_VARIABLE = "CVELAB_TOKEN"
-TOKEN_PREFIX = "cvelab_"
 
 #: Where a token lives when it is not in the environment. Kept out of the
 #: shell history and out of CI logs, which is where exported variables leak.

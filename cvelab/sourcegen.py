@@ -383,25 +383,6 @@ FORBIDDEN = {
 }
 
 
-
-
-SOURCE_HEALTH_PY = r'''from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *_): pass
-    def do_GET(self):
-        body = b'{"ok":true}' if self.path == "/health" else b'not found'
-        self.send_response(200 if self.path == "/health" else 404)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
-'''
-
-
-
-
-
-
 def _run_git(arguments: list[str], cwd: Path | None = None, binary: bool = False):
     git = shutil.which("git")
     if not git:
