@@ -6172,6 +6172,53 @@ class ManualActionVerdictTests(unittest.TestCase):
         self.assertFalse(
             core._manual_action_passed("verify", "BLOCKED", 1, "REPRODUCED"))
 
+    def test_the_exploit_action_may_say_blocked_by_exiting_one_too(self) -> None:
+        """The same widening, one action over, and it cost a run to find.
+
+        `verify` was widened; `exploit` was not, on the reasoning that for an
+        action which only re-sends the input "the exit status is all there is
+        to go on". But on the patched side the attack is supposed to fail
+        there as well, so requiring exit zero asked it to SUCCEED on the
+        fixed build.
+
+        Measured on a lab whose differential was confirmed at proof_quality
+        high: the vulnerable build executed the canary, the patched build
+        answered 400 with the fix's own `quote() rejected the token list`,
+        and `patched_exploit` was the one false check in a run whose other
+        ten passed. `ok` came out False and the record read "the lab did not
+        reproduce, so there was nothing to hand over" about a lab that had.
+        """
+        self.assertTrue(core._manual_action_passed(
+            "exploit", "BLOCKED", 1,
+            '{"error":"quote() rejected the token list","name":"TypeError"}'))
+
+    def test_an_exploit_that_worked_on_the_patched_side_still_ran(self) -> None:
+        """Exit 0 there is not this check's to refuse.
+
+        It means the attack reached the fixed build and came back, which is a
+        fact about the fix and belongs to the differential. This check asks
+        only whether the action ran and said something.
+        """
+        self.assertTrue(
+            core._manual_action_passed("exploit", "BLOCKED", 0, "canary"))
+
+    def test_an_exploit_that_printed_nothing_is_not_a_verdict(self) -> None:
+        # The half that is NOT widened: `bool(output)` still holds, so a
+        # script that exited 1 and said nothing has reported nothing.
+        self.assertFalse(core._manual_action_passed("exploit", "BLOCKED", 1, ""))
+        for code in (2, 127, -9):
+            with self.subTest(code=code):
+                self.assertFalse(
+                    core._manual_action_passed("exploit", "BLOCKED", code, "out"))
+
+    def test_the_vulnerable_exploit_still_has_to_exit_zero(self) -> None:
+        # Nothing is widened on the side where the attack must work: there
+        # `expected_verdict` is REPRODUCED and the old rule stands.
+        self.assertTrue(
+            core._manual_action_passed("exploit", "REPRODUCED", 0, "canary"))
+        self.assertFalse(
+            core._manual_action_passed("exploit", "REPRODUCED", 1, "error"))
+
     def test_the_vulnerable_side_still_has_to_exit_zero(self) -> None:
         # Nothing is widened here: a reproduction that could not exit zero
         # has not shown the effect, and the exit status is the only part of
@@ -6181,12 +6228,21 @@ class ManualActionVerdictTests(unittest.TestCase):
         self.assertFalse(
             core._manual_action_passed("verify", "REPRODUCED", 1, "REPRODUCED"))
 
-    def test_the_exploit_action_is_judged_only_on_its_exit_status(self) -> None:
-        # It re-sends the one input and prints what came back; it reports no
-        # verdict, so the exit status is all there is to go on.
+    def test_the_exploit_action_is_judged_on_its_exit_status_and_its_side(
+        self,
+    ) -> None:
+        # This used to assert that `exploit` is judged on the exit status
+        # ALONE -- the reasoning being that it reports no verdict, so there
+        # is nothing else to read. True about the output, wrong about the
+        # side: on the patched build exit 1 is the attack being blocked,
+        # which is the outcome that build exists to produce. The rule now
+        # reads the side as well, through `expected_verdict`.
         self.assertTrue(core._manual_action_passed("exploit", "BLOCKED", 0, "status: 302"))
-        self.assertFalse(core._manual_action_passed("exploit", "BLOCKED", 1, "status: 302"))
+        self.assertTrue(core._manual_action_passed("exploit", "BLOCKED", 1, "status: 302"))
         self.assertFalse(core._manual_action_passed("exploit", "BLOCKED", 0, ""))
+        # And unchanged where the attack has to work.
+        self.assertFalse(
+            core._manual_action_passed("exploit", "REPRODUCED", 1, "status: 302"))
 
 
 if __name__ == "__main__":
