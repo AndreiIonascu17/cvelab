@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -28,6 +29,7 @@ from cvelab.deliverables import (
     POC_NAME,
     create_deliverables,
 )
+from cvelab.field import shell_standing
 
 #: A spec that was proved, as `report.manual_poc_field` carries one. The
 #: three keys `field.poc_standing` reads are the three a half-written record
@@ -875,6 +877,117 @@ class TheGateReadsTheComputedVerdictTests(unittest.TestCase):
                 self.assertEqual(delivered["status"], "POC_NOT_VERIFIED")
                 for name in self.KIT:
                     self.assertFalse((lab / "artifacts" / name).exists(), name)
+
+    def test_the_kit_offers_the_command_only_where_the_artifact_has_it(
+        self,
+    ) -> None:
+        """What the kit prints is what the file beside it can do.
+
+        The condition here was `_executes(plan)`, the evidence shape the
+        plan DECLARES, while the artifact offers the command form on
+        `shell_standing` -- a declared service port and a validator that
+        reads the command. Measured across 262 archived labs: 34 declare
+        command execution, 2 implement it, and every one of the other 32
+        declares no port at all, so `manual.sh` and the guide printed
+        `PoC.py --lab-address $POC_AT id` for a file that does not have the
+        flag.
+
+        Tested here rather than against `_write_generic_manual_assets`,
+        which is where the existing test for this line lives: that function
+        was always right about the flag it was handed, and no test covered
+        what it was handed. The defect was the argument, so the argument is
+        what this reads.
+        """
+        offer = "--lab-address $POC_AT id"
+        fallback = "nothing here may be pointed at that address"
+
+        # Declares command execution, implements nothing of the sort: the
+        # default validator reads no command and the plan declares no port.
+        lab = self.lab()
+        plan = json.loads((lab / "plan.json").read_text(encoding="utf-8"))
+        plan["exploit_contract"]["evidence_type"] = "code_execution"
+        (lab / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+
+        self.assertTrue(create_deliverables(self.CVE, lab, self.result())["ok"])
+
+        runner = (lab / "artifacts" / "manual.sh").read_text(encoding="utf-8")
+        guide = (lab / "artifacts" / LAB_POC_GUIDE_NAME).read_text(encoding="utf-8")
+        self.assertNotIn(offer, runner)
+        self.assertIn(fallback, runner)
+        self.assertNotIn("PoC.py --lab-address", guide)
+
+        # And the shape that does implement it keeps the line, which is the
+        # half of this that a stricter condition could have taken away.
+        able = self.lab()
+        plan = json.loads((able / "plan.json").read_text(encoding="utf-8"))
+        plan["exploit_contract"]["evidence_type"] = "code_execution"
+        plan["exploit_contract"]["service_port"] = 8080
+        (able / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+        (able / "validator" / "validator.py").write_text(
+            (Path(__file__).parent / "fixtures" / "operator_validator.py")
+            .read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+        self.assertTrue(create_deliverables(self.CVE, able, self.result())["ok"])
+
+        runner = (able / "artifacts" / "manual.sh").read_text(encoding="utf-8")
+        guide = (able / "artifacts" / LAB_POC_GUIDE_NAME).read_text(encoding="utf-8")
+        self.assertIn(offer, runner)
+        self.assertNotIn(fallback, runner)
+        self.assertIn("PoC.py --lab-address", guide)
+
+    def test_the_kit_and_the_artifact_say_the_same_thing(self) -> None:
+        """One predicate, read once, so the two cannot come apart.
+
+        They did come apart, and that is the whole finding: the kit printed
+        the command on what the plan DECLARED while the artifact offered it
+        on what the validator IMPLEMENTS. Two predicates for one question.
+
+        All four shapes, because fixing it with a condition that merely
+        agrees on the labs that exist today is how it would come apart
+        again. The port decides whether there is an address at all; the
+        validator decides whether a command after it is answered. Only both
+        together may print a command.
+        """
+        able = (
+            Path(__file__).parent / "fixtures" / "operator_validator.py"
+        ).read_text(encoding="utf-8")
+        unable = "# CVELAB_MANUAL_ACTION CVELAB_TARGET exploit verify\n"
+        shapes = {
+            ("port", "implements"): (8080, able, True),
+            ("port", "refuses"): (8080, unable, False),
+            ("no port", "implements"): (None, able, False),
+            ("no port", "refuses"): (None, unable, False),
+        }
+        for (has_port, reads), (port, validator, expected) in shapes.items():
+            with self.subTest(port=has_port, validator=reads):
+                lab = self.lab()
+                plan = json.loads((lab / "plan.json").read_text(encoding="utf-8"))
+                plan["exploit_contract"]["evidence_type"] = "code_execution"
+                if port is not None:
+                    plan["exploit_contract"]["service_port"] = port
+                (lab / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+                (lab / "validator" / "validator.py").write_text(
+                    validator, encoding="utf-8"
+                )
+
+                self.assertIs(shell_standing(plan, validator)[0], expected)
+                self.assertTrue(create_deliverables(self.CVE, lab, self.result())["ok"])
+
+                runner = (lab / "artifacts" / "manual.sh").read_text(encoding="utf-8")
+                poc = (lab / "artifacts" / field.POC_NAME).read_text(encoding="utf-8")
+                header = poc.split('"""')[1]
+                # The kit's offer and the file's own usage line, read off the
+                # two artifacts rather than off the predicate, so this is a
+                # comparison and not a restatement.
+                kit_offers = "--lab-address $POC_AT id" in runner
+                file_offers = bool(
+                    re.search(r"--lab-address \S+ id\b", header)
+                )
+                self.assertIs(kit_offers, expected)
+                self.assertIs(file_offers, expected)
+                self.assertIs(kit_offers, file_offers)
 
     def test_the_gate_no_longer_reads_the_validators_own_label(self) -> None:
         """Read off the source, because the behaviour above cannot tell a gate
