@@ -41,10 +41,10 @@ from .field import (
     POC_NOT_REQUESTED,
     POC_REFUSED,
     POC_SHIPPED,
-    _executes,
     emit_poc,
     poc_record,
     poc_standing,
+    shell_standing,
 )
 
 ANALYSIS_SCHEMA = {
@@ -604,7 +604,7 @@ def _write_generic_manual_assets(
     seeds: bool = False,
     port: int | None = None,
     record: dict | None = None,
-    executes: bool = False,
+    takes_a_command: bool = False,
 ) -> None:
     """Write the kit the lab is handed over with: runner, wrapper and guide.
 
@@ -626,12 +626,25 @@ def _write_generic_manual_assets(
     dependency stays Docker.
 
     The record decides what the kit says about the address: whether remote
-    mode is there to be pointed at it, and with which arguments. `executes`
-    is the lab's declared evidence shape, and it decides the other command
-    printed beside the address: `--lab-address`, which runs the lab program
-    against this lab's own published build and prints what one command on it
-    returns. That is the form an owner demonstrates impact with, so it is
-    printed where they are already looking.
+    mode is there to be pointed at it, and with which arguments.
+
+    `takes_a_command` decides the other command printed beside the address:
+    `--lab-address`, which runs the lab program against this lab's own
+    published build and prints what one command on it returns. That is the
+    form an owner demonstrates impact with, so it is printed where they are
+    already looking.
+
+    It is what the artifact IMPLEMENTS and not what the plan declares, and
+    the difference is the correction here. This was `_executes(plan)`, the
+    declared evidence shape, while the artifact offers the form on
+    `shell_standing` -- a declared port AND a validator that reads the
+    command. Measured across 262 archived labs: 34 declare command
+    execution, 2 implement it, and all 32 of the rest declare no service
+    port at all -- so the kit printed `--lab-address` for a file that does
+    not have the flag. The comment under the offers below already said what
+    that costs: a printed command that fails reads as the kit being broken
+    rather than as the drafter having refused the proof. One predicate for
+    one question, asked of the thing that answers it.
     """
     record = record if isinstance(record, dict) else {}
     proved = poc_standing(record) == POC_SHIPPED
@@ -647,7 +660,7 @@ def _write_generic_manual_assets(
     # refused the proof.
     poc = f'python3 \\"$LAB_ROOT/artifacts/{POC_NAME}\\"'
     offers = []
-    if executes:
+    if takes_a_command:
         offers.append(f'      echo "  {poc} --lab-address $POC_AT id"')
     if proved:
         offers.append(
@@ -738,7 +751,7 @@ about any other host: the address has to be on loopback, and an address that
 is not is refused. Which loopback port is this lab's `PoC.py` cannot check, so
 pointing it at another service of your own is yours to answer for.
 
-''' if executes else ""
+''' if takes_a_command else ""
     rehearsal = impact + f'''```bash
 bash manual.sh setup vulnerable
 python3 {POC_NAME} "$(bash manual.sh address vulnerable)"{_remote_arguments(record)}
@@ -755,7 +768,7 @@ that authorization in writing.
 that address: `python3 {POC_NAME} <address>` prints the recorded reason and
 exits 2 without sending anything. The section above carries that reason. Lab
 mode -- `{POC_NAME}` with no argument, which is what `exploit` runs inside the
-lab{', and `--lab-address` above' if executes else ''} -- is unaffected.
+lab{', and `--lab-address` above' if takes_a_command else ''} -- is unaffected.
 '''
     direct_section = f'''## The address this lab publishes
 
@@ -1016,9 +1029,16 @@ def create_deliverables(
     # the two cannot disagree. The declared port is read from the contract in
     # plan.json and not inferred; a lab that declares none is an archived one,
     # and gets the kit it always had.
+    # `shell_standing` and not `_executes`: the question the kit is asking
+    # is whether the artifact beside it offers the command form, and only
+    # the validator can answer that. Reading the declaration instead printed
+    # the command for 32 of the 34 labs that declare command execution,
+    # every one of which declares no port and so has no `--lab-address` at
+    # all. Same predicate the artifact's own prompt is gated on, read once
+    # here and not re-derived, so the kit and the file cannot disagree.
     _write_generic_manual_assets(
         cve, lab_dir, artifacts, vulnerable_only, seeds, service_port(plan), record,
-        _executes(plan),
+        shell_standing(plan, validator)[0],
     )
     # Where the guard in `core.run_lab` is settled, because this is the line
     # above that makes it answerable.
