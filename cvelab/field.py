@@ -75,8 +75,6 @@ from .closed import (
     _docker,
     _seconds,
     _validate_fixture,
-    check_lab_arguments,
-    disposable_instance,
     sidecar_argv,
 )
 from .core import (
@@ -5729,43 +5727,6 @@ def _poc_header(
     )
 
 
-#: The entry point of a PoC that has only the one mode. No argument is
-#: argparse's error rather than a second mode, because there is no second
-#: mode to fall through to.
-_SOLE_MODE_DISPATCH = '''
-if __name__ == "__main__":
-    sys.exit(main())
-'''
-
-
-def emit_standalone_poc(
-    cve: str,
-    spec: dict[str, Any],
-    plan: dict[str, Any] | None = None,
-    port: int = 0,
-    filename: str = "field-poc.py",
-) -> str:
-    """`cvelab field`'s artifact: remote mode, and no second mode.
-
-    A closed-image field lab carries no validator of its own. Its proof is
-    two published images, the script never runs against a Compose service
-    name, and the whole deliverable is that one mode -- so the header offers
-    no second one rather than describing a lab mode this artifact has not
-    got.
-    """
-    header = _poc_header(
-        cve, plan, {"shipped": True, "spec": spec, "container_port": port},
-        POC_SHIPPED, lab_mode=False, filename=filename,
-    )
-    script = (
-        "#!/usr/bin/env python3\n" + header + "\n"
-        + emit_field_poc(cve, spec, plan, filename)
-        + _SOLE_MODE_DISPATCH
-    )
-    compile(script, filename, "exec")
-    return script
-
-
 _FUTURE_IMPORT = re.compile(r"^from __future__ import ([^(\\\n]+)$", re.MULTILINE)
 
 
@@ -6420,212 +6381,12 @@ def _run_reverse_shell_proof(
     return outcome
 
 
-def _run_variant(
-    cve: str, variant: str, image: str, port: int, health_path: str,
-    spec: dict[str, Any], script: str,
-) -> dict[str, Any]:
-    """Start one image, seed it, and run the field PoC against it.
-
-    The starting, seeding and taking away is `disposable_instance`, which the
-    closed path uses for the same thing on the same kind of input: a pair of
-    published images. `field-` stays in the container's name so an operator
-    reading `docker ps` can tell the two modes apart.
-
-    It brought the health wait and the fixture with it, which is why
-    `_apply_fixture` and `_wait_ready` are no longer imported here -- this
-    module no longer does either by hand. `_validate_fixture` still is: a
-    spec's fixture is checked when the spec is read, long before anything is
-    started.
-    """
-    with disposable_instance(
-        cve, variant, image, port, health_path, spec, prefix="cvelab-field"
-    ) as running:
-        outcome = _run_field_script(
-            running.container, port, script, spec.get("transport", "http"),
-            sidecar.ensure_image({spec.get("transport", "http")}, True),
-        )
-        return {
-            "variant": variant, "image": image, "fixture": running.fixture, **outcome
-        }
-
-
-def run_field_lab(
-    cve: str,
-    output_root: Path,
-    vulnerable_image: str,
-    fixed_image: str | None,
-    container_port: int,
-    health_path: str,
-    spec_path: Path,
-) -> dict[str, Any]:
-    """Emit a field PoC and prove it against the built instances.
-
-    A field PoC without a fixed instance to check against cannot show that the
-    effect it observes is the vulnerability rather than the application's normal
-    behavior, so a fixed image is required here even though the closed mode
-    treats it as optional.
-    """
-    cve = check_lab_arguments(cve, container_port, health_path)
-    if not fixed_image:
-        raise ValueError("field mode needs a fixed image to prove the effect is the bug")
-    spec = validate_spec(json.loads(spec_path.read_text(encoding="utf-8")))
-    script = emit_standalone_poc(cve, spec, port=container_port)
-
-    lab_dir = output_root.resolve() / cve
-    artifacts = lab_dir / "artifacts"
-    evidence_dir = lab_dir / "field" / "evidence"
-    artifacts.mkdir(parents=True, exist_ok=True)
-    evidence_dir.mkdir(parents=True, exist_ok=True)
-
-    vulnerable = _run_variant(
-        cve, "vulnerable", vulnerable_image, container_port, health_path, spec, script
-    )
-    patched = _run_variant(
-        cve, "patched", fixed_image, container_port, health_path, spec, script
-    )
-
-    # The script is a field PoC only if it tells the two apart on its own: the
-    # effect on the vulnerable instance, silence on the fixed one. Firing on
-    # both means it observes normal behavior, not the bug. Silence counts only
-    # from a run that finished and said so -- a script that crashed against
-    # the fixed image observed nothing because it never looked.
-    both_ran = bool(vulnerable["ran"] and patched["ran"])
-    proven = bool(both_ran and vulnerable["observed"] and not patched["observed"])
-    proof_checks = {
-        "script_ran_on_both": both_ran,
-        "effect_observed_on_vulnerable": bool(vulnerable["observed"]),
-        "silent_on_fixed": bool(patched["ran"] and not patched["observed"]),
-        "field_poc_proven": proven,
-    }
-
-    (artifacts / "field-poc.py").write_text(script, encoding="utf-8")
-    (artifacts / "field-poc.py").chmod(0o755)
-    (artifacts / "field-spec.json").write_text(
-        json.dumps(spec, indent=2), encoding="utf-8"
-    )
-
-    plan = {
-        "cve": cve,
-        "lab_type": "FIELD_POC",
-        "strategy": spec["strategy"],
-        "repository": None,
-        "revisions": {},
-        "images": {"vulnerable": vulnerable_image, "patched": fixed_image},
-        "container_port": container_port,
-        "health_path": health_path,
-    }
-    evidence = {
-        "schema_version": 1,
-        "cve": cve,
-        "status": "REAL_FIELD_POC_VALIDATED" if proven else "FIELD_POC_NOT_VALIDATED",
-        "lab_type": "FIELD_POC",
-        "strategy": spec["strategy"],
-        "observable_effect": spec["observable_effect"],
-        "validated_against": {"vulnerable": vulnerable_image, "fixed": fixed_image},
-        "proof_checks": proof_checks,
-        "runs": {"vulnerable": vulnerable, "patched": patched},
-    }
-    (lab_dir / "plan.json").write_text(json.dumps(plan, indent=2), encoding="utf-8")
-    (artifacts / "plan.json").write_text(json.dumps(plan, indent=2), encoding="utf-8")
-    (artifacts / "EVIDENCE.json").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
-    (evidence_dir / "result.json").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
-
-    usage = "python3 field-poc.py --target 10.0.0.5:8080 --show-bodies"
-    walkthrough = f"""# {cve} Field PoC
-
-## What this is
-
-A single-target exploit you run yourself, against one server you are permitted
-to test, in one run. It shows the vulnerability happening: {spec['observable_effect']}
-
-It does not need a second server. Its proof is an effect a fixed build cannot
-produce, and CVELab confirmed that before handing it to you -- the script
-observed the effect on `{vulnerable_image}` and stayed silent on `{fixed_image}`.
-
-## Run it
-
-```bash
-cd {cve}/artifacts
-{usage}
-```
-
-`--target` is one host and port: `10.0.0.5:8080`, `[2001:db8::1]:8443` or
-`https://app.example.com`. A scheme is optional and `http` is assumed without
-one, except for port 443. The paths come from the spec, so the target carries
-none.
-
-It prints `OBSERVED` and exits 0 when the effect is present, `NOT_OBSERVED` and
-exits 1 when it is not. Any other ending is a run that did not finish, not a
-result. Without `--show-bodies` each disclosed value is cut at 120 characters;
-with it they print in full, which is what a report needs as evidence.
-
-The script names the target and the effect on stderr before it sends anything,
-so the run is visible in the output and in whatever log captured it. It sends
-live requests and reads what comes back, so point it only at a host the
-engagement covers, and keep that permission in writing -- the effect it
-demonstrates is real data leaving a real server.
-
-## Strategy: {spec['strategy']}
-
-{'It reads the same resource two ways in one request round -- the vulnerable path and the path that authorizes correctly -- and reports what only the vulnerable path returned. A value it reports is one the server disclosed to an unauthorized requester.' if spec['strategy'] == 'inband_differential' else 'It sends a unique marker through the vulnerable vector and observes it surface where it should not. The marker is fresh each run, so a stored reflection from a previous run is never counted.'}
-
-## A negative result is not always a clean bill
-
-`NOT_OBSERVED` means the effect was not seen on this target with this input. For
-a differential strategy it can also mean the target had nothing for the probe to
-disclose -- an empty instance -- not that it is patched. To decide affected vs
-fixed regardless of data, check the build, not only this script.
-"""
-    report = f"""# {cve} Field PoC Report
-
-- Lab type: `FIELD_POC`
-- Strategy: `{spec['strategy']}`
-- Observable effect: {spec['observable_effect']}
-- Proven against vulnerable `{vulnerable_image}`: `{vulnerable['observed']}`
-- Silent against fixed `{fixed_image}`: `{not patched['observed']}`
-- Field PoC proven: `{proven}`
-
-## Interpretation
-
-The script is handed over only because it told the vulnerable and the fixed
-instance apart on its own. It claims only the effect it observed; it does not
-infer source-level root cause or behavior outside the requests it sends.
-"""
-    (artifacts / "WALKTHROUGH.md").write_text(walkthrough, encoding="utf-8")
-    (artifacts / "REPORT.md").write_text(report, encoding="utf-8")
-    (artifacts / "report.json").write_text(
-        json.dumps({"cve": cve, "lab_type": "FIELD_POC", "ok": proven,
-                    "real_poc_verified": proven, "proof_checks": proof_checks},
-                   indent=2), encoding="utf-8"
-    )
-
-    result = {
-        "ok": proven,
-        "cve": cve,
-        "lab_type": "FIELD_POC",
-        "strategy": spec["strategy"],
-        "field_poc_proven": proven,
-        "proof_checks": proof_checks,
-        "vulnerable": vulnerable,
-        "patched": patched,
-        "lab_dir": str(lab_dir),
-        "deliverables": {
-            "field_poc": str(artifacts / "field-poc.py"),
-            "spec": str(artifacts / "field-spec.json"),
-            "evidence": str(evidence_dir / "result.json"),
-            "walkthrough": str(artifacts / "WALKTHROUGH.md"),
-            "report": str(artifacts / "REPORT.md"),
-        },
-    }
-    return result
-
-
 # --- A source lab's handover -------------------------------------------------
 #
-# `cvelab field` above needs a pair of published images: what a closed product
-# ships and a source lab has no equivalent of, because it builds its two
-# revisions itself. Everything below gives a source lab the same deliverable
-# from the two builds it already has.
+# A single-target script is handed over only once it has told a vulnerable
+# build and a fixed one apart, and a source lab has both: it builds its two
+# revisions itself. Everything below gives it that deliverable from the two
+# builds it already has.
 #
 # The spec is the operator's, not the model's. Asking for one during generation
 # pushed the whole generation prompt past the provider's threshold: two of three
@@ -6682,9 +6443,9 @@ def _seal_lab(compose: list[str], lab_dir: Path, environment: dict[str, str]) ->
     name. `down` on its own leaves the lab's volumes behind, and a later run
     of the same lab would then start against state this one created -- which
     for a seeding step is exactly the difference between a lab that was put
-    in the state the attack needs and one that was already in it. The two
-    paths that end a run, the proof's own teardown and `demo-target down`,
-    were spelling the same four arguments out separately.
+    in the state the attack needs and one that was already in it. The proof's
+    own teardown is the one path that ends a run, and the four arguments it
+    needs are named here rather than spelled out at the call site.
     """
     subprocess.run(
         compose + ["down", "--volumes", "--remove-orphans"],
@@ -7681,34 +7442,17 @@ WHY YOU CAN TRUST IT
 {trust}
 REHEARSE IT FIRST
 
-`cvelab demo-target up <lab-dir>` starts this lab's vulnerable build on a
-network your host can reach and prints the host and port to point at, so you
-can see the run end to end before it touches anyone else's server. The fixed
-build is never started, and `cvelab demo-target down <lab-dir>` puts the lab
-back.
+Point it at this lab's own build before you point it at a server that is not
+yours. `manual.sh`, beside this file, publishes that build on loopback and
+prints the address it was given:
+
+    bash manual.sh setup vulnerable
+    python3 {filename} "$(bash manual.sh address vulnerable)"
+
+The host side is assigned each run, so there is no constant to write down --
+`address` reprints the current one. `bash manual.sh cleanup` takes the lab
+back down when you are done.
 """
-
-def _demo_override(networks: list[str]) -> str:
-    """A Compose fragment that makes the lab's own networks reachable.
-
-    A lab is sealed: its network is `internal: true` and it publishes no port,
-    so neither a published port nor the container's own address answers from
-    the host. Publishing a port while the network stays internal binds to the
-    wrong address, so the fragment lifts `internal` instead and the target is
-    the container's address on its own port.
-
-    It is never written into the lab directory and never named
-    docker-compose.override.yml, which Compose loads by name: left behind,
-    either would quietly change every later run of the lab.
-    """
-    body = "".join(f"  {name}:\n    internal: false\n" for name in networks)
-    return (
-        "# Written by `cvelab demo-target up` and used for that one command.\n"
-        "# It lifts `internal` from this lab's networks so the host can reach\n"
-        "# the vulnerable build, which the lab is deliberately built not to\n"
-        "# allow. `cvelab demo-target down <lab-dir>` puts the lab back.\n"
-        f"networks:\n{body}"
-    )
 
 
 def _container_address(container: str) -> str:
@@ -7719,87 +7463,6 @@ def _container_address(container: str) -> str:
         container, check=False,
     )
     return " ".join(candidate for candidate in shown.split() if candidate)
-
-
-def run_demo_target(
-    action: str, lab_dir: Path, container_port: int | None = None
-) -> dict[str, Any]:
-    """Start a lab's vulnerable build where the host can reach it, or put it back.
-
-    This is a rehearsal target for the single-target script: it gives the
-    operator a real host and port to point at before they point it at a server
-    that belongs to someone else. The fixed build is never started -- the
-    differential is the lab's job, already done, and a demo that reached the
-    fixed build by accident would show nothing.
-    """
-    lab_dir = lab_dir.resolve()
-    plan = _lab_plan(lab_dir)
-    cve = str(plan.get("cve") or lab_dir.name).upper()
-    docker, environment, compose, scratch = prepare_compose(lab_dir)
-    try:
-        if action == "down":
-            _seal_lab(compose, lab_dir, environment)
-            progress.step(f"{cve} is back to its sealed posture")
-            return {"ok": True, "cve": cve, "lab_dir": str(lab_dir), "running": False}
-
-        port = container_port
-        if port is None:
-            with contextlib.suppress(KeyError, TypeError, ValueError):
-                port = int(poc_record(lab_dir)["container_port"])
-        if port is None:
-            raise RuntimeError(
-                "No port to point at: pass --container-port, or run `cvelab manual` "
-                "first, which records the one it proved in report.json under "
-                "manual_poc_field"
-            )
-
-        resolved = _resolved_compose(compose, lab_dir, environment)
-        internal = [
-            name for name, definition in (resolved.get("networks") or {}).items()
-            if isinstance(definition, dict) and definition.get("internal")
-        ]
-        if internal:
-            override = scratch / "demo-target.yml"
-            override.write_text(_demo_override(internal), encoding="utf-8")
-            compose = [*compose, "-f", str(override)]
-
-        services = [
-            name for name in (plan.get("startup_services") or ["vulnerable"])
-            if name != "patched"
-        ]
-        if "vulnerable" not in services:
-            services.append("vulnerable")
-        timeout = DEFAULT_HEALTH_TIMEOUT + startup_grace()
-        _bring_up(
-            services, ["vulnerable"], port, timeout,
-            lab_dir, compose, docker, environment, resolved,
-        )
-        container = _service_container(compose, "vulnerable", lab_dir, environment)
-        address = _container_address(container).split(" ")[0] if container else ""
-        if not address:
-            raise RuntimeError("the vulnerable build started but has no address to reach")
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-
-    target = f"{address}:{port}"
-    script = lab_dir / "artifacts" / POC_NAME
-    # Printed only where remote mode exists. The rehearsal is of remote mode;
-    # a lab whose remote mode was refused would have this line answer with the
-    # drafter's reason and exit 2, which reads as the rehearsal having failed.
-    proved = script.is_file() and poc_standing(poc_record(lab_dir)) == POC_SHIPPED
-    progress.step(f"{cve} vulnerable build is reachable at {target}")
-    if proved:
-        progress.step(f"python3 {script} --target {target} --show-bodies")
-    progress.step(f"this lab is reachable from the host until: cvelab demo-target down {lab_dir}")
-    return {
-        "ok": True,
-        "cve": cve,
-        "lab_dir": str(lab_dir),
-        "running": True,
-        "target": target,
-        "poc": str(script) if proved else None,
-        "posture": "reachable from the host; `cvelab demo-target down` restores it",
-    }
 
 
 # --- Asking for a spec, after the lab is finished ----------------------------

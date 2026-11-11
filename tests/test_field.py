@@ -377,7 +377,7 @@ class EmittedScriptTests(unittest.TestCase):
         ))
         script = field.emit_field_poc("CVE-2026-0001", spec)
         namespace: dict[str, Any] = {"__name__": "not_main"}
-        exec(compile(script, "field-poc.py", "exec"), namespace)  # noqa: S102
+        exec(compile(script, "PoC.py", "exec"), namespace)  # noqa: S102
         self.assertIsNone(namespace["SPEC"]["checks"][0]["probe"][0]["body"])
 
     def test_the_fixture_is_not_baked_into_the_deliverable(self) -> None:
@@ -419,7 +419,7 @@ class EmittedScriptTests(unittest.TestCase):
         extractor = spec["checks"][0]["extract"]
         script = field.emit_field_poc("CVE-2026-0001", spec)
         namespace: dict[str, Any] = {}
-        exec(compile(script, "<field-poc.py>", "exec"), namespace)
+        exec(compile(script, "<PoC.py>", "exec"), namespace)
         probe = {"data": {"notes": [{"body": "public"}, {"body": "SECRET"}]}}
         control = {"data": {"notes": [{"body": "public"}]}}
         tokens = namespace["tokens"]
@@ -439,7 +439,7 @@ class TargetTests(unittest.TestCase):
     def setUp(self) -> None:
         script = field.emit_field_poc("CVE-2026-0001", field.validate_spec(_inband()))
         namespace: dict[str, Any] = {"__name__": "not_main"}
-        exec(compile(script, "<field-poc.py>", "exec"), namespace)  # noqa: S102
+        exec(compile(script, "<PoC.py>", "exec"), namespace)  # noqa: S102
         self.normalize = namespace["normalize_target"]
 
     def test_a_host_and_port_needs_no_scheme(self) -> None:
@@ -479,7 +479,7 @@ class SubstitutionTests(unittest.TestCase):
     def setUp(self) -> None:
         script = field.emit_field_poc("CVE-2026-0001", field.validate_spec(_inband()))
         namespace: dict[str, Any] = {"__name__": "not_main"}
-        exec(compile(script, "<field-poc.py>", "exec"), namespace)  # noqa: S102
+        exec(compile(script, "<PoC.py>", "exec"), namespace)  # noqa: S102
         self.subst = namespace["_subst"]
 
     def test_a_discovered_value_with_a_quote_stays_one_value(self) -> None:
@@ -494,88 +494,6 @@ class SubstitutionTests(unittest.TestCase):
                 out = self.subst({"path": "/p/{{name}}", "method": "GET"}, {"name": value})
                 self.assertEqual(out["path"], "/p/" + value)
                 self.assertEqual(out["method"], "GET")
-
-
-class ProofTests(unittest.TestCase):
-    """The lab hands the script over only if it tells the instances apart."""
-
-    def _lab(
-        self,
-        vulnerable_observed: bool,
-        patched_observed: bool,
-        patched_ran: bool = True,
-    ) -> dict[str, Any]:
-        outcomes = {
-            "vulnerable": {"variant": "vulnerable", "image": "img:v", "fixture": None,
-                           "observed": vulnerable_observed, "ran": True,
-                           "verdict": "OBSERVED" if vulnerable_observed else "NOT_OBSERVED",
-                           "exit_code": 0, "observation": {}, "output": "", "stderr": ""},
-            "patched": {"variant": "patched", "image": "img:p", "fixture": None,
-                        "observed": patched_observed, "ran": patched_ran,
-                        "verdict": ("OBSERVED" if patched_observed else "NOT_OBSERVED")
-                        if patched_ran else None,
-                        "exit_code": 0 if patched_ran else 1,
-                        "observation": {}, "output": "", "stderr": ""},
-        }
-        with tempfile.TemporaryDirectory() as root:
-            output = Path(root)
-            spec_path = output / "spec.json"
-            spec_path.write_text(json.dumps(_inband()))
-            with mock.patch.object(
-                field, "_run_variant",
-                side_effect=lambda cve, variant, *a, **k: outcomes[variant],
-            ):
-                result = field.run_field_lab(
-                    "CVE-2026-0001", output, "img:v", "img:p", 8080, "/", spec_path
-                )
-            artifacts = Path(result["lab_dir"]) / "artifacts"
-            return {
-                "result": result,
-                "evidence": json.loads((artifacts / "EVIDENCE.json").read_text()),
-                "script": (artifacts / "field-poc.py").read_text(),
-            }
-
-    def test_fires_on_vulnerable_and_silent_on_fixed_is_proven(self) -> None:
-        lab = self._lab(vulnerable_observed=True, patched_observed=False)
-        self.assertIs(lab["result"]["ok"], True)
-        self.assertEqual(lab["evidence"]["status"], "REAL_FIELD_POC_VALIDATED")
-        self.assertIs(lab["evidence"]["proof_checks"]["field_poc_proven"], True)
-        self.assertTrue(lab["script"].startswith("#!/usr/bin/env python3"))
-
-    def test_firing_on_both_is_not_a_field_poc(self) -> None:
-        """An effect the fixed build also shows is normal behavior, not the bug."""
-        lab = self._lab(vulnerable_observed=True, patched_observed=True)
-        self.assertIs(lab["result"]["ok"], False)
-        self.assertNotEqual(lab["evidence"]["status"], "REAL_FIELD_POC_VALIDATED")
-        self.assertIs(lab["evidence"]["proof_checks"]["silent_on_fixed"], False)
-
-    def test_firing_on_neither_is_not_proven(self) -> None:
-        lab = self._lab(vulnerable_observed=False, patched_observed=False)
-        self.assertIs(lab["result"]["ok"], False)
-        self.assertIs(lab["evidence"]["proof_checks"]["effect_observed_on_vulnerable"], False)
-
-    def test_a_script_that_crashed_on_the_fixed_image_is_not_silence(self) -> None:
-        """A run that never finished observed nothing because it never looked.
-
-        Reading only the last line, an unreachable target, a traceback or a
-        killed sidecar on the fixed image read as silence and the lab was
-        stored as a validated field PoC.
-        """
-        lab = self._lab(
-            vulnerable_observed=True, patched_observed=False, patched_ran=False
-        )
-        self.assertIs(lab["result"]["ok"], False)
-        self.assertNotEqual(lab["evidence"]["status"], "REAL_FIELD_POC_VALIDATED")
-        self.assertIs(lab["evidence"]["proof_checks"]["silent_on_fixed"], False)
-        self.assertIs(lab["evidence"]["proof_checks"]["script_ran_on_both"], False)
-
-    def test_a_fixed_image_is_required(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
-            output = Path(root)
-            spec_path = output / "spec.json"
-            spec_path.write_text(json.dumps(_inband()))
-            with self.assertRaises(ValueError):
-                field.run_field_lab("CVE-2026-0001", output, "img:v", None, 8080, "/", spec_path)
 
 
 class SidecarTests(unittest.TestCase):

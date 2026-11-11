@@ -37,8 +37,6 @@ from .doctor import doctor_command
 from .field import (
     draft_only,
     manual_poc_step,
-    run_demo_target,
-    run_field_lab,
     run_manual_poc,
 )
 from .providers import SELECTABLE
@@ -255,18 +253,6 @@ def parser() -> argparse.ArgumentParser:
     closed.add_argument("--health-path", default="/", help="Relative readiness path")
     closed.add_argument("--contract", required=True, type=Path, help="Inspectable HTTP attack contract JSON")
 
-    field_cmd = sub.add_parser(
-        "field",
-        help="Emit a single-target PoC the operator runs against their own server, "
-             "proven against a vulnerable and a fixed image",
-    )
-    field_cmd.add_argument("cve")
-    field_cmd.add_argument("--vulnerable-image", required=True, help="Image the PoC must fire against")
-    field_cmd.add_argument("--fixed-image", required=True, help="Image the PoC must stay silent against")
-    field_cmd.add_argument("--container-port", required=True, type=int, help="HTTP port inside the image")
-    field_cmd.add_argument("--health-path", default="/", help="Relative readiness path")
-    field_cmd.add_argument("--spec", required=True, type=Path, help="Field PoC spec: strategy, effect, requests")
-
     manual_poc = sub.add_parser(
         "manual",
         help="Prove remote mode for a lab you already built, and write it into that "
@@ -313,18 +299,6 @@ def parser() -> argparse.ArgumentParser:
         help="Ask for the spec, check it, print it, and stop. One model call, no "
              "containers and no proof: the cheap way to see what the instructions "
              "produce for a lab before spending a run on it",
-    )
-
-    demo_target = sub.add_parser(
-        "demo-target",
-        help="Start a lab's vulnerable build where your host can reach it, to rehearse "
-             "the single-target script before pointing it at anyone else's server",
-    )
-    demo_target.add_argument("action", choices=("up", "down"))
-    demo_target.add_argument("lab_dir", type=Path, help="A generated lab directory")
-    demo_target.add_argument(
-        "--container-port", type=int,
-        help="Port the service listens on; read from the proved record when omitted",
     )
 
     closed_auto = sub.add_parser(
@@ -578,18 +552,6 @@ def _run_command(args: argparse.Namespace) -> int:
                     _named_values(args.input), args.redraft,
                     api_key=api_key, model=model, provider=provider, base_url=base_url,
                 )
-        elif args.command == "demo-target":
-            result = run_demo_target(args.action, args.lab_dir, args.container_port)
-        elif args.command == "field":
-            result = run_field_lab(
-                args.cve,
-                args.output_root,
-                args.vulnerable_image,
-                args.fixed_image,
-                args.container_port,
-                args.health_path,
-                args.spec,
-            )
         elif args.command == "closed":
             result = run_closed_lab(
                 args.cve,

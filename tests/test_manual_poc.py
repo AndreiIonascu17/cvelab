@@ -519,7 +519,9 @@ class OperatorSpecTests(unittest.TestCase):
             # is not a clean bill.
             self.assertIn("keep that permission in writing", guide)
             self.assertIn("not the same", guide)
-            self.assertIn("demo-target", guide)
+            # And how to rehearse against this lab's own build first, in the
+            # kit's own words rather than a second description of it.
+            self.assertIn("bash manual.sh address vulnerable", guide)
 
     def test_the_record_keeps_a_refusal_and_remote_mode_refuses(self) -> None:
         with _lab(spec=_spec()) as lab_dir:
@@ -583,85 +585,6 @@ class OperatorSpecTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as raised:
                 field.run_manual_poc(Path(root), Path(root) / "spec.json", 8000)
             self.assertIn("plan.json is missing", str(raised.exception))
-
-
-class DemoTargetTests(unittest.TestCase):
-    """A rehearsal target: one reachable vulnerable host, and the way back."""
-
-    def _up(self, lab_dir: Path, **kwargs: Any) -> tuple[dict, mock.Mock]:
-        resolved = {"networks": {"lab_internal": {"internal": True}}}
-        with mock.patch.object(
-            field, "prepare_compose",
-            return_value=("docker", {}, ["docker", "compose"], lab_dir.parent / "scratch"),
-        ), mock.patch.object(
-            field, "_resolved_compose", return_value=resolved
-        ), mock.patch.object(
-            field, "_bring_up"
-        ) as brought_up, mock.patch.object(
-            field, "_lab_validator", return_value=_LAB_MODE
-        ), mock.patch.object(
-            field, "_service_container", return_value="cid-v"
-        ), mock.patch.object(
-            field, "_container_address", return_value="172.19.0.2"
-        ):
-            (lab_dir.parent / "scratch").mkdir(exist_ok=True)
-            return field.run_demo_target("up", lab_dir, **kwargs), brought_up
-
-    def test_it_prints_a_real_host_and_port_to_point_at(self) -> None:
-        with _lab() as lab_dir:
-            result, _ = self._up(lab_dir, container_port=8000)
-        self.assertEqual(result["target"], "172.19.0.2:8000")
-        self.assertIs(result["running"], True)
-
-    def test_the_fixed_build_is_never_started(self) -> None:
-        """The differential is the lab's job, already done.
-
-        A demo that reached the fixed build by accident would show nothing,
-        so only the vulnerable one comes up.
-        """
-        with _lab() as lab_dir:
-            _, brought_up = self._up(lab_dir, container_port=8000)
-        services = brought_up.call_args.args[0]
-        self.assertIn("vulnerable", services)
-        self.assertNotIn("patched", services)
-
-    def test_the_port_comes_from_the_proved_record_when_not_given(self) -> None:
-        with _lab(record={"container_port": 9090}) as lab_dir:
-            result, _ = self._up(lab_dir)
-        self.assertEqual(result["target"], "172.19.0.2:9090")
-
-    def test_without_a_port_or_a_record_it_says_what_is_missing(self) -> None:
-        with _lab() as lab_dir:
-            with self.assertRaises(RuntimeError) as raised:
-                self._up(lab_dir)
-            self.assertIn("--container-port", str(raised.exception))
-
-    def test_the_override_lifts_internal_and_is_not_auto_loaded(self) -> None:
-        """docker-compose.override.yml is loaded by name.
-
-        Left behind under that name, or inside the lab, it would quietly
-        change every later run of the lab.
-        """
-        fragment = field._demo_override(["lab_internal", "lab_back"])
-        self.assertIn("lab_internal:\n    internal: false", fragment)
-        self.assertIn("lab_back:\n    internal: false", fragment)
-        self.assertIn("demo-target down", fragment)
-        source = Path(field.__file__).read_text(encoding="utf-8")
-        self.assertNotIn("docker-compose.override.yml\"", source)
-        self.assertNotIn("lab_dir / \"docker-compose.demo.yml\"", source)
-
-    def test_down_restores_the_lab_and_reports_it(self) -> None:
-        with _lab() as lab_dir, mock.patch.object(
-            field, "prepare_compose",
-            return_value=("docker", {}, ["docker", "compose"], lab_dir.parent / "scratch"),
-        ), mock.patch.object(
-            field.subprocess, "run",
-            return_value=subprocess.CompletedProcess(["docker"], 0, "", ""),
-        ) as run:
-            (lab_dir.parent / "scratch").mkdir(exist_ok=True)
-            result = field.run_demo_target("down", lab_dir)
-        self.assertIs(result["running"], False)
-        self.assertIn("down", run.call_args.args[0])
 
 
 class ContainerLookupTests(unittest.TestCase):
@@ -3782,14 +3705,16 @@ class NamesCannotCollideTests(unittest.TestCase):
     #: constants and spelled out where the writer spells it out. Three names
     #: left this list when the two scripts were merged, which is three fewer
     #: chances to collide -- but the merged name has to be checked too, and
-    #: `PoC.py` against `PoC.ps1` is the pair that is nearly one.
+    #: `PoC.py` against `PoC.ps1` is the pair that is nearly one. Two more
+    #: left with `cvelab field`: field-poc.py and field-spec.json were the
+    #: closed-image field lab's own deliverables, and nothing writes them.
     ARTIFACT_NAMES = (
         field.POC_NAME,
         field.LAB_POC_GUIDE_NAME,
         "PoC.ps1", "manual.sh",
         "REPORT.md", "WALKTHROUGH.md",
         "EVIDENCE.json", "report.json", "plan.json", "contract.json",
-        "analysis.json", "field-poc.py", "field-spec.json",
+        "analysis.json",
     )
 
     def test_no_two_artifact_names_differ_only_by_case(self) -> None:
@@ -3923,14 +3848,6 @@ class CommandLineTests(unittest.TestCase):
             self.assertIn("CVE-2026-0001", said)
             self.assertIn("plan.json", said)
             self.assertIn("cvelab auto", said)
-
-    def test_demo_target_takes_up_or_down(self) -> None:
-        for action in ("up", "down"):
-            with self.subTest(action=action):
-                args = cli.parser().parse_args(["demo-target", action, "/labs/X"])
-                self.assertEqual(args.action, action)
-        with self.assertRaises(SystemExit):
-            cli.parser().parse_args(["demo-target", "sideways", "/labs/X"])
 
 
 class DraftedSpecTests(unittest.TestCase):
@@ -4143,7 +4060,7 @@ class HookOptionsTests(unittest.TestCase):
 
     def test_a_command_that_never_validates_has_no_such_flag(self) -> None:
         """The dispatch reads it with getattr, so absence means skipped."""
-        for argv in (["upload", "CVE-2026-0001"], ["demo-target", "up", "/lab"]):
+        for argv in (["upload", "CVE-2026-0001"], ["doctor"]):
             with self.subTest(command=argv[0]):
                 args = cli.parser().parse_args(argv)
                 self.assertFalse(hasattr(args, "no_manual_poc"))
