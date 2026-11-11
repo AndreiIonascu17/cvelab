@@ -39,12 +39,16 @@ possible, and the refusals for an answer that declares neither.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import re
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1077,6 +1081,1284 @@ def ran_address(port: int | None, published: str) -> str | None:
         if finished.returncode != 0:
             return None
         return finished.stdout.strip()
+
+
+class _Executing(_Product):
+    """The same product with the weakness it declares, actually working.
+
+    `_Product` answers `/run` by echoing the command back, which is enough to
+    measure that a line reaches the route as one command. A connect-back is
+    not a line to be echoed: it has to RUN, or nothing connects back and the
+    session mode has nothing to carry. So this one runs it, and the mode is
+    measured instead of asserted.
+
+    The command runs here and nowhere else: it is the one this test's own
+    artifact composed, sent to a server bound on this machine's loopback, and
+    the shell it starts connects straight back to the listener in the same
+    process tree.
+    """
+
+    spawned: list = []
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        type(self).asked.append((parsed.path, query))
+        if parsed.path != "/run":
+            self._answer(404, "not found")
+            return
+        held = "sid=lab-session" in (self.headers.get("Cookie") or "")
+        if not (held or type(self).seeded):
+            self._answer(403, "forbidden")
+            return
+        command = (query.get("cmd") or [""])[0]
+        child = subprocess.Popen(
+            ["/bin/sh", "-c", command], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        type(self).spawned.append(child)
+        try:
+            said = child.communicate(timeout=4)[0].decode("utf-8", "replace")
+        except subprocess.TimeoutExpired:
+            # A connect-back holds the request open for as long as the shell
+            # it started lives, which is the behaviour the mode is written
+            # for: it sends and does not wait.
+            said = "(still running)"
+        self._answer(200, "shell-ran " + said)
+
+
+class _Connecting(_Product):
+    """A product that connects back itself, as a build with no bash would.
+
+    `_Executing` runs the command, so what connects back is a real shell and
+    the session is whatever that shell does. This one runs nothing: it reads
+    the address and the nonce out of the command it was sent and connects
+    back with the behaviour the test asked for. That is how the three cases
+    the exit status has to tell apart are reached on demand -- a connection
+    that carries nothing, a connection that carries a few bytes and dies,
+    and a connection that carries a session -- without waiting for a shell
+    to misbehave on cue.
+
+    `presents` False is the impostor: it connects to the listener and acts
+    like a shell without the nonce, which is a session in something that is
+    not the build.
+    """
+
+    WHERE = re.compile(r"/dev/tcp/([0-9.]+)/([0-9]+)")
+    TOKEN = re.compile(r"\b[0-9a-f]{32}\b")
+    behaves = "session"
+    presents = True
+    knocks: list = []
+
+    @classmethod
+    def knock(cls, host: str, port: int, nonce: str) -> None:
+        held = socket.create_connection((host, port), timeout=10)
+        cls.knocks.append(held)
+        if cls.presents:
+            held.sendall((nonce + "\n").encode())
+        if cls.behaves == "silent":
+            held.close()
+            return
+        held.sendall(b"sh-4.4$ ")
+        if cls.behaves == "dies":
+            time.sleep(0.5)
+            held.close()
+            return
+        while True:
+            with contextlib.suppress(OSError):
+                line = held.recv(4096)
+                if not line:
+                    return
+                if b"id" in line:
+                    held.sendall(b"uid=0(root) gid=0(root)\nsh-4.4$ ")
+                if b"exit" in line:
+                    held.close()
+                    return
+                continue
+            return
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        type(self).asked.append((parsed.path, query))
+        if parsed.path != "/run":
+            self._answer(404, "not found")
+            return
+        command = (query.get("cmd") or [""])[0]
+        where = self.WHERE.search(command)
+        token = self.TOKEN.search(command)
+        if where and token:
+            threading.Thread(
+                target=type(self).knock,
+                args=(where.group(1), int(where.group(2)), token.group(0)),
+                daemon=True,
+            ).start()
+        self._answer(200, "shell-ran " + command)
+
+
+class _Knocking:
+    """`_Connecting` on a loopback port, with the behaviour to use."""
+
+    def __init__(self, behaves: str = "session", presents: bool = True) -> None:
+        self.behaves = behaves
+        self.presents = presents
+
+    def __enter__(self) -> tuple[str, list]:
+        handler = type("_Bound", (_Connecting,), {
+            "seeded": True, "asked": [], "knocks": [],
+            "behaves": self.behaves, "presents": self.presents,
+        })
+        self.handler = handler
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.server.server_address[:2]
+        return f"{host}:{port}", handler.asked
+
+    def __exit__(self, *_: object) -> None:
+        for held in self.handler.knocks:
+            with contextlib.suppress(OSError):
+                held.close()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+
+class _Working:
+    """`_Executing` on a loopback port, and the children it left behind."""
+
+    def __enter__(self) -> tuple[str, list]:
+        handler = type("_Bound", (_Executing,), {"seeded": False, "asked": [], "spawned": []})
+        self.handler = handler
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.server.server_address[:2]
+        return f"{host}:{port}", handler.asked
+
+    def __exit__(self, *_: object) -> None:
+        for child in self.handler.spawned:
+            if child.poll() is None:
+                child.terminate()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    child.wait(timeout=5)
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+
+class TheSessionIsCarriedToTheProductTests(unittest.TestCase):
+    """`--reverse-shell`, measured end to end, because nothing else can be.
+
+    Of the labs in the archive whose declared evidence is command execution,
+    every single one names something in `fidelity.simulated_components`, so
+    ZERO qualify for this mode and it ships dormant. That is the owner's
+    decision and not an oversight -- a pseudo-shell on an adapter-routed lab
+    is visibly the same thing as one echoed command, and a session prompt is
+    the artifact most easily mistaken for real access.
+
+    It also means that without this class the whole proof path -- listener,
+    connect-back, relay, exit status -- would be code that never runs
+    anywhere, which is the defect the feature was written against. So the
+    lab here is synthetic and everything else is real: the validator beside
+    these tests is the smallest script `_OPERATOR_CONTRACT` admits and
+    implements the one-command form, the product is on a real socket and
+    really runs what it is sent, and the shell that comes back is a shell.
+    """
+
+    def plan(self, **extra: object) -> dict:
+        held = {
+            "cve": "CVE-2026-0001",
+            "lab_type": "END_TO_END_REPRODUCTION",
+            "repository": "https://example.invalid/p.git",
+            "exploit_contract": contract(),
+            "fidelity": {"simulated_components": [], "vendor_product_started": True},
+        }
+        held.update(extra)
+        return held
+
+    def artifact(self, **extra: object) -> str:
+        return field.emit_poc(
+            "CVE-2026-0001", self.plan(**extra),
+            FIXTURE.read_text(encoding="utf-8"),
+            {"shipped": False, "reason": "nothing was proved against one instance",
+             "reverse_shell": {"shipped": True, "form": "bash-devtcp"}},
+        )
+
+    def ran(
+        self, text: str, *argv: str, typed: str = "", port: str = ""
+    ) -> tuple[str, str, int]:
+        environment = dict(os.environ)
+        for name in ("CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "CVELAB_BOUND"):
+            environment.pop(name, None)
+        if port:
+            environment["CVELAB_FIXTURE_PORT"] = port
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / field.POC_NAME
+            path.write_text(text, encoding="utf-8")
+            finished = subprocess.run(
+                [sys.executable, str(path), *argv], input=typed,
+                capture_output=True, text=True, timeout=300, env=environment,
+            )
+        return finished.stdout, finished.stderr, finished.returncode
+
+    def session(
+        self, address: str, typed: str, *extra: str
+    ) -> tuple[str, str, int]:
+        return self.ran(
+            self.artifact(), "--lab-address", address, "--reverse-shell",
+            "--allow-shell", "--callback-bind", "127.0.0.1:0",
+            "--callback-wait", "8", *extra,
+            typed=typed, port=address.rsplit(":", 1)[1],
+        )
+
+    def test_the_mode_is_offered_for_a_lab_that_qualifies(self) -> None:
+        offered, reason = field.reverse_shell_standing(
+            self.plan(), FIXTURE.read_text(encoding="utf-8"),
+            {"reverse_shell": {"shipped": True}},
+        )
+        self.assertTrue(offered, reason)
+        self.assertIn("--reverse-shell", self.artifact())
+
+    def test_a_shell_lands_on_the_product_and_the_session_is_carried(self) -> None:
+        """The whole of it, once, against a product that runs what it is sent.
+
+        What is held: the connect-back went out as ONE command through the
+        lab program's own address path, something connected back to this
+        file's own listener, a line typed at this end was answered by a shell
+        at the other end, and the answer is on stdout while every word of
+        this file's own is on stderr.
+        """
+        with _Working() as (address, asked):
+            said, complained, code = self.session(address, "id\nexit\n")
+        self.assertEqual(code, 0, complained)
+        # The target's own answer, which is not the text that was typed: a
+        # connect-back that spawns a pty echoes its input, so `uid=` is the
+        # check and `id` is not.
+        self.assertIn("uid=", said)
+        self.assertNotIn("uid=", "id\nexit\n")
+        # One connect-back, through the address path's own session -- the
+        # product refuses /run to a caller that has not logged in.
+        sent = self.delivered(asked)
+        self.assertEqual(len(sent), 1, sent)
+        self.assertEqual([path for path, _ in asked][:2], ["/login", "/run"])
+        # And the chrome is all on stderr, so a redirected run is the session.
+        together = " ".join(complained.split())
+        self.assertIn("connect-back landed:", complained)
+        self.assertIn("real interactive access", together)
+        self.assertNotIn("real interactive access", said)
+
+    @staticmethod
+    def listening(complained: str) -> str:
+        """The address this file said it bound, read back out of its own chrome.
+
+        On its own line now: the one that carried the bind AND what the build
+        would be told was a 79-column line in a 78-column file at an address
+        as short as 8.8.8.8.
+        """
+        return complained.partition("[listening on ")[2].partition("]")[0].strip()
+
+    @staticmethod
+    def told(complained: str) -> str:
+        """The address this file said the build would be told to reach."""
+        return (
+            complained.partition("[the build will be told to reach ")[2]
+            .partition("]")[0].strip()
+        )
+
+    def delivered(self, asked: list) -> list[str]:
+        return [
+            (query.get("cmd") or [""])[0]
+            for path, query in asked if path == "/run"
+        ]
+
+    def filled(self, form: str, where: str) -> str:
+        """A form with the two substitutions a test can predict.
+
+        @NONCE@ is left standing, because a test cannot know it: it is made
+        by the artifact at delivery time, per delivery. `masked` below puts
+        it back so the rest of the form can be compared verbatim.
+        """
+        host, _, port = where.rpartition(":")
+        return form.replace("@HOST@", host).replace("@PORT@", port)
+
+    NONCE = re.compile(r"\b[0-9a-f]{32}\b")
+
+    def masked(self, command: str) -> str:
+        return self.NONCE.sub("@NONCE@", command)
+
+    def nonces(self, asked: list) -> list[str]:
+        """Every nonce the artifact actually put on the wire, in order."""
+        found = [self.NONCE.search(one) for one in self.delivered(asked)]
+        return [one.group(0) for one in found if one]
+
+    # --- what the exit status is worth ------------------------------------
+
+    def test_a_landing_that_carried_nothing_is_not_exit_zero(self) -> None:
+        """`--reverse-shell && echo proved` printed `proved` for this.
+
+        The connection is the build's own -- it presents the nonce, so the
+        attribution is not in question -- and it closes without sending a
+        byte. That is a socket and not a session: a connect-back can write
+        its nonce and then fail to spawn anything at all, and the only
+        evidence a shell was there is bytes coming back from one.
+
+        Exit 1 and not 2: this file did not refuse, it delivered and got an
+        answer. The byte count was printed on every run and gated nothing.
+        """
+        with _Knocking(behaves="silent") as (address, asked):
+            said, complained, code = self.session(address, "id\nexit\n")
+        self.assertEqual(code, 1, complained)
+        self.assertEqual(said, "")
+        # Attributed, and said to be: the refusal is about the session being
+        # empty and not about the connection being a stranger's.
+        self.assertIn(field._REVERSE_LANDED_PREFIX, complained)
+        self.assertIn("not one byte came back through it", complained)
+        self.assertIn("is a socket and not a session", complained)
+        self.assertNotIn("bytes came back from the build", complained)
+
+    def test_a_session_that_carried_something_is_exit_zero(self) -> None:
+        """And the line says how it ended, which the count cannot.
+
+        A session that carried bytes and then died mid-way is a session that
+        happened: it is this exit with the ending named, not a failure. The
+        line between the two is one byte, and it is there because this mode
+        interprets nothing in the stream -- there is no honest bar above "it
+        carried something" that could be held without reading the session.
+        """
+        with _Knocking(behaves="session") as (address, asked):
+            said, complained, code = self.session(address, "id\nexit\n")
+        self.assertEqual(code, 0, complained)
+        self.assertIn("uid=", said)
+        self.assertIn("bytes came back from the build", complained)
+        self.assertNotIn("is a socket and not a session", complained)
+        # The nonce is the handshake and is not counted as the build
+        # answering, and it never reaches the operator's session either.
+        self.assertNotIn(self.nonces(asked)[0], said)
+        moved = int(
+            complained.partition("ended")[2].partition(". ")[2].split()[0]
+        )
+        self.assertEqual(moved, len(said))
+
+    def test_a_session_that_died_mid_way_still_happened(self) -> None:
+        with _Knocking(behaves="dies") as (address, asked):
+            said, complained, code = self.session(address, "id\nexit\n")
+        self.assertEqual(code, 0, complained)
+        self.assertIn("sh-4.4$", said)
+        self.assertIn("bytes came back from the build", complained)
+
+    # --- what a landing is attributed to ----------------------------------
+
+    def test_a_connection_with_no_nonce_is_not_a_landing(self) -> None:
+        """The impostor. Nothing runs anywhere and something answers.
+
+        Measured on the shape this replaces: an unrelated local process
+        connected to the bound port, behaved like a shell, and the run
+        exited 0 reporting `[connect-back landed: bash-devtcp, from
+        127.0.0.1]` and N bytes "from the build". The operator had a session
+        in something that was not the build and was told it was the build --
+        and the generation-time proof would have recorded `shipped: True`
+        with a form name that never ran.
+        """
+        with _Knocking(behaves="session", presents=False) as (address, asked):
+            said, complained, code = self.session(address, "id\nexit\n")
+        self.assertEqual(code, 1, complained)
+        # Not a session: nothing of the impostor's reaches the operator.
+        self.assertEqual(said, "")
+        self.assertNotIn(field._REVERSE_LANDED_PREFIX, complained)
+        self.assertNotIn("bytes came back from the build", complained)
+        # Said, and said as what it is, rather than passed off or dropped --
+        # and said in a sentence that is true of a first line that was read
+        # and was no nonce AND of one that had not been read yet, which the
+        # one it replaces was not: it asserted that none of them carried a
+        # nonce about connections whose nonce was still in flight.
+        together = " ".join(complained.split())
+        self.assertIn("not one was a landing", together)
+        self.assertIn("1 had its first line read and it was no nonce", together)
+        self.assertIn("0 had not been read yet when this gave up", together)
+        self.assertNotIn("none carried a nonce this run issued", together)
+        # And every form was still tried, because none of them landed.
+        self.assertEqual(
+            len(self.delivered(asked)), len(field.REVERSE_FORMS)
+        )
+
+    def test_the_form_named_is_the_form_that_caused_the_connection(self) -> None:
+        """The slow form. No adversary needed: a cold start on a loaded host.
+
+        The product delays the connect-back for the FIRST form past
+        --callback-wait, so it lands while a later delivery is in flight.
+        The landing used to be attributed to whichever delivery was most
+        recently sent -- reported as nc-fifo while stdout was visibly a bash
+        shell, with the header's FIFO-cleanup sentence describing a form that
+        never executed. The nonce settles it: only the command this file sent
+        for THAT form knew that nonce.
+        """
+        class _Slow(_Connecting):
+            delay = 3.0
+            seen: list = []
+
+            @classmethod
+            def knock(cls, host: str, port: int, nonce: str) -> None:
+                cls.seen.append(nonce)
+                if nonce == cls.seen[0]:
+                    time.sleep(cls.delay)
+                    _Connecting.knock.__func__(cls, host, port, nonce)
+
+        handler = type("_Bound", (_Slow,), {
+            "seeded": True, "asked": [], "knocks": [], "seen": [],
+            "behaves": "session", "presents": True,
+        })
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        host, port = server.server_address[:2]
+        said, complained, code = self.ran(
+            self.artifact(), "--lab-address", f"{host}:{port}",
+            "--reverse-shell", "--allow-shell", "--callback-bind",
+            "127.0.0.1:0", "--callback-wait", "1",
+            typed="id\nexit\n", port=str(port),
+        )
+        self.assertEqual(code, 0, complained)
+        self.assertIn("uid=", said)
+        landed = complained.partition(field._REVERSE_LANDED_PREFIX)[2].partition(
+            ","
+        )[0].strip()
+        # The first form, which is the one that actually ran -- not the last
+        # one sent, which is what the delivery loop's own variable held.
+        self.assertEqual(landed, field.REVERSE_FORMS[0][0])
+        self.assertEqual(handler.seen[0], self.nonces(handler.asked)[0])
+        # And the operator is told that later deliveries ran on the build.
+        self.assertIn("is not the last of them", complained)
+
+    def test_a_wildcard_bind_with_a_callback_says_what_it_is(self) -> None:
+        """It used to be silent, which was the impostor's precondition.
+
+        Refused only when --callback was absent, so `--callback-bind
+        0.0.0.0:PORT --callback 127.0.0.1:PORT` bound every interface and
+        said nothing. Named rather than refused: that pairing is the
+        arrangement NAT and a port mapping need, and the nonce means the
+        exposure is a port anyone can knock on rather than a session anyone
+        can take. What stays true is stated, including the nonce's limit.
+        """
+        with _Knocking(behaves="session") as (address, asked):
+            port = address.rsplit(":", 1)[1]
+            said, complained, code = self.ran(
+                self.artifact(), "--lab-address", address, "--reverse-shell",
+                "--allow-shell", "--callback-bind", "0.0.0.0:0",
+                # Host only, so the bound port is the one the build is told.
+                "--callback", "127.0.0.1", "--callback-wait", "8",
+                typed="id\nexit\n", port=port,
+            )
+        self.assertEqual(code, 0, complained)
+        self.assertIn("uid=", said)
+        together = " ".join(complained.split())
+        self.assertIn("That bind is every interface on this machine", together)
+        self.assertIn("closed unread and counted", together)
+        self.assertIn("anything that can read this lab's own request", together)
+        # A wildcard bind with no --callback is still refused, because there
+        # is then no address to tell the build about at all.
+        _, refused, code = self.ran(
+            self.artifact(), "--lab-address", address, "--reverse-shell",
+            "--allow-shell", "--callback-bind", "0.0.0.0:0", port=port,
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("bound to every interface", refused)
+
+    # --- a nonce that arrives a beat late --------------------------------
+
+    def _serving(self, handler: type) -> tuple[str, type]:
+        """One of these products on a loopback port, torn down afterwards."""
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        host, port = server.server_address[:2]
+        return f"{host}:{port}", handler
+
+    def test_a_nonce_a_beat_late_is_still_the_session(self) -> None:
+        """The window between the last delivery and the listener closing.
+
+        `arrivals` is incremented at accept time on purpose, because the
+        nonce read can still be in flight when the delivery loop gives up.
+        What happened to such a connection was that the loop ended, `close()`
+        set `released`, and the handler registered the landing after it: the
+        session was lost AND the file then asserted that none of the
+        connections that arrived had carried a nonce this run issued, which
+        was false about the only one that had. Measured at a nonce written
+        4.7 seconds after the connect against a one-second wait per form.
+
+        Here the first line arrives in pieces and is finished only after
+        every form has been delivered and the loop has had its grace, so the
+        nonce is complete strictly after the loop gave up -- and nothing in
+        the timing depends on how fast this machine is, because every piece
+        refreshes the greeting read's own timeout.
+        """
+        class _Late(_Connecting):
+            seen: list = []
+
+            @classmethod
+            def knock(cls, host: str, port: int, nonce: str) -> None:
+                cls.seen.append(nonce)
+                held = socket.create_connection((host, port), timeout=30)
+                cls.knocks.append(held)
+                held.sendall(nonce[:1].encode())
+                gone = 1
+                while gone < 24 and len(
+                    [one for one, _ in cls.asked if one == "/run"]
+                ) < len(field.REVERSE_FORMS):
+                    time.sleep(1.0)
+                    held.sendall(nonce[gone:gone + 1].encode())
+                    gone += 1
+                # The loop's own grace after the last delivery, and then the
+                # rest of the nonce.
+                time.sleep(2.5)
+                held.sendall(nonce[gone:].encode() + b"\n")
+                held.sendall(b"uid=0(root) gid=0(root)\n")
+                with contextlib.suppress(OSError):
+                    while held.recv(4096):
+                        pass
+
+        address, handler = self._serving(type("_Bound", (_Late,), {
+            "seeded": True, "asked": [], "knocks": [], "seen": [],
+        }))
+        self.addCleanup(self._shut, handler)
+        port = address.rsplit(":", 1)[1]
+        said, complained, code = self.ran(
+            self.artifact(), "--lab-address", address, "--reverse-shell",
+            "--allow-shell", "--callback-bind", "127.0.0.1:0",
+            "--callback-wait", "1", typed="exit\n", port=port,
+        )
+        self.assertEqual(code, 0, complained)
+        self.assertIn("uid=", said)
+        # Every form went out, so the loop really did run to the end before
+        # this one finished presenting itself.
+        self.assertEqual(
+            len(self.delivered(handler.asked)), len(field.REVERSE_FORMS)
+        )
+        landed = complained.partition(field._REVERSE_LANDED_PREFIX)[2].partition(
+            ","
+        )[0].strip()
+        self.assertEqual(landed, field.REVERSE_FORMS[0][0])
+        # And the sentence that used to be printed instead is not.
+        self.assertNotIn("not one was a landing", complained)
+
+    @staticmethod
+    def _shut(handler: type) -> None:
+        for held in handler.knocks:
+            with contextlib.suppress(OSError):
+                held.close()
+
+    def test_the_late_wait_is_only_paid_where_a_first_line_may_still_come(
+        self,
+    ) -> None:
+        """The cost of that wait, charged to the case it exists for.
+
+        Bounded by the seconds a greeting is given, and asked for only where
+        a first line has not been read yet. Measured as a difference rather
+        than against a clock, so the numbers hold on any machine: a run where
+        nothing connects and a run where an impostor connects and speaks at
+        once are both answered as soon as the deliveries run out, while a
+        connection whose first line is still arriving is waited for.
+
+        And the sentence, in both of the shapes it has to be true in. The one
+        it replaces asserted that none of the connections that arrived
+        "carried a nonce this run issued", which was a claim about
+        connections whose first line had never been read.
+        """
+        class _Stranger(_Connecting):
+            says = "line"
+
+            @classmethod
+            def knock(cls, host: str, port: int, nonce: str) -> None:
+                held = socket.create_connection((host, port), timeout=60)
+                cls.knocks.append(held)
+                if cls.says == "line":
+                    # A whole line, so the greeting read finishes at once --
+                    # and no nonce of this run's, so it is not the landing.
+                    held.sendall(b"not-a-nonce-of-this-run\n")
+                    return
+                if cls.says == "dribble":
+                    # Never finishes a line, and refreshes the read's own
+                    # timeout as it goes: still being read when the wait
+                    # above runs out, which is the other half of the report.
+                    for _ in range(12):
+                        with contextlib.suppress(OSError):
+                            held.sendall(b"x")
+                        time.sleep(3.0)
+                    return
+                # Connects, says nothing, and does not close either.
+                with contextlib.suppress(OSError):
+                    while held.recv(4096):
+                        pass
+
+        def timed(address: str) -> tuple[float, str, int]:
+            began = time.monotonic()
+            _, complained, code = self.ran(
+                self.artifact(), "--lab-address", address, "--reverse-shell",
+                "--allow-shell", "--callback-bind", "127.0.0.1:0",
+                "--callback-wait", "1", typed="exit\n",
+                port=address.rsplit(":", 1)[1],
+            )
+            return time.monotonic() - began, " ".join(complained.split()), code
+
+        def against(says: str) -> tuple[float, str, int]:
+            address, handler = self._serving(type("_Bound", (_Stranger,), {
+                "seeded": True, "asked": [], "knocks": [], "says": says,
+            }))
+            self.addCleanup(self._shut, handler)
+            return timed(address)
+
+        with stub(seeded=False) as (address, _):
+            nobody, said_nobody, code_nobody = timed(address)
+        spoke, said_spoke, code_spoke = against("line")
+        mute, said_mute, code_mute = against("nothing")
+        drip, said_drip, code_drip = against("dribble")
+        for code in (code_nobody, code_spoke, code_mute, code_drip):
+            self.assertEqual(code, 1)
+        # Nothing connected, so there was nothing to wait for and nothing to
+        # report about.
+        self.assertNotIn("connection(s) arrived", said_nobody)
+        # One did and had already spoken, so there was nothing to wait for
+        # either: this must not cost the greeting wait.
+        self.assertIn("1 had its first line read and it was no nonce", said_spoke)
+        self.assertIn("0 had not been read yet", said_spoke)
+        self.assertLess(spoke - nobody, field.REVERSE_GREETING_WAIT / 2)
+        # One that says nothing at all IS waited for, and by the end of the
+        # wait its read has run out, so it is reported as read and silent --
+        # which the sentence says in as many words.
+        self.assertIn("1 had its first line read and it was no nonce", said_mute)
+        self.assertIn(
+            f"it said nothing in the {field.REVERSE_GREETING_WAIT} seconds a "
+            "greeting is given",
+            said_mute,
+        )
+        self.assertGreater(mute - spoke, field.REVERSE_GREETING_WAIT / 2)
+        # And one whose line is still arriving when the wait runs out is the
+        # other half: not read yet, and said so rather than claimed about.
+        # A dribbler is now READ and silent, not still-being-read, and that
+        # is `greeting`'s bound having become total rather than per-`recv`.
+        # Set once, the timeout bounded each read, so a connection sending
+        # one byte at a time held its handler for the limit times the wait
+        # -- measured still reading at 20 seconds against a bound of 8 --
+        # and was reported as not read yet because it genuinely was not.
+        # With a deadline across the reads it expires inside the bound, so
+        # it HAS been given its chance and is reported as having said
+        # nothing in it, which is the truer of the two sentences.
+        self.assertIn("1 had its first line read", said_drip)
+        self.assertIn("0 had not been read yet when this gave up", said_drip)
+        self.assertIn("the ones it read came from", said_drip)
+
+    def test_the_banner_does_not_claim_a_session_that_did_not_happen(self) -> None:
+        """The headline is before the delivery, so it cannot be a fact.
+
+        It read "a session, not a prompt" on every run, including the ones
+        that end at exit 1 with nothing having connected back. The sentences
+        stay -- they are the operator's reason to stop, and they have to be
+        up before the first command goes out -- and the claim does not.
+        """
+        with stub(seeded=False) as (address, asked):
+            _, complained, code = self.session(address, "id\nexit\n")
+        self.assertEqual(code, 1)
+        together = " ".join(complained.split())
+        self.assertIn("What this opens is a session and not a prompt", together)
+        self.assertIn("Nothing has been sent yet", together)
+        self.assertNotIn("--reverse-shell: a session, not a prompt", together)
+        # The banner itself is still there, before anything was delivered.
+        self.assertIn("real interactive access", together)
+
+    def test_a_later_connection_is_counted_after_the_session_not_before(
+        self,
+    ) -> None:
+        """The accounting the listener's docstring is written for.
+
+        A second connection arrives DURING the session, which is the only
+        time a slow form can land on a live one. The count was read on the
+        line after the landing, where it is always zero.
+        """
+        class _Twice(_Connecting):
+            @classmethod
+            def knock(cls, host: str, port: int, nonce: str) -> None:
+                held = socket.create_connection((host, port), timeout=10)
+                cls.knocks.append(held)
+                held.sendall((nonce + "\n").encode())
+                held.sendall(b"sh-4.4$ ")
+                # Wait for the relay to be carrying this one before the
+                # second arrives: the point of the measurement is a
+                # connection landing DURING a live session, which is the
+                # only time a slow form of this one's own can.
+                held.recv(4096)
+                spare = socket.create_connection((host, port), timeout=5)
+                cls.knocks.append(spare)
+                spare.sendall((nonce + "\n").encode())
+                time.sleep(0.5)
+                held.sendall(b"uid=0(root) gid=0(root)\n")
+                held.close()
+
+        handler = type("_Bound", (_Twice,), {
+            "seeded": True, "asked": [], "knocks": [],
+            "behaves": "session", "presents": True,
+        })
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        host, port = server.server_address[:2]
+        said, complained, code = self.ran(
+            self.artifact(), "--lab-address", f"{host}:{port}",
+            "--reverse-shell", "--allow-shell", "--callback-bind",
+            "127.0.0.1:0", "--callback-wait", "8",
+            typed="id\nsleep 1\nexit\n", port=str(port),
+        )
+        self.assertEqual(code, 0, complained)
+        # One keyboard, one session: the extra is closed and counted, and
+        # nothing of it is in the transcript.
+        self.assertIn("closed unread", complained)
+        self.assertIn("one keyboard, one session", complained)
+
+    def test_the_form_that_landed_is_named_and_was_sent_verbatim(self) -> None:
+        """Which form works is a measurement and not a constant to trust.
+
+        The artifact tries an ordered set and says which one landed, because
+        what can work is a fact about what is in the image: measured across
+        five images, a busybox image has only `nc`, a slim Debian image has
+        no `nc` at all, and the archive's one lab with a verified
+        one-command form has bash and perl and no python3.
+        """
+        with _Working() as (address, asked):
+            _, complained, code = self.session(address, "id\nexit\n")
+        self.assertEqual(code, 0, complained)
+        landed = complained.partition(field._REVERSE_LANDED_PREFIX)[2].partition(
+            ","
+        )[0].strip()
+        self.assertIn(landed, [name for name, _ in field.REVERSE_FORMS])
+        sent = self.delivered(asked)
+        self.assertEqual(
+            self.masked(sent[-1]),
+            self.filled(dict(field.REVERSE_FORMS)[landed],
+                        self.listening(complained)),
+        )
+        # And the form named is the form whose nonce came back, which is what
+        # the attribution is: the nonce that was in that delivery and in no
+        # other is the one the connection presented.
+        self.assertEqual(len(self.nonces(asked)), len(sent))
+        self.assertEqual(len(set(self.nonces(asked))), len(sent))
+
+    def test_nothing_in_the_session_is_interpreted_on_this_side(self) -> None:
+        """The difference from the prompt, measured.
+
+        `--shell` reads `cd` and prefixes it to the next command, because
+        there is nothing on the other end that can hold a directory. Here
+        there is: the shell that connected back has its own, so `cd` is sent
+        and answered on the target and this file never sees it.
+        """
+        with _Working() as (address, asked):
+            said, complained, code = self.session(
+                address, "cd /\npwd\nexit\n"
+            )
+        self.assertEqual(code, 0, complained)
+        self.assertIn("\n/\n", said.replace("\r", ""))
+        sent = self.delivered(asked)
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn("cd / &&", sent[0])
+        self.assertNotIn("[cd simulated]", complained)
+
+    def test_nothing_connecting_back_is_a_result_and_not_a_refusal(self) -> None:
+        """Against the product that echoes instead of running.
+
+        Exit 1: the forms were delivered and nothing came back, which is an
+        answer. Exit 2 would say this file refused, and exit 0 would say a
+        session happened -- which is the rule the prompt beside this one
+        breaks, where a run in which no line ever ran still exits 0.
+        """
+        with stub(seeded=False) as (address, asked):
+            said, complained, code = self.session(address, "id\nexit\n")
+        self.assertEqual(code, 1)
+        self.assertEqual(said, "")
+        self.assertIn("Nothing connected back", " ".join(complained.split()))
+        where = self.listening(complained)
+        self.assertEqual(
+            [self.masked(one) for one in self.delivered(asked)],
+            [self.filled(form, where) for _, form in field.REVERSE_FORMS],
+        )
+        # Every form was delivered -- this product answers 200 -- so the
+        # cause named is the image and not the lab program refusing.
+        for name, _ in field.REVERSE_FORMS:
+            with self.subTest(name=name):
+                self.assertIn(
+                    f"  {name}: delivered; nothing carrying its nonce connected back",
+                    complained,
+                )
+                self.assertNotIn(f"  {name}: NOT delivered", complained)
+
+    def test_the_no_argument_path_is_unchanged_with_the_session_in_the_file(
+        self,
+    ) -> None:
+        """The path every proof rests on, measured with the mode present."""
+        text = self.artifact()
+        self.assertIn("_reverse_given(sys.argv)", text)
+        with tempfile.TemporaryDirectory() as temporary:
+            alone = Path(temporary) / "validator.py"
+            alone.write_text(FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+            merged = Path(temporary) / field.POC_NAME
+            merged.write_text(text, encoding="utf-8")
+            environment = dict(os.environ)
+            for name in ("CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "CVELAB_BOUND"):
+                environment.pop(name, None)
+            runs = [
+                subprocess.run(
+                    [sys.executable, str(script)], capture_output=True, text=True,
+                    timeout=60, env=environment,
+                )
+                for script in (merged, alone)
+            ]
+        self.assertEqual(runs[0].stdout, runs[1].stdout)
+        self.assertEqual(runs[0].returncode, runs[1].returncode)
+
+    def test_a_lab_with_an_adapter_is_offered_no_session(self) -> None:
+        text = field.emit_poc(
+            "CVE-2026-0001",
+            self.plan(fidelity={"simulated_components": ["an adapter over the helper"]}),
+            FIXTURE.read_text(encoding="utf-8"),
+            {"shipped": False, "reason": "no", "reverse_shell": {"shipped": True}},
+        )
+        self.assertNotIn("--reverse-shell", text)
+        # Typed at a file that has no such mode, the words are not a mode and
+        # are not read as one. With no address they reach remote mode's own
+        # refusal; with one they become the command, which the lab program
+        # refuses because there are three positionals and it takes two. The
+        # flag is absent from the file entirely, so there is nothing here
+        # that could name it instead -- and either way it is exit 2 with
+        # nothing on stdout.
+        said, complained, code = self.ran(
+            text, "--reverse-shell", "--allow-shell", "--callback-bind", "127.0.0.1:0",
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(said, "")
+        self.assertIn("no remote mode", complained)
+        said, complained, code = self.ran(
+            text, "--lab-address", "127.0.0.1:1", "--reverse-shell", "--allow-shell",
+            "--callback-bind", "127.0.0.1:0",
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(said, "")
+        self.assertIn("usage", complained)
+
+
+class TheOutboundAddressTests(unittest.TestCase):
+    """What `--callback` tells the build to reach, and who is told about it.
+
+    `--lab-address` refuses any address that is not loopback, by design: the
+    inbound direction was thought about. The outbound one was not. This flag
+    was accepted on nothing but "non-empty, no colon in it", so
+    `--callback 8.8.8.8:4444` was delivered in all four forms and
+    `--callback =` became `/dev/tcp/=/49987`, under one line of chrome -- and
+    the refusal beneath it claimed the flag "takes an IPv4 address this build
+    has to reach", which neither a DNS name nor `=` is.
+
+    Two things here, and they are deliberately not the same thing. What the
+    flag claims to accept it now checks: an address written out, or a name
+    that resolves from here. And what it accepts and cannot account for it
+    cautions about rather than refuses -- NAT and a port mapping are real,
+    and an operator does have to be able to name an address that is neither
+    loopback nor this machine's. The nonce argument that makes warning right
+    for a wildcard BIND does not carry over: the nonce travels inside the
+    delivered command, so a build told to reach a stranger hands that
+    stranger the nonce and the session with it.
+    """
+
+    plan = TheSessionIsCarriedToTheProductTests.plan
+    artifact = TheSessionIsCarriedToTheProductTests.artifact
+    ran = TheSessionIsCarriedToTheProductTests.ran
+    delivered = TheSessionIsCarriedToTheProductTests.delivered
+    session = TheSessionIsCarriedToTheProductTests.session
+    told = staticmethod(TheSessionIsCarriedToTheProductTests.told)
+    listening = staticmethod(TheSessionIsCarriedToTheProductTests.listening)
+
+    def against(self, *extra: str) -> tuple[str, int, list]:
+        """One run against a product that refuses every delivery.
+
+        Refusing is enough: what is being measured is what this file does
+        with the address before anything goes out, and what it says about it.
+        """
+        with stub(seeded=False) as (address, asked):
+            _, complained, code = self.ran(
+                self.artifact(), "--lab-address", address, "--reverse-shell",
+                "--allow-shell", "--callback-bind", "127.0.0.1:0",
+                "--callback-wait", "1", *extra,
+                port=address.rsplit(":", 1)[1],
+            )
+        return complained, code, asked
+
+    def test_a_callback_that_is_neither_an_address_nor_a_name_is_refused(
+        self,
+    ) -> None:
+        """And refused before anything is sent, which is the whole point."""
+        for told in ("=", "evil.invalid.invalid:4444", "8.8.8:4444",
+                     "0x7f.1:4444", "not a host:4444"):
+            with self.subTest(told=told):
+                complained, code, asked = self.against("--callback", told)
+                self.assertEqual(code, 2)
+                self.assertNotIn("[sending the ", complained)
+                self.assertEqual(self.delivered(asked), [])
+                said = " ".join(complained.split())
+                # The refusal says what is actually accepted, which the one
+                # it replaces did not: a name passed it while it claimed to
+                # take an address.
+                self.assertIn("an IPv4 address written out, or a name that", said)
+                self.assertIn("resolves to one from here", said)
+                self.assertIn(repr(told), said)
+
+    def test_a_name_that_resolves_is_accepted_and_told_to_the_build(self) -> None:
+        """Accepted, because every form can be given a name to connect to.
+
+        Delivered as it was typed and not as the address it resolves to here:
+        the build does its own resolving and a container's resolver is not
+        this host's.
+        """
+        complained, code, asked = self.against("--callback", "localhost:4444")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.told(complained), "localhost:4444")
+        for command in self.delivered(asked):
+            with self.subTest(command=command[:40]):
+                self.assertIn("localhost", command)
+        # Loopback, so nothing to caution about.
+        self.assertNotIn("not loopback, not an address of this machine", complained)
+
+    def test_an_address_nothing_can_connect_to_is_refused_not_cautioned(
+        self,
+    ) -> None:
+        """Where the line between refusing and cautioning actually falls.
+
+        The caution is for an address that CAN be a destination and cannot
+        be shown to be the operator's -- NAT and a port mapping are real.
+        These are the other thing: multicast, the reserved range above it
+        where the limited broadcast address lives, and 0.0.0.0/8. No TCP
+        connect-back reaches any of them, so a delivery naming one is a
+        command that cannot land.
+
+        They were not merely uncautioned, they were cautioned-proof:
+        `_reverse_is_this_machine` asks the kernel by binding, and Linux
+        lets a socket bind 255.255.255.255 and all of 224.0.0.0/4 -- so the
+        probe called them this machine's and the warning did not print.
+        Which is why the classification is read off the packed bytes and
+        happens before the probe is consulted at all.
+        """
+        for address in ("255.255.255.255", "224.0.0.1", "239.255.255.250",
+                        "240.0.0.1", "0.1.2.3"):
+            with self.subTest(address=address):
+                complained, code, asked = self.against(
+                    "--callback", address + ":4444"
+                )
+                self.assertEqual(code, 2)
+                self.assertIn(address, complained)
+                self.assertIn("multicast, reserved or", complained)
+                # Refused before anything went out, which is the point.
+                self.assertEqual(asked, [])
+                self.assertNotIn("is not loopback", complained)
+
+    def test_a_callback_port_of_zero_is_refused(self) -> None:
+        """Port 0 means something on the bind and nothing here.
+
+        `_reverse_at` allows it because `--callback-bind 127.0.0.1:0` is the
+        arrangement the proof itself uses, where the kernel picks the port.
+        Carried into `--callback` it told the build to reach a port nothing
+        can connect to, and the run delivered all four forms to it.
+        """
+        complained, code, asked = self.against("--callback", "1.2.3.4:0")
+        self.assertEqual(code, 2)
+        self.assertIn("port 0", complained)
+        self.assertEqual(asked, [])
+        # And the shape it exists for is still accepted.
+        _, kept, _ = self.against("--callback", "1.2.3.4:4444")
+        self.assertEqual(kept, 1)
+
+    def test_the_wildcard_is_refused_in_the_words_of_whoever_named_it(
+        self,
+    ) -> None:
+        """Two causes, two sentences, and each one true of its own cause.
+
+        Both used to reach the bind's text: "This listener is bound to every
+        interface. Name the one it can with --callback HOST:PORT" -- said to
+        an operator whose listener was on loopback and who had just named it
+        with --callback. Two false clauses and advice to do the thing they
+        had already done.
+        """
+        named, code, asked = self.against("--callback", "0.0.0.0:4444")
+        self.assertEqual(code, 2)
+        self.assertIn("--callback names every interface", named)
+        self.assertNotIn("This listener is bound", named)
+        self.assertEqual(asked, [])
+
+        with stub(seeded=False) as (address, bind_asked):
+            _, bound, bind_code = self.ran(
+                self.artifact(), "--lab-address", address, "--reverse-shell",
+                "--allow-shell", "--callback-bind", "0.0.0.0:0",
+                "--callback-wait", "1",
+                port=address.rsplit(":", 1)[1],
+            )
+        self.assertEqual(bind_code, 2)
+        self.assertIn("This listener is bound to every interface", bound)
+        self.assertNotIn("--callback names every interface", bound)
+        self.assertEqual(bind_asked, [])
+
+    def test_a_far_callback_is_cautioned_and_not_refused(self) -> None:
+        """Cautioned, because the flag exists for the case that needs it.
+
+        What the operator is told: the address, that it is none of the three
+        shapes a listener of theirs has, what the commands below will tell
+        the build to do and to whom, and that the nonce does not help with
+        it. Said before the first delivery, so it is a reason to stop.
+        """
+        complained, code, asked = self.against("--callback", "8.8.8.8:4444")
+        self.assertEqual(code, 1)
+        said = " ".join(complained.split())
+        self.assertIn(
+            "[8.8.8.8 is not loopback, not an address of this machine, and not a",
+            complained,
+        )
+        self.assertIn("open a shell to that address and that port", said)
+        self.assertIn("whoever is listening there is who gets the shell", said)
+        self.assertIn("the nonce does not help with that", said)
+        self.assertIn("the build has not been sent anything yet", said)
+        # Cautioned and not refused: the deliveries still went out, which is
+        # the case NAT and a port mapping need.
+        self.assertEqual(len(self.delivered(asked)), len(field.REVERSE_FORMS))
+        for command in self.delivered(asked):
+            with self.subTest(command=command[:40]):
+                self.assertIn("8.8.8.8", command)
+        # The caution is before the first delivery.
+        self.assertLess(
+            complained.index("is not loopback"),
+            complained.index(field._REVERSE_SENDING_PREFIX),
+        )
+
+    def test_a_far_name_says_what_it_resolves_to(self) -> None:
+        """A name is far unless every address it has from here is near.
+
+        One of two being near is not an answer about where the build will go,
+        so the addresses are printed and the caution stands.
+        """
+        complained, code, _ = self.against("--callback", "dns.google:4444")
+        if code == 2:
+            self.skipTest("this host cannot resolve a public name")
+        self.assertIn("[dns.google is not loopback", complained)
+        # A heading and then one address per line: joined into the
+        # sentence this was 76 columns at three A records and 93 at four,
+        # and four to eight is ordinary for a real name.
+        self.assertIn("[it resolves from here to]", complained)
+        for found in ("8.8.8.8", "8.8.4.4"):
+            self.assertIn(f"\n  {found}\n", complained)
+
+    def test_loopback_and_private_callbacks_are_not_cautioned(self) -> None:
+        """The three shapes a listener of the operator's own actually has.
+
+        Loopback, an address this machine holds, and RFC1918 -- which is what
+        the Docker bridge address the flag's own help names is.
+        """
+        for told in ("127.0.0.1:4444", "127.0.0.53:4444", "10.1.2.3:4444",
+                     "172.16.0.1:4444", "192.168.1.1:4444"):
+            with self.subTest(told=told):
+                complained, code, _ = self.against("--callback", told)
+                self.assertEqual(code, 1, complained)
+                self.assertEqual(self.told(complained), told)
+                self.assertNotIn("is not loopback", complained)
+                self.assertNotIn("open a shell to that address", complained)
+
+    def test_the_bind_is_never_cautioned_about_being_this_machine_s(self) -> None:
+        """A bind with no --callback cannot be far: it bound the address.
+
+        So the caution is about what was TOLD and not about what was bound,
+        and the wildcard bind's own warning is untouched beside it.
+        """
+        complained, code, _ = self.against()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.told(complained), self.listening(complained))
+        self.assertNotIn("is not loopback", complained)
+
+    def test_the_mode_keeps_its_own_lines_inside_seventy_eight_columns(
+        self,
+    ) -> None:
+        """The width the file is written at, at values an operator really sees.
+
+        The reworded headline was 86 columns with a real file name and a real
+        published port, the landing sentence 89, the summary of connections
+        that were not landings 82, and `[listening on ...]` 79 -- in a file
+        whose own comment calls a 95-column line the thing to avoid.
+
+        The lab program's own output is exempt and is the one thing that is:
+        `_reverse_said` indents it by four spaces precisely because it is
+        somebody else's text and this file cannot wrap it.
+        """
+        runs = []
+        with _Working() as (address, _):
+            _, landed, code = self.session(address, "id\nexit\n")
+            self.assertEqual(code, 0, landed)
+            runs.append(("a session that happened", landed))
+        with _Knocking(behaves="silent") as (address, _):
+            _, socketed, _ = self.session(address, "id\nexit\n")
+            runs.append(("a socket that said nothing", socketed))
+        with _Knocking(behaves="session", presents=False) as (address, _):
+            _, impostor, _ = self.session(address, "id\nexit\n")
+            runs.append(("an impostor with no nonce", impostor))
+        runs.append(("a far callback", self.against("--callback", "8.8.8.8:4444")[0]))
+        runs.append(("a bind nothing can reach", self.against(
+            "--callback", "evil.invalid.invalid")[0]))
+        for tag, text in runs:
+            for line in text.splitlines():
+                if line.startswith("    "):
+                    continue
+                with self.subTest(tag=tag, line=line[:40]):
+                    self.assertLessEqual(len(line), 78, line)
+
+
+class TheListenerItselfTests(unittest.TestCase):
+    """`_ReverseListener`, run out of the artifact rather than described.
+
+    The class is emitted text, so the end-to-end tests above are the only
+    place it runs -- and they can only reach its edges through four
+    deliveries and a product. The upper half of the artifact is importable
+    on its own: everything in it is a definition, so exec'ing it under a
+    `__name__` that is not `__main__` yields the real class with the real
+    constants, and the window this is about can be driven directly and
+    deterministically instead of being timed against a delivery loop.
+    """
+
+    plan = TheSessionIsCarriedToTheProductTests.plan
+    artifact = TheSessionIsCarriedToTheProductTests.artifact
+
+    def listener(self) -> object:
+        upper = self.artifact().partition(field.POC_LAB_MODE_MARKER)[0]
+        held: dict = {"__name__": "not_main", "__file__": field.POC_NAME}
+        exec(compile(upper, field.POC_NAME, "exec"), held)
+        self.assertEqual(held["REVERSE_GREETING_WAIT"], field.REVERSE_GREETING_WAIT)
+        #: The emitted namespace, so a test can read a constant that lives
+        #: in the artifact rather than in the module that writes it.
+        self.held = held
+        catcher = held["_ReverseListener"]("127.0.0.1", 0)
+        self.addCleanup(catcher.close)
+        return catcher
+
+    def connect(self, catcher: object) -> socket.socket:
+        held = socket.create_connection((catcher.host, catcher.port), timeout=10)
+        self.addCleanup(held.close)
+        return held
+
+    def test_nothing_reading_is_answered_at_once(self) -> None:
+        """A run where nothing connected must not get slower for this.
+
+        Not free, and the cost is named rather than hidden: taking the
+        listener down waits for the serving loop to notice, which is one
+        poll interval. `socketserver`'s own default is half a second, which
+        this run measured and which is why the interval is set; with it set
+        the empty path pays about one of them.
+        """
+        catcher = self.listener()
+        began = time.monotonic()
+        self.assertIsNone(catcher.wait_for_a_greeting())
+        took = time.monotonic() - began
+        self.assertLess(took, 1.0)
+        # Tied to the constant, so lengthening the interval has to be a
+        # deliberate act and not something a later edit does quietly.
+        self.assertLess(took, self.held["REVERSE_POLL"] * 20)
+
+    def test_a_nonce_presented_before_the_accept_is_still_the_landing(
+        self,
+    ) -> None:
+        """The window no counter can see, and the reason this is three steps.
+
+        A client's `connect` returns when the handshake does. The connection
+        then sits in the listening socket's queue until the serving thread
+        is scheduled, so there is a stretch in which the connection is
+        complete and no counter of this file's knows about it -- measured,
+        every one of the connects below returns with `reading` still 0.
+        Taking the count as early as the accepting thread can take it does
+        not help, because the window is in front of user space altogether:
+        that arrangement lost 200 of 200. Asking the kernel whether it holds
+        an unaccepted connection, and only then shutting the listener down
+        -- which does not return until the iteration that takes the count
+        has finished -- is what closes it.
+
+        Repeated, because once is not evidence about a race.
+        """
+        unseen = lost = 0
+        for _ in range(25):
+            catcher = self.listener()
+            catcher.offer("perl", "b" * 32)
+            held = self.connect(catcher)
+            if catcher.reading == 0:
+                unseen += 1
+            held.sendall(b"b" * 32 + b"\n")
+            if catcher.wait_for_a_greeting() is None:
+                lost += 1
+            catcher.close()
+        self.assertEqual(lost, 0)
+        # The window is real, which is what makes the assertion above mean
+        # something. If this ever reads 0 the test has stopped testing.
+        self.assertGreater(unseen, 0)
+
+    def test_a_nonce_that_arrives_during_the_wait_is_the_landing(self) -> None:
+        """The window itself: accepted, not yet read, and the deliveries over.
+
+        This is where the session used to be lost. `close()` set `released`
+        and the handler registered the landing after it, so the socket was
+        gone and the file then said no connection had carried a nonce.
+        """
+        catcher = self.listener()
+        catcher.offer("perl", "a" * 32)
+        held = self.connect(catcher)
+        for _ in range(100):
+            if catcher.reading:
+                break
+            time.sleep(0.02)
+        self.assertEqual(catcher.arrivals, 1)
+        self.assertEqual(catcher.reading, 1)
+        self.assertFalse(catcher.arrived.is_set())
+        threading.Timer(1.0, lambda: held.sendall(b"a" * 32 + b"\n")).start()
+        self.assertIsNotNone(catcher.wait_for_a_greeting())
+        self.assertEqual(catcher.form, "perl")
+        self.assertEqual(catcher.unknown, [])
+
+    def test_a_first_line_already_read_leaves_nothing_to_wait_for(self) -> None:
+        """So an impostor that speaks costs the report nothing."""
+        catcher = self.listener()
+        catcher.offer("perl", "a" * 32)
+        held = self.connect(catcher)
+        held.sendall(b"not-a-nonce\n")
+        for _ in range(200):
+            if catcher.unknown:
+                break
+            time.sleep(0.02)
+        self.assertEqual(catcher.unknown, ["127.0.0.1"])
+        self.assertEqual(catcher.reading, 0)
+        began = time.monotonic()
+        self.assertIsNone(catcher.wait_for_a_greeting())
+        self.assertLess(time.monotonic() - began, 1.0)
+
+    def test_the_wait_is_bounded_by_the_greeting_wait(self) -> None:
+        """A connection that never speaks holds this for that long and no more.
+
+        Measured against the bound rather than against a guess, because the
+        bound is what makes paying it defensible at all.
+        """
+        catcher = self.listener()
+        catcher.offer("perl", "a" * 32)
+        self.connect(catcher)
+        for _ in range(100):
+            if catcher.reading:
+                break
+            time.sleep(0.02)
+        began = time.monotonic()
+        self.assertIsNone(catcher.wait_for_a_greeting())
+        spent = time.monotonic() - began
+        self.assertGreaterEqual(spent, field.REVERSE_GREETING_WAIT - 1)
+        self.assertLess(spent, field.REVERSE_GREETING_WAIT + 4)
 
 
 if __name__ == "__main__":
