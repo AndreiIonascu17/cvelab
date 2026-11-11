@@ -651,29 +651,40 @@ Three things to know:
   It may also need more than the default 2 GB ceiling, which is
   `CVELAB_RUNTIME_MEMORY`, not a contract key.
 
-## 10a. Field PoC: one target you own
+## 11. A PoC for one target you own
 
-The source and closed modes prove a vulnerability inside Docker, by a
-differential between two revisions or two images. Their PoC never leaves that
-harness: it is the validator, bound to the service names `vulnerable` and
-`patched`, and refuses a remote target by construction. That answers "does this
-bug reproduce"; it does not hand you something to run against a server to show a
-client the bug happening.
+A lab's `PoC.py` proves a vulnerability inside Docker, by a differential
+between two revisions or two images. Given no address that is all it does: it
+is the validator, bound to the Compose service names `vulnerable` and
+`patched`, and it reaches nothing else. That answers "does this bug reproduce";
+it does not hand you something to run against a server to show a client the bug
+happening.
 
-The field mode emits that artifact. The deliverable is a standalone
-`field-poc.py` that takes `--target`, runs against one server you are permitted
-to test, in one run, and shows the effect rather than printing a version
-verdict:
+Remote mode is that artifact. Ask for it separately, once the lab has been
+validated, and the same `PoC.py` gains a second mode that takes `--target`,
+runs against one server you are permitted to test, in one run, and shows the
+effect rather than printing a version verdict:
 
 ```bash
-cvelab --output-root out field CVE-YYYY-NNNNN \
-  --vulnerable-image vendor/app:vulnerable \
-  --fixed-image vendor/app:fixed \
-  --container-port 8080 --health-path /health \
-  --spec field-spec.json
+cvelab manual CVE-YYYY-NNNNN --poc out \
+  --spec spec.json --container-port 8000
 # then, from out/CVE-YYYY-NNNNN/artifacts:
-python3 field-poc.py --target 10.0.0.5:8080 --show-bodies
+python3 PoC.py --target 10.0.0.5:8080 --show-bodies
 ```
+
+`--spec` is optional. Without it CVELab asks for one itself, in a call of its
+own, and writes the script if it proves -- so `cvelab manual CVE-... --poc out`
+on its own is the whole thing. Pass `--spec` when you disagree with the answer
+it gave, or when you know something the lab does not: a credential, a tenant
+id, the one route that matters. `--container-port` is the port the service
+listens on inside its container and is required with `--spec`; otherwise it is
+read from the lab's own healthcheck or from the drafted answer.
+
+Generating labs and demonstrating one on a server are separate jobs, so
+`auto` does **not** do this. A batch run gives you
+the labs and their `PoC.py`, and nothing else. Pass `--manual-poc` to that
+command if you do want it inline; the answer then lands in `report.json` under
+`manual_poc_field`, and `--manual-poc-provider` sends just that call elsewhere.
 
 `--target` is one host and port, however you write it: `10.0.0.5:8080`,
 `[2001:db8::1]:8443`, `app.example.com` or `https://app.example.com`. Without a
@@ -688,9 +699,10 @@ a host the engagement covers.
 
 Its proof does not need a second server. It is an effect a fixed build cannot
 produce, observed on the one target, and CVELab confirms that before handing
-the script over: the script must observe the effect on the vulnerable image and
-must stay silent on the fixed one. A script that fires on both is observing
-normal behavior, not the bug, and is refused.
+the script over: the script must observe the effect on the lab's vulnerable
+build and must stay silent on its fixed one. A script that fires on both is
+observing normal behavior, not the bug, and is refused. Either way "not
+observable on one instance" is the expected answer for most vulnerabilities.
 
 Two strategies carry the effect without a listener you have to stand up:
 
@@ -889,7 +901,7 @@ refused rather than silently skipped.
 A spec can also discover its own targets instead of naming them. A check's
 `discover` chain enumerates them from the target -- public projects, then the
 items in each -- binding a name per step that the probe and control fill in with
-`{{name}}`. One `field-poc.py` then sweeps every target it finds, so the same
+`{{name}}`. One `PoC.py` then sweeps every target it finds, so the same
 script works against any instance rather than the objects a fixture happened to
 create. A spec with several `checks` runs each independently and reports them
 together.
@@ -972,12 +984,12 @@ Point it at a route of yours that passes a request through the affected
 library. One that never reaches it reports `NOT_OBSERVED`, which means nothing
 was tested rather than nothing is wrong.
 
-### What the field mode will not do
+### What remote mode will not do
 
 A class whose effect is not observable on a live target over the wire has no
-field PoC: a race that needs two clients driven at once, a memory or register
+remote mode: a race that needs two clients driven at once, a memory or register
 state visible only inside the process, an effect needing a second host you
-control, a weakness in a client rather than a server. The mode declines such a
+control, a weakness in a client rather than a server. CVELab declines such a
 spec rather than emit a script that prints a verdict it never observed.
 
 A crash, a hang and a timing signal used to be on that list and are not any
@@ -988,37 +1000,6 @@ And `NOT_OBSERVED` on a real target is not proof of a patch: a differential
 strategy also returns it when the instance simply had nothing to disclose, and
 a route that never reaches the affected code returns it too. To decide affected
 vs fixed regardless of data, check the build.
-
-## 10b. The same deliverable from a source lab
-
-`cvelab field` needs a pair of published images, which is what a closed product
-ships. A source lab has no equivalent: it builds its two revisions itself. For
-one of those, ask for the script separately, once the lab has been validated:
-
-```bash
-cvelab manual CVE-YYYY-NNNNN --poc out \
-  --spec spec.json --container-port 8000
-# then, from out/CVE-YYYY-NNNNN/artifacts:
-python3 PoC.py --target 10.0.0.5:8080 --show-bodies
-```
-
-`--spec` is optional. Without it CVELab asks for one itself, in a call of its
-own, and writes the script if it proves -- so `cvelab manual CVE-... --poc out`
-on its own is the whole thing. Pass `--spec` when you disagree with the answer
-it gave, or when you know something the lab does not: a credential, a tenant
-id, the one route that matters.
-
-Generating labs and demonstrating one on a server are separate jobs, so
-`auto` does **not** do this. A batch run gives you
-the labs and their `PoC.py`, and nothing else. Pass `--manual-poc` to that
-command if you do want it inline; the answer then lands in `report.json` under
-`manual_poc_field`, and `--manual-poc-provider` sends just that call elsewhere.
-
-Either way "not observable on one instance" is the expected answer for most
-vulnerabilities. The spec shape is the one `cvelab field` takes -- strategy,
-the effect in words, the requests, never a host. `--container-port` is the port
-the service listens on inside its container and is required with `--spec`;
-otherwise it is read from the lab's own healthcheck or from the drafted answer.
 
 ### What you get
 
@@ -1110,24 +1091,7 @@ runs against: `inband_differential`, `marker_roundtrip` or `oob_callback`.
 build. Say so in a report: that run shows the effect happening, not that a fix
 removes it.
 
-### Rehearsing it against the lab
-
-A lab is sealed: its network is `internal: true` and it publishes no port, so
-you cannot point the script at it from your own machine. To rehearse the run
-before it touches anyone else's server:
-
-```bash
-cvelab demo-target up out/CVE-YYYY-NNNNN     # prints a host and port
-cvelab demo-target down out/CVE-YYYY-NNNNN   # puts the lab back
-```
-
-`up` starts only the vulnerable build -- the differential is the lab's job and
-is already done -- and lifts `internal` from the lab's networks for that one
-run, through an override written outside the lab directory. While it is up, the
-lab is reachable from your host, which is a posture the lab is otherwise built
-to prevent, so `down` it when you are finished.
-
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 ### Docker does not respond
 
@@ -1192,7 +1156,7 @@ The correct result is `ARTIFACT_REQUIRED` or `POC_NOT_GENERATED`. Provide a
 verifiable repository/revision or the required legal artifact; do not use a
 simulation as a substitute.
 
-## 12. Safety and limitations
+## 13. Safety and limitations
 
 - Run only on systems you own or are explicitly authorized to test.
 - Keep services on loopback and internal Docker networks.
@@ -1202,7 +1166,7 @@ simulation as a substitute.
 - Do not treat the absence of a result after a timeout as the sole evidence of a fix.
 - No generator can faithfully reproduce every CVE from its identifier alone.
 
-## 13. Development
+## 14. Development
 
 Linux build:
 

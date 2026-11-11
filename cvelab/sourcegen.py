@@ -3610,9 +3610,8 @@ def repair_source_lab(
         # thing this check was added to stop.
         #
         # Defence in depth, and nothing more than that. There is no
-        # `cvelab repair` subcommand -- cli.py registers build, source,
-        # source-all, auto, doctor, upload, run, closed, field, manual,
-        # demo-target, closed-auto and all -- so the only callers are
+        # `cvelab repair` subcommand -- cli.py registers auto, closed,
+        # closed-auto, doctor, manual and upload -- so the only callers are
         # autoflow's two, and run_auto_workflow always generates first. The
         # plan read here was therefore written by a generation that already
         # applied this very predicate, which leaves exactly one way in: a
