@@ -1399,6 +1399,27 @@ def _manual_action_passed(
     still required to be zero.
     """
     if action != "verify":
+        # The same widening, one action over. `exploit` on the patched side is
+        # ALSO supposed to fail, and a validator that says so by exiting 1 is
+        # using the convention this function already accepts for `verify`
+        # below and that the shipped PoC.py documents in its own help.
+        # Requiring exit zero of it there asked the attack to SUCCEED on the
+        # fixed build. Measured on a lab whose differential was confirmed at
+        # proof_quality high, where `patched_exploit` returned the fix's own
+        # 400 -- "quote() rejected the token list" -- and was recorded as the
+        # one false check in a run whose other ten passed; the repair budget
+        # then spent its attempts on something that had nothing to fix, which
+        # is the failure this docstring already describes for `verify`.
+        #
+        # Rare, and the rarity is why this widens rather than drops the
+        # status: 1 of the 140 archived labs that measured `patched_exploit`
+        # failed it, because most validators' `exploit` action only re-sends
+        # the input and prints what came back, exiting 0 either way.
+        #
+        # Still `bool(output)`: a script that printed nothing has not
+        # reported a verdict, whatever it exited with.
+        if expected_verdict == "BLOCKED":
+            return returncode in (0, 1) and bool(output)
         return returncode == 0 and bool(output)
     if not output or expected_verdict not in output:
         return False
