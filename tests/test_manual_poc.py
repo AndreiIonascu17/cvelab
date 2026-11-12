@@ -1199,7 +1199,9 @@ class TheOneAddressArgumentTests(unittest.TestCase):
             dict(self.REFUSED) if record is None else record,
         )
 
-    def ran(self, text: str, *argv: str) -> subprocess.CompletedProcess:
+    def ran(
+        self, text: str, *argv: str, environment: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess:
         root = tempfile.TemporaryDirectory()
         self.addCleanup(root.cleanup)
         path = Path(root.name) / field.POC_NAME
@@ -1207,7 +1209,7 @@ class TheOneAddressArgumentTests(unittest.TestCase):
         return subprocess.run(
             [sys.executable, str(path), *argv],
             capture_output=True, text=True, timeout=60,
-            env={"PATH": os.environ["PATH"]},
+            env={"PATH": os.environ["PATH"], **(environment or {})},
         )
 
     def test_it_reaches_the_lab_program_with_the_address_and_the_command(self) -> None:
@@ -1240,18 +1242,33 @@ class TheOneAddressArgumentTests(unittest.TestCase):
         about the address: this lab publishes the same port and carries the
         same validator as the runs above, and the argument goes to remote
         mode because remote mode was proved. So the lab program is not
-        reachable with an address here at all, and the file carries nothing
-        that says it is.
+        reachable with an address an OPERATOR types, which is what this
+        dispatch answers for.
+
+        The one run that reaches it with an address is a child this file's
+        own prompt started and named in the environment, which is held where
+        the prompt is. The name is checked against the child's own parent, so
+        a value left behind in an operator's shell is not that child and does
+        not take this argument away from remote mode either -- the second run
+        here is that, and the file says so rather than quietly running the
+        other program.
         """
         text = self.artifact(self.proved())
         self.assertFalse(field.takes_lab_address(8080, self.proved()))
-        self.assertNotIn("_lab_target", text)
-        done = self.ran(text, "127.0.0.1:32768", "id")
-        self.assertNotIn("lab program against", done.stdout)
-        # argparse's, because remote mode's `main()` took the run: one
-        # address and no second positional.
-        self.assertEqual(done.returncode, 2)
-        self.assertIn("unrecognized arguments: id", done.stderr)
+        for stale in (False, True):
+            with self.subTest(stale=stale):
+                done = self.ran(
+                    text, "127.0.0.1:32768", "id",
+                    environment={"CVELAB_POC_SHELL_PARENT": "1"} if stale else None,
+                )
+                self.assertNotIn("lab program against", done.stdout)
+                # argparse's, because remote mode's `main()` took the run:
+                # one address and no second positional.
+                self.assertEqual(done.returncode, 2)
+                self.assertIn("unrecognized arguments: id", done.stderr)
+                if stale:
+                    self.assertIn("CVELAB_POC_SHELL_PARENT is set", done.stderr)
+                    self.assertIn("Ignored", done.stderr)
 
     def test_argv_arrives_whole_and_nothing_is_rewritten(self) -> None:
         """What ended the class of bug the flag it replaced had twice.
@@ -1492,12 +1509,15 @@ class ThePromptTests(unittest.TestCase):
 
     WHICH LAB GETS IT
 
-    One address and no flag, so which of the file's two programs that address
-    reaches is the lab's standing. A lab with a proved remote mode spends the
-    argument there, and a prompt over that program would have every line
-    refused by argparse -- so `shell_standing` refuses the mode for it rather
-    than shipping a prompt that cannot work, and the record these tests emit
-    from is the one 262 of the 264 archived labs have.
+    Three facts about the lab, every one of them read off the lab: a declared
+    port, command execution as the declared evidence, and a validator that
+    implements the one-command form. There was a fourth and it was about the
+    dispatch -- a lab with a proved remote mode spends its one address
+    argument there, so the prompt's child would have landed in argparse --
+    and it withheld the mode from the one shape that qualifies in every other
+    way. The prompt names its own child in the environment now, so that shape
+    gets the mode too; the default record here is still the one 262 of the 264
+    archived labs have, and the proved one is run beside it.
 
     WHAT THESE TESTS HOLD
 
@@ -1639,7 +1659,8 @@ class ThePromptTests(unittest.TestCase):
         )
 
     def ran(
-        self, text: str, *argv: str, typed: str = "", name: str = field.POC_NAME
+        self, text: str, *argv: str, typed: str = "", name: str = field.POC_NAME,
+        environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess:
         """The artifact run as a file, with lines typed at it."""
         root = tempfile.TemporaryDirectory()
@@ -1649,7 +1670,7 @@ class ThePromptTests(unittest.TestCase):
         return subprocess.run(
             [sys.executable, str(path), *argv], input=typed,
             capture_output=True, text=True, timeout=120,
-            env={"PATH": os.environ["PATH"]},
+            env={"PATH": os.environ["PATH"], **(environment or {})},
         )
 
     def prompted(
@@ -1684,26 +1705,90 @@ class ThePromptTests(unittest.TestCase):
         self.assertNotIn("the effect is internal", done.stdout)
         self.assertNotIn("the effect is internal", done.stderr)
 
-    def test_a_lab_with_a_proved_remote_mode_is_offered_no_prompt(self) -> None:
-        """The fourth condition, and the reason it is last.
+    def test_a_lab_with_a_proved_remote_mode_gets_the_prompt_as_well(self) -> None:
+        """The shape the fourth condition was withholding the mode from.
 
-        One address reaches remote mode for a lab that proved one, so there
-        is no way left to hand the lab program an address -- and a prompt is
-        one command through that program per line. A shipped prompt that
-        cannot work is the worse of the two costs, so the mode is withheld
-        and the reason is a fact about the dispatch rather than about the
-        lab, which is why it is heard only after the three that are not.
+        A declared port, command execution, a validator that implements the
+        one-command form AND a proved remote mode is the most capable shape a
+        lab has, and it was the one shape with no prompt: one address is
+        remote mode's there, so the prompt's child would have landed in
+        argparse and had every line refused. No archived lab was both, and a
+        lab generated after that was written is -- which is how the cost
+        stayed invisible.
+
+        The child is told it is the prompt's in the environment now, where
+        the lab program already takes its instructions from, so the mode is
+        offered here and nothing an operator types changed: a bare address
+        still reaches remote mode, which the dispatch tests hold, and there
+        is no new flag to type.
         """
         offered, reason = field.shell_standing(self.PLAN, self.LAB, self.proved())
-        self.assertFalse(offered)
-        self.assertIn("this lab has a proved remote mode", reason)
-        self.assertIn("both unaffected", reason)
+        self.assertTrue(offered, reason)
+        self.assertEqual(reason, "")
         text = self.artifact(self.proved())
-        for absent in ("--shell", "--allow-shell"):
-            with self.subTest(absent=absent):
-                self.assertNotIn(absent, text)
-        # And the same lab, same validator, differing only in the record.
+        for present in ("--shell", "--allow-shell", "CVELAB_POC_SHELL_PARENT"):
+            with self.subTest(present=present):
+                self.assertIn(present, text)
+        # The channel is not a flag and not something to type, so it is not
+        # in the handover document an operator reads either.
+        self.assertNotIn("--shell-child", text)
+        self.assertNotIn("CVELAB_POC_SHELL_PARENT", text.split('"""')[1])
+        # And the lines run: one process per line, reaching the lab program
+        # rather than the argparse that answers the same address.
+        done = self.prompted("id\npwd\n", record=self.proved())
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(
+            done.stdout,
+            "ran id against 127.0.0.1:32768\n"
+            "ran pwd against 127.0.0.1:32768\n",
+        )
+        # And the same lab and the same validator with the other record,
+        # where the address needs no help reaching the lab program.
         self.assertTrue(field.shell_standing(self.PLAN, self.LAB, self.REFUSED)[0])
+        self.assertNotIn("CVELAB_POC_SHELL_PARENT", self.artifact())
+
+    def test_the_name_the_prompt_sets_is_not_a_setting_an_operator_holds(self) -> None:
+        """What a value left in a shell may do to this file, which is nothing.
+
+        The channel's value is the prompt's own pid and the child checks it
+        against its own parent, so a run that did not come from the prompt is
+        not the prompt's child whatever that name holds. Honouring it would
+        run the lab program for a command line whose address the header says
+        reaches remote mode -- a different program against a different spec,
+        chosen by something the operator cannot see -- and ignoring it costs
+        nothing at all: the lab program needs no argument.
+
+        Said and not silent, because a name that does nothing and explains
+        nothing is the one an operator carries into the next run.
+        """
+        done = self.ran(
+            self.artifact(self.proved()), "127.0.0.1:32768", "id",
+            environment={"CVELAB_POC_SHELL_PARENT": "1"},
+        )
+        self.assertNotIn("ran id against", done.stdout)
+        self.assertIn("CVELAB_POC_SHELL_PARENT is set", done.stderr)
+        self.assertIn("The prompt is --shell", done.stderr)
+        # Remote mode took the run, as the header says it does.
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("unrecognized arguments: id", done.stderr)
+
+    def test_the_prompt_is_named_where_help_cannot_reach_the_header(self) -> None:
+        """One function decides and every surface repeats it, including this one.
+
+        `--help` on a lab with no remote mode prints the file's own header,
+        which says what the prompt is. On a lab that proved one, `--help` is
+        argparse's -- one address is remote mode's, so that is where it goes
+        -- and the header it never prints is the only place the mode was
+        named. That is the need remote mode's epilog was kept for.
+        """
+        done = self.ran(self.artifact(self.proved()), "--help")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        said = " ".join(done.stdout.split())
+        self.assertIn("This file holds two programs", said)
+        self.assertIn("--shell --allow-shell after an address", said)
+        self.assertIn("once per line against that address", said)
+        # And the channel stays out of it: it is not something to type.
+        self.assertNotIn("CVELAB_POC_SHELL_PARENT", done.stdout)
 
     def test_the_output_is_printed_with_the_drafters_header_line_dropped(self) -> None:
         done = self.prompted("id\npwd\n")
@@ -2030,6 +2115,41 @@ class ThePromptTests(unittest.TestCase):
         # argument reaches neither program and the file says so.
         self.assertIn("has no remote mode", done.stderr)
 
+    def test_a_lab_that_declares_the_evidence_and_no_port_is_told_why(self) -> None:
+        """The reason, printed where it was computed and then dropped.
+
+        A lab whose contract declares command execution and no service port
+        is refused the prompt for a fact about itself -- there is no address
+        to point one at -- and it used to hear nothing: the paragraph was
+        written only where the lab ALSO took an address, so of the 264
+        archived labs the reason reached 0 artifacts while 32 were owed it.
+        An operator holding one of those learned neither that a prompt exists
+        in this tool nor why their file has none.
+
+        The declaration is what the explanation is gated on now, which is
+        what the comment above it always said. The mode itself is still
+        absent, and a lab that declares something else still hears nothing.
+        """
+        plan = dict(
+            self.PLAN,
+            exploit_contract={
+                key: value for key, value in self.CONTRACT.items()
+                if key != "service_port"
+            },
+        )
+        text = self.artifact(plan=plan)
+        for absent in ("--shell", "--allow-shell"):
+            with self.subTest(absent=absent):
+                self.assertNotIn(absent, text)
+        header = text.split('"""')[1]
+        lab = " ".join(
+            header[header.index("LAB MODE"):header.index("REMOTE MODE")].split()
+        )
+        self.assertIn("There is no prompt in this file", lab)
+        self.assertIn("declares no service port", lab)
+        # The same answer the function gives, in the words it gives it in.
+        self.assertIn(field.shell_standing(plan, self.LAB)[1], lab)
+
     def test_a_lab_with_no_command_evidence_carries_no_trace_of_it(self) -> None:
         plan = dict(
             self.PLAN,
@@ -2153,11 +2273,12 @@ class ThePromptTests(unittest.TestCase):
         the one the operator receives rests on them agreeing. A mode that read
         a clock, an environment variable or the filesystem would break that.
 
-        Both outcomes, because the record is now one of the inputs: a proved
-        remote mode spends this lab's one address argument, so it is also the
-        outcome that gets no prompt. Agreement has to hold on the artifact
-        that carries the mode and on the one that does not, and the two have
-        to differ -- otherwise this passes on a record neither writer read.
+        Both outcomes, because the record is one of the inputs: a proved
+        remote mode spends this lab's one address argument, so the prompt in
+        that artifact carries the channel its own child is named through and
+        the other one does not. Agreement has to hold on both, and the two
+        have to differ -- otherwise this passes on a record neither writer
+        read.
         """
         spec = field.validate_spec(_spec())
         texts = {}
@@ -2188,8 +2309,13 @@ class ThePromptTests(unittest.TestCase):
                     )
                 self.assertEqual(written, rendered)
                 texts[name] = written
-        self.assertNotIn("--shell", texts["proved"])
-        self.assertIn("--shell", texts["refused"])
+        for outcome in ("proved", "refused"):
+            with self.subTest(outcome=outcome):
+                self.assertIn("--shell", texts[outcome])
+        self.assertIn("CVELAB_POC_SHELL_PARENT", texts["proved"])
+        self.assertNotIn("CVELAB_POC_SHELL_PARENT", texts["refused"])
+        self.assertIn("the effect is internal", texts["refused"])
+        self.assertNotIn("the effect is internal", texts["proved"])
 
 
 class TheScriptThatWasProvedIsTheScriptShippedTests(unittest.TestCase):

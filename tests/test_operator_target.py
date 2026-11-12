@@ -434,8 +434,11 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
     What is held: that a typed line reaches the lab program's own address
     path and nowhere else, that each line is one invocation and therefore one
     session -- the session the contract makes that path build for itself --
-    and that none of this is reachable with no argument at all, which is the
-    path the automatic differential takes.
+    that it still arrives on a lab whose one address argument belongs to a
+    proved remote mode, where the child is named through the environment
+    rather than reached by that argument, and that none of this is reachable
+    with no argument at all, which is the path the automatic differential
+    takes.
     """
 
     def plan(self, **extra: object) -> dict:
@@ -449,12 +452,33 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
         held.update(extra)
         return held
 
-    def artifact(self, **extra: object) -> str:
+    def artifact(self, record: dict | None = None, **extra: object) -> str:
         return field.emit_poc(
             "CVE-2026-0001", self.plan(**extra),
             FIXTURE.read_text(encoding="utf-8"),
-            {"shipped": False, "reason": "nothing was proved against one instance"},
+            record
+            or {"shipped": False, "reason": "nothing was proved against one instance"},
         )
+
+    def proved(self) -> dict:
+        """A record that makes this lab's one address argument remote mode's.
+
+        The shape no test here covered, which is how the prompt came to be
+        withheld from it. The spec is the smallest one `validate_spec`
+        accepts and is never sent: `main()` is the program the prompt does
+        not reach, and what these runs measure is the one it does.
+        """
+        return {
+            "shipped": True,
+            "container_port": 8080,
+            "spec": field.validate_spec({
+                "strategy": "inband_differential",
+                "observable_effect": "the supplied command ran",
+                "probe": [{"method": "GET", "path": "/run?cmd=id"}],
+                "control": [{"method": "GET", "path": "/run"}],
+                "extract": {"json_values": "body"},
+            }),
+        }
 
     def ran(
         self, text: str, *argv: str, typed: str = "", port: str = ""
@@ -498,6 +522,35 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
         # like the drafter's output header -- so nothing is stripped and
         # everything it printed is here.
         self.assertIn("status: 200", said)
+        self.assertIn("REPRODUCED", said)
+
+    def test_a_typed_line_arrives_for_a_lab_that_proved_a_remote_mode_too(self) -> None:
+        """The shape the mode was withheld from, measured the same way.
+
+        A declared port, command execution, a validator that implements the
+        one-command form -- the three the prompt is gated on -- and a proved
+        remote mode, which used to be a fourth gate: one address is remote
+        mode's on such a lab, so a child run with the address and the line
+        would have landed in argparse and had every line refused. The prompt
+        names its own child in the environment instead, and the question that
+        matters is whether the line still arrives at the product. So it is
+        asked here, against a real socket, and not only of the emitted text.
+
+        Nothing an operator types changed: the same address with no prompt is
+        still remote mode's, which `TheOneAddressArgumentTests` holds.
+        """
+        with stub(seeded=False) as (address, asked):
+            said, complained, code = self.ran(
+                self.artifact(self.proved()), address, "--shell", "--allow-shell",
+                typed="id\n", port=address.rsplit(":", 1)[1],
+            )
+        self.assertEqual(code, 0, complained)
+        # The address path's own session, built for that line and used by it.
+        self.assertEqual([path for path, _ in asked], ["/login", "/run"])
+        self.assertEqual(
+            [query.get("cmd") for path, query in asked if path == "/run"], [["id"]]
+        )
+        self.assertIn("uid=0(root)", said)
         self.assertIn("REPRODUCED", said)
 
     def test_each_line_is_its_own_invocation_and_its_own_session(self) -> None:
