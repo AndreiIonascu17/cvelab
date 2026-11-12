@@ -45,6 +45,7 @@ from .field import (
     POC_NOT_REQUESTED,
     POC_REFUSED,
     POC_SHIPPED,
+    _executes,
     emit_poc,
     poc_record,
     poc_standing,
@@ -405,6 +406,109 @@ says that route is not served there and says nothing about whether the host is
 affected. `{POC_NAME}` says so itself whenever the address is not on loopback --
 before the run, and again under the verdict, which is the line that gets pasted
 into a report."""
+
+
+#: The prompt, in the document that is read before anything is run.
+#:
+#: The gap this fills: the document never mentioned the prompt for any lab
+#: shape, including the labs that have one. It named the two invocations an
+#: address can be given and stopped, so an operator who did not open the
+#: artifact's own header did not learn that a third one exists.
+#:
+#: `field.shell_standing` decides, here as in that header, and the wording is
+#: the artifact's own -- `field._lab_mode_note` writes the same paragraph into
+#: the header and `field._POC_SHELL` prints it again before the first line is
+#: typed. Three surfaces, one answer; this was the surface giving none.
+#:
+#: Named as an invocation and never as a third mode. The prompt is the lab
+#: program again, once per line -- `field._lab_mode_note`'s docstring is the
+#: account -- so the sentences in this document that say the file holds two
+#: modes stay true and stay as they are.
+_PROMPT_IS_NOT_A_SESSION = f"""A prompt, and not a session. Every line you type is one more run of the lab
+program's one-command form -- one address and one command, through the weakness
+this lab's differential proved, its output printed -- so there is no persistent
+environment, no interactive programs, no job control and no signals, and `cd`
+is tracked by the prompt rather than on the target. It asks for `--allow-shell`
+because it runs whatever you type for as long as you keep typing, which is more
+than any other mode here asks; without the flag nothing is sent. `{POC_NAME}` says
+all of this again at the prompt, before the first line, together with whose
+route answers the commands."""
+
+#: Where the lines go, which the lab's own standing decides and not the
+#: address: `field.takes_lab_address` is the predicate, the same one the
+#: sections above are keyed on, so the document cannot describe one
+#: destination in two ways.
+#:
+#: True is the shape where an address already reaches the lab program, so the
+#: prompt adds no destination and the route paragraph the reader has just
+#: passed covers every line. False is the shape where it reaches remote mode:
+#: there the lab program is reachable at an address ONLY at this prompt, the
+#: route paragraph is nowhere in the document, and the sentence that keeps an
+#: operator from reading a silent line as "not affected" has to be here.
+_PROMPT_REACHES = {
+    True: """The address is the one the section above publishes, and a line typed at the
+prompt reaches the same lab program that address already reaches -- so what
+that section says about the route holds for every line you type.""",
+    False: """An address on its own reaches remote mode in this file, which the section above
+is about, and a line typed at this prompt does not: it reaches the lab program,
+at the address you gave the prompt, over the route this lab's own differential
+proved. That route is a constant in it, so a line that comes back with nothing
+from a host that never served it says that about the route and not about the
+host. The prompt tells its own child which of the two programs it means, in the
+environment, where the lab program already takes its instructions from -- so
+nothing new is reachable either way and there is no further flag.""",
+}
+
+#: Said where the lab declared command execution and `field.shell_standing`
+#: refused it the prompt anyway, which is a fact about the lab every time: 32
+#: of the 264 archived labs, each one a real candidate turned down for
+#: something about itself. The artifact prints this same sentence in its own
+#: header; the reason is taken from the one function that gives it rather than
+#: restated here, so the two cannot drift.
+#:
+#: `{reason}` is CVELab's own prose and not the drafter's, so it is body text
+#: rather than a blockquote -- `_quoted` is for the recorded reason, which is a
+#: model's. Measured: of the three reasons that function gives, the one that
+#: interpolates anything a model wrote is the "declared something else"
+#: reason, and that is exactly the lab this section is not written for, so
+#: nothing a model wrote can reach the document this way. It is flowed at the
+#: use site anyway, because the substitution lands mid-paragraph.
+_NO_PROMPT_NOTE = (
+    f"No. There is no prompt in `{POC_NAME}` -- no mode where line after line is "
+    "run against this build -- because {reason}"
+)
+
+#: The last line of the document, which is the one a reader quotes. It names
+#: what the file takes, so it is keyed on both answers that decide that: where
+#: the address goes (`field.takes_lab_address`) and whether there is a prompt
+#: to give one to (`field.shell_standing`).
+#:
+#: It named the mode the address reaches, and for a lab whose address reaches
+#: the lab program that was the wrong mode: "one address for remote mode" sent
+#: the reader looking for a mode this file does not have, and read as a promise
+#: that the argument had been proved against an instance when the section above
+#: says the opposite. It then still named two invocations for the labs that
+#: take three. Written out per shape rather than interpolated, like `_LAB_REACH`
+#: above and for the same reason: a substitution lands mid-line and prints a
+#: sentence wrapped nowhere near the rest of the file.
+_CLOSING = {
+    (False, False): f"""`{POC_NAME}` takes no argument for
+lab mode and one address for remote mode, and where you point that is yours to
+answer for -- only a host your engagement authorizes.""",
+    (True, False): f"""`{POC_NAME}` takes no argument
+for lab mode and one address, which runs that same lab program against a host
+instead of the Compose network. Where you point it is yours to answer for --
+only a host your engagement authorizes.""",
+    (False, True): f"""`{POC_NAME}` takes no argument for
+lab mode, one address for remote mode, and that address with `--shell
+--allow-shell` for a prompt that runs the lab program once per line. Where you
+point either is yours to answer for -- only a host your engagement authorizes.""",
+    (True, True): f"""`{POC_NAME}` takes no argument
+for lab mode, one address, which runs that same lab program against a host
+instead of the Compose network, and that address with `--shell --allow-shell`
+for a prompt that runs it once per line. Where you point it is yours to answer
+for -- only a host your engagement authorizes.""",
+}
 
 
 #: The column the emitted Markdown is hard-wrapped at, measured rather than
@@ -809,7 +913,8 @@ def _write_generic_manual_assets(
     seeds: bool = False,
     port: int | None = None,
     record: dict | None = None,
-    takes_a_command: bool = False,
+    shell: tuple[bool, str] | None = None,
+    declares_a_command: bool = False,
 ) -> None:
     """Write the kit the lab is handed over with: runner, wrapper and guide.
 
@@ -833,14 +938,19 @@ def _write_generic_manual_assets(
     The record decides what the kit says about the address: whether remote
     mode is there to be pointed at it, and with which arguments.
 
-    `takes_a_command` decides the other command printed beside the address:
-    the lab program's one-command form, which runs against this lab's own
-    published build and prints what one command on it returns. That is the
-    form an owner demonstrates impact with, so it is printed where they are
-    already looking. It is one address and no flag, like everything else this
-    artifact takes -- which of the file's two programs that address reaches is
-    `field.takes_lab_address`, computed here from the same port and the same
-    record the artifact's own dispatch was built from.
+    `shell` is `field.shell_standing`'s whole answer -- whether this lab has
+    the prompt, and the reason where it has none -- and it decides two things
+    that are one fact. The first is the other command printed beside the
+    address: the lab program's one-command form, which runs against this
+    lab's own published build and prints what one command on it returns. That
+    is the form an owner demonstrates impact with, so it is printed where they
+    are already looking. It is one address and no flag, like everything else
+    this artifact takes -- which of the file's two programs that address
+    reaches is `field.takes_lab_address`, computed here from the same port and
+    the same record the artifact's own dispatch was built from. The second is
+    the prompt, which is that same form run once per line: the standing grants
+    it exactly where the form is there to be run, so one bit answers both and
+    the document cannot offer a command it has no prompt for.
 
     It is what the artifact IMPLEMENTS and not what the plan declares, and
     the difference is the correction here. This was `_executes(plan)`, the
@@ -853,9 +963,21 @@ def _write_generic_manual_assets(
     that costs: a printed command that fails reads as the kit being broken
     rather than as the drafter having refused the proof. One predicate for
     one question, asked of the thing that answers it.
+
+    `declares_a_command` is `field._executes(plan)`, what the contract
+    DECLARES, and it decides only what is EXPLAINED: whether this lab was ever
+    a candidate for the prompt, and so whether the document owes a reason for
+    not having one. The artifact's header is gated on the same two arguments
+    in the same way -- `field._poc_header` passes both to
+    `field._lab_mode_note` -- so the two answer together or not at all.
     """
     record = record if isinstance(record, dict) else {}
     proved = poc_standing(record) == POC_SHIPPED
+    # One bit from `shell`, under the name the sentences below need it by: the
+    # form the lab program takes after an address. The prompt is that form once
+    # per line, so reading the same bit twice under two names is how the kit
+    # and the document would come to disagree about one file.
+    takes_a_command = bool(shell and shell[0])
     # Whether this lab's one address argument reaches the lab program, which
     # is what decides that the commands printed below are real: on a lab with
     # a proved remote mode the same address goes there instead, and a printed
@@ -1049,31 +1171,65 @@ kit that publishes the port.
     # the lab program, and saying "remote mode" would have the reader looking
     # for a mode this file does not have while the thing it warns about sat
     # one section above.
+    #
+    # The middle shape is the prompt's: a lab whose address reaches remote
+    # mode and which also has a prompt has two things that take an address,
+    # and "the one thing" counted one of them. Where the address already
+    # reaches the lab program the first sentence covers the prompt too -- the
+    # lines it sends are that same program over that same route.
     outside = (
         f"""is the address you can give `{POC_NAME}`, which on this lab runs the lab
 program over this lab's own route -- so a negative result from anywhere else is
 a fact about that route, and only where you are authorized to send it at all."""
         if lab_at_an_address else
+        f"""is `{POC_NAME}` given an address -- its remote mode, or the prompt below,
+which runs the lab program once per line -- and only where you are authorized
+to test it."""
+        if takes_a_command else
         f"""is `{POC_NAME}`'s remote mode, and only where you are authorized to
 test it."""
     )
-    # The last line of the document, which is the one a reader quotes, and it
-    # named the mode the address reaches. For a lab whose address reaches the
-    # lab program that was the wrong mode: "one address for remote mode" sent
-    # the reader looking for a mode this file does not have, and read as a
-    # promise that the argument had been proved against an instance when the
-    # section above says the opposite. Same predicate, same sentence shape, so
-    # the summary and the section cannot answer differently.
-    closing = (
-        f"""`{POC_NAME}` takes no argument
-for lab mode and one address, which runs that same lab program against a host
-instead of the Compose network. Where you point it is yours to answer for --
-only a host your engagement authorizes."""
-        if lab_at_an_address else
-        f"""`{POC_NAME}` takes no argument for
-lab mode and one address for remote mode, and where you point that is yours to
-answer for -- only a host your engagement authorizes."""
-    )
+    # The prompt, where this lab has one, and the reason where it was a
+    # candidate and was refused. The same split the artifact's own header
+    # makes, from the same two answers: `shell` is what `shell_standing` said
+    # and `declares_a_command` is what the contract declared. A lab that
+    # declared some other evidence hears nothing, because a section about a
+    # prompt it was never a candidate for is noise in a document read standing
+    # up -- 229 of the 264 archived labs.
+    #
+    # Its own section rather than a paragraph in the one above it: the reason
+    # is owed on the declaration, and all 32 of the archived labs that hear it
+    # publish no port at all, so the section about the address they publish is
+    # the section saying they publish none.
+    prompt_section = ""
+    if shell is not None and declares_a_command:
+        offered, reason = shell
+        if offered:
+            prompt_section = f'''## Is there a prompt?
+
+Yes.
+
+```bash
+bash manual.sh setup vulnerable
+python3 {POC_NAME} "$(bash manual.sh address vulnerable)" --shell --allow-shell
+```
+
+{_PROMPT_IS_NOT_A_SESSION}
+
+{_PROMPT_REACHES[lab_at_an_address]}
+
+'''
+        elif reason:
+            prompt_section = f'''## Is there a prompt?
+
+{_flowed(_NO_PROMPT_NOTE.format(reason=reason))}
+
+'''
+    # The last line of the document, which is the one a reader quotes. Same
+    # predicates as the sections above, read once each, so the summary and the
+    # sections cannot answer differently; `_CLOSING` is the account of what it
+    # got wrong twice.
+    closing = _CLOSING[(lab_at_an_address, takes_a_command)]
     manual_guide = f'''# {cve} Lab PoC
 
 ## What this runs against
@@ -1133,7 +1289,7 @@ It needs WSL with a distribution installed and Docker reachable from inside it.
 Docker Desktop's WSL integration is one way; a Docker installed in the
 distribution itself is another.
 
-{patched_section}{seeded_section}{direct_section}## What each step does
+{patched_section}{seeded_section}{direct_section}{prompt_section}## What each step does
 
 - `setup` builds the selected source revision, starts only that target, and waits
   for it to report healthy before going on{' -- then establishes the state the attack needs' if seeds else ''}.
@@ -1306,9 +1462,16 @@ def create_deliverables(
     # record, which that predicate now reads too: a lab with a proved remote
     # mode spends its one address argument there, so the lab program's
     # command form is not reachable and is not printed.
+    #
+    # The whole answer now and not its first element: the reason is the other
+    # half, and the document owes it to a lab that declared the form and was
+    # refused it. `_executes(plan)` beside it is the declaration, which is
+    # what decides whether this lab was a candidate at all -- the two
+    # arguments `field._poc_header` hands the same question, so the document
+    # and the header cannot answer it differently.
     _write_generic_manual_assets(
         cve, lab_dir, artifacts, vulnerable_only, seeds, service_port(plan), record,
-        shell_standing(plan, validator, record)[0],
+        shell_standing(plan, validator, record), _executes(plan),
     )
     # Where the guard in `core.run_lab` is settled, because this is the line
     # above that makes it answerable.
