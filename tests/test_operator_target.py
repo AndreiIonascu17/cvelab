@@ -443,7 +443,7 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
     def test_a_typed_line_arrives_at_the_product_as_one_command(self) -> None:
         with stub(seeded=False) as (address, asked):
             said, complained, code = self.ran(
-                self.artifact(), "--lab-address", address, "--shell", "--allow-shell",
+                self.artifact(), address, "--shell", "--allow-shell",
                 typed="id\n", port=address.rsplit(":", 1)[1],
             )
         self.assertEqual(code, 0, complained)
@@ -463,7 +463,7 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
     def test_each_line_is_its_own_invocation_and_its_own_session(self) -> None:
         with stub(seeded=False) as (address, asked):
             said, complained, code = self.ran(
-                self.artifact(), "--lab-address", address, "--shell", "--allow-shell",
+                self.artifact(), address, "--shell", "--allow-shell",
                 typed="id\necho two\nexit\n", port=address.rsplit(":", 1)[1],
             )
         self.assertEqual(code, 0, complained)
@@ -479,7 +479,7 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
     def test_the_directory_it_tracks_rides_on_the_command_itself(self) -> None:
         with stub(seeded=False) as (address, asked):
             self.ran(
-                self.artifact(), "--lab-address", address, "--shell", "--allow-shell",
+                self.artifact(), address, "--shell", "--allow-shell",
                 typed="cd /srv\nls\n", port=address.rsplit(":", 1)[1],
             )
         self.assertEqual(
@@ -672,15 +672,38 @@ class TheRunnerPublishesOnePortTests(unittest.TestCase):
         )
         self.assertIn("setup|exploit|verify|address|cleanup", runner)
 
-    def test_a_lab_with_no_proved_remote_mode_is_offered_no_command(self) -> None:
-        """A printed command that exits 2 reads as a broken kit.
+    def test_a_lab_with_no_proved_remote_mode_is_offered_the_lab_program(self) -> None:
+        """One echo line per thing that can actually be pointed at it.
 
-        Remote mode refuses for three labs in four, and the refusal is the
-        drafter's own recorded judgement rather than a fault. The hint says so
-        and sends the reader to the document that carries the reason.
+        A printed command that exits 2 reads as a broken kit, which is why
+        this line is per lab. For a lab that publishes a port and has no
+        proved remote mode there IS something to point at the address now:
+        the lab program takes it, at the place that program reads it. The
+        fallback was printed here anyway, so the runner said "nothing here
+        may be pointed at that address" while the document written by the
+        same call printed the command that does -- the disagreement between
+        the kit and the file that `takes_lab_address` exists to make
+        impossible. Measured: 12 archived labs are this shape.
+
+        No command after the address, because the validator this kit is
+        written beside reads none. That half is `shell_standing`'s and is
+        pinned where the two artifacts are compared.
         """
         runner = written_kit(port=8080)["manual.sh"]
         self.assertIn('echo "This build is reachable on $POC_AT"', runner)
+        self.assertIn(
+            'echo "  python3 \\"$LAB_ROOT/artifacts/PoC.py\\" $POC_AT"', runner
+        )
+        self.assertNotIn("nothing here may be pointed at that address", runner)
+        self.assertNotIn("$POC_AT id", runner)
+        self.assertNotIn("--input", runner)
+
+    def test_a_lab_with_neither_is_offered_nothing_and_says_so(self) -> None:
+        """The fallback's own lab: it publishes no port, so no address
+        reaches either program and there is nothing to print. 247 of the 264
+        archived labs are that lab.
+        """
+        runner = written_kit(port=None)["manual.sh"]
         self.assertIn("nothing here may be pointed at that address", runner)
         self.assertNotIn(r'python3 \"$LAB_ROOT', runner)
 
@@ -910,18 +933,42 @@ class TheGuideSaysWhatIsTrueTests(unittest.TestCase):
         # there and report NOT_OBSERVED, which reads as "not vulnerable".
         self.assertIn("Against anyone else's instance they are theirs", flat)
 
-    def test_a_refused_lab_is_shown_no_command_for_the_address(self) -> None:
-        """The address is still real; what may be pointed at it is not.
+    def test_a_refused_lab_is_shown_the_lab_program_for_the_address(self) -> None:
+        """The address is real, and so is what may be pointed at it.
 
-        Remote mode refuses for three labs in four, so this is the common
-        case, and the section says which of the two modes is unaffected.
+        Remote mode was refused for three labs in four, so this is the
+        common case. The section used to say that nothing could be pointed
+        at this address -- the refusal printed the recorded reason and exited
+        2 -- and for a lab that publishes a port that is no longer what
+        happens: the one argument reaches the lab program. So the section
+        shows that command, and owes the reader the sentence the verdict
+        cannot carry on its own, because the route that program sends is a
+        constant in it.
         """
         guide = " ".join(written_kit(port=8080)["LAB-POC.md"].split())
         self.assertIn("## The address this lab publishes", guide)
-        self.assertIn("Remote mode refuses for this lab", guide)
-        self.assertIn("exits 2 without sending anything", guide)
-        self.assertIn("Lab mode -- `PoC.py` with no argument", guide)
-        self.assertNotIn('python3 PoC.py "$(bash manual.sh address', guide)
+        self.assertIn('python3 PoC.py "$(bash manual.sh address vulnerable)"', guide)
+        self.assertIn(
+            "the one target whose result means what it looks like it means", guide
+        )
+        self.assertIn("What it cannot choose is the route", guide)
+        self.assertIn("says nothing about whether the host is affected", guide)
+        # The refusal is still named, as the thing this lab has none of
+        # rather than as what an argument meets.
+        self.assertIn("was refused for this lab, and no argument reaches one", guide)
+        self.assertIn("the address above goes to the lab program", guide)
+        self.assertIn(
+            "Lab mode with no argument, which is what `exploit` runs inside the "
+            "lab, is unaffected",
+            guide,
+        )
+        self.assertNotIn("exits 2 without sending anything", guide)
+        # And the closing summary names the same mode the section does.
+        self.assertIn(
+            "`PoC.py` takes no argument for lab mode and one address, which runs "
+            "that same lab program against a host instead of the Compose network",
+            guide,
+        )
 
     def test_a_lab_with_no_declared_port_says_so_instead(self) -> None:
         guide = " ".join(written_kit(port=None, record=PROVED)["LAB-POC.md"].split())

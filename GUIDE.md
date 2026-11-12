@@ -1018,10 +1018,30 @@ needs, and that CVELab proved it against a build before and after the fix. The
 spec it sends is embedded as readable JSON, so every request can be read -- and
 edited -- before it is run. It needs nothing installed beyond Python.
 
-Where the attempt was refused, remote mode refuses too: given an address it
-prints the drafter's own recorded reason and exits 2 without sending anything.
-That is three labs in four, so it is the case to expect. A remote mode that
-looked available and had never been proved would be pressed at a client.
+Where the attempt was refused there is no remote mode, and nothing in the file
+claims one: a remote mode that looked available and had never been proved would
+be pressed at a client. That is three labs in four, so it is the case to
+expect. What the address then reaches is decided by the lab and not by the
+address:
+
+- A lab that publishes no service port has a lab program that reads no
+  argument, so there is nothing for an address to be. It prints the drafter's
+  own recorded reason and exits 2 without sending anything.
+- A lab that publishes one hands the address to that lab program, which runs
+  the lab's own differential against it instead of against the Compose
+  network. Nothing is refused and nothing was proved against an instance of
+  yours either, so the file says what it sent: the route is a constant in the
+  lab program, and `BLOCKED` or `NOT_OBSERVED` from a host that never served
+  that route is a finding about the route and not about the host. It says it
+  once before the run and again under the verdict, because the verdict is what
+  gets pasted into a report.
+
+The second is the shape that replaced the `--lab-address` flag, which refused
+any address that was not loopback. The refusal bought less than it looked: the
+file cannot tell this lab's loopback port from any other service on the
+machine, so it was turning away the one target an operator is most likely
+entitled to test while still admitting every other one. What it was protecting
+is said instead of enforced.
 
 CVELab's half is the proof. It brings up the lab's two builds, runs that exact
 script against each from a sidecar joined to the container's network namespace,
@@ -1048,16 +1068,23 @@ downloads one. `--no-poc` withholds it.
 
 ### Which mode you are holding
 
-One script, two modes, and they reach different distances:
+One script, two modes, and they reach different distances. There is one
+argument, and which of the two it reaches is this lab's standing rather than
+anything about the address:
 
 | | Runs against | Proved before it was handed over |
 |---|---|---|
 | `python3 PoC.py` | this lab's own Docker builds, by Compose service name | yes, by the lab's own differential |
-| `python3 PoC.py <address>` | one instance whose address you supply | per CVE: this is what `cvelab manual` proves, and where it could not, the mode refuses |
+| `python3 PoC.py <address>`, lab with a proved remote mode | one instance whose address you supply | yes: this is what `cvelab manual` proves |
+| `python3 PoC.py <address>`, lab with a published port and no proved remote mode | whatever is at that address, over this lab's own route | no, and the file says so in its output -- the route is a constant in the lab program, so a negative verdict is a finding about the route |
+| `python3 PoC.py <address>`, lab with neither | nothing; it prints the recorded reason and exits 2 | not applicable |
 
-Only the second can be pointed at a server you did not build yourself, and only
-where the header says it was proved. Most labs do not have it -- the effect is
-often not observable from outside the process at all.
+Either of the two that sends anything can be pointed at a server you did not
+build yourself, and only the first of them was proved against one. Most labs
+are the last row -- the effect is often not observable from outside the process
+at all. The second is the one to read carefully: a verdict from it is about
+whether this lab's route is served there, and "not affected" is a claim it
+cannot carry.
 
 `LAB-POC.md` is written for every validated lab and says which case this lab
 is, under "Can this be pointed at a live instance?": proved, refused with the

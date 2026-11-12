@@ -2046,50 +2046,59 @@ def _check_all(target, args, findings, run):
 '''
 
 
-#: The third way in, and the only one that reaches the lab program with an
-#: argument.
+#: The one argument, and the one thing this file can say about it.
 #:
 #: The command form was the carried validator's own: `PoC.py <addr> id` ran a
 #: command through the weakness and printed its output. Measured on a freshly
 #: generated code-execution lab it worked -- `uid=10001(app) gid=10001(app)
 #: groups=10001(app)` -- and it was never proved against anything but this
 #: lab's own route, because the lab adapter's path is a constant in the
-#: validator. Aimed at a client it would send that route, find it absent and
-#: print BLOCKED: a false negative dressed as a test, which is what a bare
-#: address must not do.
+#: validator. Aimed at a client it sends that route, does not find it, and
+#: prints BLOCKED: a negative about the client's software that is actually a
+#: fact about CVELab's adapter.
 #:
-#: It is kept because showing impact is what it is for, and that is a job done
-#: on a lab the operator brought up themselves, in front of a client. So it is
-#: behind a flag that names the lab, refuses an address this lab cannot have
-#: published, and says in its own help text what it cannot check. Emitted only
-#: for a lab that declares a service port: the validator of a lab that does
-#: not reads no argument at all, so the flag would silently run the
-#: differential instead, which is worse than having no flag.
-_POC_LAB_ADDRESS = '''import ipaddress
+#: That was once a reason to refuse an address off loopback, behind a flag
+#: that named the lab. It is not any more: where this is pointed is the
+#: operator's to decide, and a flag that decided it for them bought safety
+#: this file cannot actually deliver -- which loopback port is this lab's it
+#: never knew either. What the refusal was protecting is still real, so it is
+#: said rather than enforced, in this file's own output and next to the
+#: verdict: `_lab_target_said` is that statement, and `_loopback` now decides
+#: only whether it is owed.
+#:
+#: Emitted for a lab that declares a service port and has no proved remote
+#: mode, which is exactly the lab whose one argument reaches the lab program.
+#: The validator of a lab that declares no port reads no argument at all, and
+#: a lab with a proved remote mode spends its one argument there.
+_POC_LAB_TARGET = '''import atexit, ipaddress
 
-LAB_ADDRESS_HELP = (
-@@HELP@@)
+LAB_TARGET_IS_NOT_AN_ADDRESS = (
+@@NOT_AN_ADDRESS@@)
 
+LAB_TARGET_TAKES_NO_INPUT = (
+@@NO_INPUT@@)
 
-def _lab_address_given(argv):
-    return any(
-        item == "--lab-address" or item.startswith("--lab-address=")
-        for item in argv[1:]
-    )
+#: What this file says about its own result when the address is not one this
+#: lab could have published. Printed and never enforced: see
+#: `_lab_target_said`, which is the whole of what replaced the refusal.
+LAB_TARGET_IS_NOT_THIS_LAB = (
+@@FOREIGN@@)
 
 
 def _loopback(host):
     """Whether this is an address this lab could have published.
 
-    The one half of the question that can be answered here. `manual.sh`
-    publishes 127.0.0.1 with the port left for the kernel, so a host that is
-    not loopback is certainly not this lab's; which loopback port belongs to
-    this lab is knowable only by asking Docker, which this script does not do.
+    The one half of the question that can be answered here, and it no longer
+    decides whether anything runs. `manual.sh` publishes 127.0.0.1 with the
+    port left for the kernel, so a host that is not loopback is certainly not
+    this lab's; which loopback port belongs to this lab is knowable only by
+    asking Docker, which this script does not do. So this being wrong is
+    silence where a sentence was owed, never a run that did not happen.
 
     `localhost` is taken at its word and not resolved, so a machine whose
-    hosts file points it somewhere else defeats this check. Resolving it
-    would mean a DNS lookup before the refusal, and on a machine whose
-    `localhost` is a lie the operator has already chosen that.
+    hosts file points it somewhere else gets no statement. Resolving it would
+    mean a DNS lookup before the run, and on a machine whose `localhost` is a
+    lie the operator has already chosen that.
     """
     name = host.strip().lower()
     if name == "localhost":
@@ -2100,91 +2109,106 @@ def _loopback(host):
         return False
 
 
-def _lab_address(argv):
-    """argv rewritten into the form the lab program below already takes.
-
-    The flag is stripped and the address left where that program reads it, so
-    neither half of this file is a second implementation of the attack and the
-    exit codes are the lab program's own.
-
-    The flag is read only ahead of the command, and that is the whole of why
-    this is a loop with a state in it rather than a scan. Read anywhere, a
-    second spelling of the flag overwrote the address and left the command
-    list empty -- so `--lab-address <addr> --lab-address=<addr>` handed the
-    lab program an address and nothing else, which the contract defines as
-    "run the lab's own harmless canary command". Measured: the command
-    vanished and the file printed the canary's observation and REPRODUCED on
-    stdout, exiting 0, for an argument the operator meant as a command. A
-    status that says the proof succeeded for work nobody asked for is the one
-    outcome this file must never produce, and it is reachable from any
-    caller that passes text through -- which is what a prompt over this
-    entry point does with every line it is typed.
-
-    So: before the command begins the flag is the flag, and a second one
-    there is ambiguous and refused rather than resolved. From the first word
-    of the command onward every item is the command's, verbatim, flag-shaped
-    or not. Nothing legitimate is lost -- the address has to precede what
-    runs against it for the invocation to read as anything else.
-    """
-    rest, where = [], None
-    items = list(argv[1:])
-    index = 0
-    while index < len(items):
-        item = items[index]
-        if rest:
-            # The command has started. Everything from here is its own, and
-            # an item that looks like a flag is a word in it.
-            rest.append(item)
-            index += 1
-            continue
-        if item == "--lab-address" or item.startswith("--lab-address="):
-            if where is not None:
-                print("--lab-address was given twice, before the command. Which address\\n"
-                      "this is meant to reach cannot be guessed, so nothing was sent.\\n"
-                      "Give it once, then the command: --lab-address ADDRESS [COMMAND].",
-                      file=sys.stderr)
-                raise SystemExit(2)
-            if item == "--lab-address":
-                index += 1
-                where = items[index] if index < len(items) else None
-            else:
-                where = item.split("=", 1)[1]
-        else:
-            rest.append(item)
-        index += 1
-    if not where or where.startswith("-"):
-        print("--lab-address takes the address this lab was published on, as\\n"
-              "`bash manual.sh address <build>` prints it, and it is not optional:\\n"
-              "with no argument at all this file runs the lab's own differential\\n"
-              "inside the lab's network, which needs no address.", file=sys.stderr)
-        raise SystemExit(2)
-    if any(item.startswith("--input") for item in rest):
-        # Which of the two the person wants decides what is being tested: an
-        # application of theirs, or this lab. Guessing either way would run a
-        # different test from the one they typed.
-        print("--lab-address and --input are different jobs. --input belongs to remote\\n"
-              "mode, which runs against an instance of yours and needs the route in it\\n"
-              "that reaches the affected code. --lab-address runs against this lab's\\n"
-              "own build, whose route is already a constant in the lab program. Drop\\n"
-              "whichever is not the host you mean to test.", file=sys.stderr)
-        raise SystemExit(2)
+def _lab_host(where):
+    """The host out of an address that may carry a port or be bracketed."""
     host = where
     if host.startswith("["):
         host = host[1:].partition("]")[0]
     elif host.count(":") == 1:
         host = host.split(":")[0]
-    if not _loopback(host):
-        print("%s is not an address this lab published. This lab publishes on\\n"
-              "loopback only -- `bash manual.sh address <build>` prints the port the\\n"
-              "kernel assigned it -- and --lab-address reaches this lab's own build\\n"
-              "and nothing else.\\n"
-              "\\n"
-              "To run against an instance you are permitted to test, there is remote\\n"
-              "mode: one address and no --lab-address. The header of this file says\\n"
-              "what that mode was proved against, or that it was not." % where,
-              file=sys.stderr)
+    return host
+
+
+def _lab_target_said(stream, where):
+    """What was sent, and what a negative verdict does not and does mean.
+
+    Said twice for one run: once before it, because an operator who learns
+    this from the output has already sent it, and once after, because the
+    verdict is the line that gets pasted into a report and a paragraph in the
+    header does not travel with it. The run's own recorded reason for having
+    no remote mode goes under it, since that is the finding an operator
+    pointing this at someone's host most needs to read.
+
+    Nothing raises out of here. It is registered with atexit, where an
+    exception would replace the lab program's own exit status -- the one bit
+    that says whether the proof ran at all -- with a traceback.
+    """
+    try:
+        stream.write(
+            "\\n"
+            "--------------------------------------------------------------------------\\n"
+            "WHAT WAS SENT, AND WHAT A NEGATIVE VERDICT DOES NOT MEAN\\n"
+            "--------------------------------------------------------------------------\\n"
+            "\\n"
+            "The address this run was given:\\n"
+            "\\n"
+            "    %s\\n"
+            "\\n" % where
+        )
+        stream.write(LAB_TARGET_IS_NOT_THIS_LAB)
+        stream.write("\\n")
+        stream.write(REMOTE_MODE_REFUSED)
+        stream.write(
+            "--------------------------------------------------------------------------\\n"
+        )
+        stream.flush()
+    except Exception:
+        pass
+
+
+def _lab_target(argv):
+    """Everything this file can say before the lab program takes the address.
+
+    It rewrites nothing and strips nothing. The lab program below reads the
+    address at argv[1] and a command at argv[2], which is where the operator
+    typed them, so neither half of this file is a second implementation of the
+    attack and the exit codes are the lab program's own.
+
+    That is also what ended a class of bug the flag it replaced had twice: a
+    scan that read every argument, so a second spelling of the flag anywhere
+    -- including in a line typed at the prompt, which arrives as one argument
+    of a run of this form -- replaced the address and left the lab program
+    with no command, which the contract defines as "run the lab's own harmless
+    canary". That printed REPRODUCED on stdout at exit 0 for work nobody asked
+    for. There is no flag left to collide with, and argv arrives here whole.
+
+    --help is answered here because the lab program would read it as an
+    address, and the header is this file's handover document. argv[1] only:
+    argv[2] is a command, and a prompt over this entry point will type
+    `--help` as one.
+    """
+    where = argv[1]
+    if where in ("-h", "--help"):
+        print(__doc__)
+        raise SystemExit(0)
+    if where.startswith("-"):
+        sys.stderr.write(LAB_TARGET_IS_NOT_AN_ADDRESS)
         raise SystemExit(2)
-    return [argv[0], where, *rest]
+    for item in argv[2:]:
+        if item == "--input" or item.startswith("--input="):
+            # Which of the two the person wants decides what is being tested.
+            # Guessing either way runs a different test from the one they
+            # typed, and here the guess would send this lab's route at their
+            # host and report a verdict on it.
+            sys.stderr.write(LAB_TARGET_TAKES_NO_INPUT)
+            raise SystemExit(2)
+    if _loopback(_lab_host(where)):
+        return
+    sys.stderr.write(
+        "[%s is not an address this lab published. What this sends is this\\n"
+        " lab's own route; the block at the end of this run says what that means\\n"
+        " for the verdict.]\\n" % where
+    )
+    sys.stderr.flush()
+    # stdout only where the verdict is the whole of what this run prints. Given
+    # a command, stdout is that command's output, and a paragraph of this
+    # file's in it would read as something the target said -- which is also
+    # why the prompt can redirect a run of this form to a file and get a
+    # transcript. stderr carries it there, and that is where the prompt reads
+    # it: it prints the child's stderr exactly when the command did not run.
+    atexit.register(
+        _lab_target_said, sys.stdout if len(argv) < 3 else sys.stderr, where
+    )
 '''
 
 
@@ -2217,90 +2241,168 @@ def _executes(plan: dict[str, Any] | None) -> bool:
     return contract.get("evidence_type") == "code_execution"
 
 
-def _lab_address_block(
-    plan: dict[str, Any] | None, shell: bool = False, executes: bool = False,
-) -> str:
-    """The flag's own code and the `--help` paragraph under it, for this lab.
+#: The one argument this file takes, said when what was given is not one.
+#: `_lab_target` refuses on it and so does the prompt, so there is one text
+#: for one question and the two cannot drift.
+_LAB_TARGET_IS_NOT_AN_ADDRESS = (
+    "This file takes one argument and it is the address to run against, so anything "
+    "beginning with a dash is not it. `bash manual.sh address <build>` prints the "
+    "address of this lab's own build, which is the one target whose result means "
+    "what it looks like it means; any other host is yours to choose and yours to "
+    "answer for. With no argument at all this file runs the lab's own differential "
+    "inside the lab's own Compose network, which needs no address."
+)
 
-    The paragraph is wrapped here rather than hand-laid in the emitted text:
-    one sentence of it is present only for a lab whose evidence is command
-    execution, and a literal wrapped around the longer version printed a
-    ragged block for every other lab.
+#: `--input` belongs to remote mode, and a file carrying this block has none:
+#: the block is emitted only where the lab program takes the address, which is
+#: only where remote mode was never proved. So this says there is none rather
+#: than naming a second mode the operator could have meant -- and it says how
+#: to run a command that really does begin that way, because the second
+#: argument is now a command and a refusal of one is a false refusal.
+_LAB_TARGET_TAKES_NO_INPUT = (
+    "--input belongs to remote mode -- the single-instance script CVELab drafts and "
+    "proves against one target of yours -- and this file has none; the header says "
+    "why. The argument here is an address, and anything after it is one command for "
+    "the lab program to run there, so --input is neither of those. To run a command "
+    "whose first word is --input, quote it: `printf %s --input=x`."
+)
 
-    `shell` adds the prompt's own lines, because the prompt is reached
-    through this flag rather than beside it: `--shell` without an address is
-    refused by the same function that refuses `--lab-address` without one.
 
-    `executes` is passed in for the reason `shell` is: it has
-    to be the form this lab's validator IMPLEMENTS, and the validator is
-    what `emit_poc` has and this function does not. It was `_executes(plan)`
-    -- the evidence the contract DECLARES -- and the two part company:
-    across 262 archived labs 34 declare command execution and 2 implement
-    it. For a lab with a declared port and a validator that reads no
-    command, this paragraph printed `python3 PoC.py --lab-address ADDRESS
-    id` for a command the program answers with exit 2. No archived lab has
-    that shape, because all 32 of the others declare no port either and so
-    reach none of this -- but it is the shape generation is likeliest to
-    produce, and the file promising what it refuses is the thing this mode
-    exists to avoid.
+def _lab_target_statement(plan: dict[str, Any] | None) -> str:
+    """The statement that replaced the loopback refusal, built from this lab.
+
+    It is the reason the refusal existed, said instead of enforced. The lab
+    program's one-command form and its differential both send the route of
+    this lab's own adapter, which is a constant in the validator; pointed at
+    a service that is not this lab's it asks for a route that is not there,
+    gets nothing, and prints BLOCKED or NOT_OBSERVED. That is a negative
+    result about the operator's client which is really a fact about CVELab's
+    adapter, and an operator who pastes it into a report tells the client
+    they are safe when nothing was tested.
+
+    So the three things the verdict cannot carry on its own are here with it:
+    what the route is, in the lab's own words for it; who wrote the thing
+    that serves it, read the way `_shell_where_you_are` reads the same field;
+    and which verdicts are findings about the host and which are findings
+    about the route. The last paragraph is the one that matters, because it
+    is the sentence the operator would otherwise write themselves.
+
+    Model prose goes in -- `attack_summary` is the drafter's -- and it leaves
+    through `_python_text`, which cannot end a literal early.
     """
-    command = (
-        " A second argument is one command to run on that build, delivered "
-        "through the same weakness the differential proved, whose output it "
-        "prints."
-        if executes else ""
-    )
-    paragraph = _filled(
-        "Runs the lab program in the lower half of this file against this lab's "
-        "own build on ADDRESS, which is what `bash manual.sh address <build>` "
-        f"prints after `setup`.{command} It reaches a build CVELab made and shows "
-        "nothing about any other host, so it is for demonstrating the impact of a "
-        "reproduction you brought up yourself.",
-        width=74,
-    )
-    caveat = _filled(
-        "ADDRESS has to be on loopback, because that is where this lab publishes. "
-        "WHICH loopback port is this lab's is not something this file can check -- "
-        "it asks Docker for nothing -- so pointing it at another service of your "
-        "own is yours to answer for. For an instance that is not this lab's, there "
-        "is remote mode above: one address, and no --lab-address.",
-        width=74,
-    )
-    text = (
-        "lab mode with an address:\n"
-        f"  --lab-address ADDRESS{' [COMMAND]' if executes else ''}\n"
-        + textwrap.indent(paragraph, "    ")
-        + "\n"
-        + textwrap.indent(caveat, "    ")
-        + "\n"
-    )
-    if shell:
-        text += (
-            "\n"
-            "lab mode at a prompt:\n"
-            "  --lab-address ADDRESS --shell --allow-shell\n"
-            + textwrap.indent(
-                _filled(
-                    "A prompt where every line you type is one more run of the form "
-                    "above: one command through the same weakness, its output "
-                    "printed, and nothing held open between lines. It is not a "
-                    "session -- no persistent environment, no interactive programs, "
-                    "no job control, no signals -- and `cd` is tracked by the prompt "
-                    "itself rather than on the target. --allow-shell is required and "
-                    "not implied: without it nothing is sent.",
-                    width=74,
-                ),
-                "    ",
+    plan = plan or {}
+    contract = plan.get("exploit_contract")
+    contract = contract if isinstance(contract, dict) else {}
+    summary = " ".join(str(contract.get("attack_summary") or "").split())
+    fidelity = plan.get("fidelity")
+    fidelity = fidelity if isinstance(fidelity, dict) else {}
+    simulated = [
+        item for item in (fidelity.get("simulated_components") or [])
+        if str(item).strip()
+    ]
+    said = [
+        _filled(
+            "That is not an address this lab published. This lab publishes on "
+            "loopback, and `bash manual.sh address <build>` prints the port the "
+            "kernel gave it -- so what ran above is this lab's own program against "
+            "a host of your choosing, and whether you were permitted to point it "
+            "there is your answer to give.",
+            width=74,
+        ),
+        _filled(
+            "What you could not choose is the route. The lab program sends one "
+            "route, the route this lab's own differential proved, and it is a "
+            "constant in the program rather than anything it discovered about the "
+            "host" + (":" if summary else "."),
+            width=74,
+        ),
+    ]
+    if summary:
+        said.append(textwrap.indent(_filled(summary, width=70), "    "))
+    if simulated:
+        said.append(
+            _filled(
+                "This lab's own fidelity record declares that route simulated "
+                "rather than the product's own, so it is a route CVELab's model "
+                "wrote and has no reason to exist anywhere but in this lab.",
+                width=74,
             )
-            + "\n"
         )
-    return _POC_LAB_ADDRESS.replace("@@HELP@@", _python_text(text))
+    elif fidelity.get("vendor_product_started") is True:
+        said.append(
+            _filled(
+                "This lab's fidelity record names no simulated component and "
+                "records the vendor's own product starting, so the route is the "
+                "product's own -- which another instance of that product may well "
+                "serve, and anything else will not.",
+                width=74,
+            )
+        )
+    else:
+        # The same silence `_shell_where_you_are` and `deliverables._fidelity`
+        # resolve the same way: an empty list can mean nothing was simulated
+        # or that the lab said nothing, and only `vendor_product_started`
+        # tells them apart.
+        said.append(
+            _filled(
+                "This lab's fidelity record does not say what serves that route: "
+                "it names no simulated component and does not record the vendor's "
+                "own product starting either. Read that as not recorded rather "
+                "than as the product's own.",
+                width=74,
+            )
+        )
+    said.append(
+        _filled(
+            "So read the result against that route and not against the host. "
+            "REPRODUCED, or output from a command you asked for, is a finding "
+            "about this host: the route is there and it answered. BLOCKED, "
+            "NOT_OBSERVED or nothing is NOT a finding about this host. It says "
+            "this one route did not answer there, which is what a host that never "
+            "served this lab's route looks like -- and exactly what a host that "
+            "IS affected through some other path looks like too. Nothing above "
+            "went looking for one.",
+            width=74,
+        )
+    )
+    said.append(
+        _filled(
+            "So report it as \"the route this lab reproduces is not served "
+            "there\", and name the route. \"Not affected\" is a claim this run "
+            "cannot carry, and the owner of that host will read it as one you "
+            "made.",
+            width=74,
+        )
+    )
+    return "\n\n".join(said) + "\n"
+
+
+def _lab_target_block(plan: dict[str, Any] | None) -> str:
+    """The address argument's own code, with this lab's words about this lab in it.
+
+    There is no `--help` paragraph under it any more, and that is the point:
+    there is no flag left to document under one. Where the address goes is in
+    the header's LAB MODE note, and `--help` prints the header for a file with
+    no remote mode -- which is every file this block is emitted into.
+    """
+    return (
+        _POC_LAB_TARGET
+        .replace(
+            "@@NOT_AN_ADDRESS@@",
+            _python_text(_filled(_LAB_TARGET_IS_NOT_AN_ADDRESS, width=76)),
+        )
+        .replace(
+            "@@NO_INPUT@@",
+            _python_text(_filled(_LAB_TARGET_TAKES_NO_INPUT, width=76)),
+        )
+        .replace("@@FOREIGN@@", _python_text(_lab_target_statement(plan)))
+    )
 
 
 #: The prompt. CVELab's own code, driving the lab program's own command form.
 #:
 #: The primitive the lower half proved is a request/response oracle, not a
-#: channel: `--lab-address ADDRESS COMMAND` runs one command and exits. Both
+#: channel: `PoC.py ADDRESS COMMAND` runs one command and exits. Both
 #: halves are in one file, so the half above can run that form in a loop --
 #: which is why there is no new entry point, no change to
 #: `sourcegen._OPERATOR_CONTRACT`, and nothing here that delivers a command
@@ -2314,10 +2416,13 @@ def _lab_address_block(
 #: is reached. The subprocess also keeps that program's exit status, which is
 #: the one bit that says whether the command ran at all.
 #:
-#: `--lab-address` and never a bare address. `_poc_entry` sends a bare
-#: argv[1] to remote mode's `main()`, which is a different program drafted
-#: against a different spec; the flag is the one branch that falls through to
-#: the lab program with the address where it reads it.
+#: One address and no flag, which is the dispatch this mode now re-enters:
+#: `_poc_entry` hands a bare argv[1] to the lab program for a lab that has no
+#: proved remote mode, and to remote mode's `main()` for a lab that has one.
+#: Those are different programs against different specs, and a prompt over
+#: the wrong one would have every line refused by argparse -- so
+#: `shell_standing` refuses the mode where remote mode was proved rather than
+#: shipping a prompt that cannot work.
 _POC_SHELL = '''import os, posixpath, re, shlex, subprocess, sys
 
 SHELL_NOT_ALLOWED = (
@@ -2355,24 +2460,8 @@ SHELL_JOINED = ("&&", "||", ";", "|", "&", ">", "<", "$(", "`")
 #: out of what is left. A mode added beside this one adds its own name here.
 SHELL_FLAGS = ("--shell", "--allow-shell")
 
-#: A line that the run this prompt makes would read as the address flag rather
-#: than as the command, because the command is one argument of that run and
-#: `_lab_address` reads every argument. `--lab-address=X` typed here used to
-#: replace the address and leave the lab program with no command at all, which
-#: prints that program's own differential where the command's output goes --
-#: REPRODUCED, on stdout, at exit 0, for a line the operator typed as a
-#: command. Refused by name instead, and nothing is sent.
-SHELL_IS_THE_ADDRESS_FLAG = (
-@@ADDRESS_FLAG@@)
-
-
 def _shell_given(argv):
     return "--shell" in argv[1:]
-
-
-def _shell_is_a_flag(sent):
-    """Whether this line would be read as the address flag and not as a command."""
-    return sent == "--lab-address" or sent.startswith("--lab-address=")
 
 
 def _shell_allowed(argv, refusal):
@@ -2401,15 +2490,29 @@ def _shell_cd(cwd, where):
 
 
 def _shell_run(address, command):
-    """One command, as one run of this same file in the form proved below."""
+    """One command, as one run of this same file in the form proved below.
+
+    Two arguments and nothing else, which is also the form an operator types
+    by hand. The child reads the address at argv[1] and this line, whole, at
+    argv[2]; nothing above the marker rewrites either, so a line that looks
+    like a flag is a word in the command.
+    """
     return subprocess.run(
-        [sys.executable, __file__, "--lab-address", address, command],
+        [sys.executable, __file__, address, command],
         capture_output=True, text=True,
     )
 
 
-def _shell_said(done):
-    """What the lab program said, printed as output only when it was output."""
+def _shell_said(done, foreign=False):
+    """What the lab program said, printed as output only when it was output.
+
+    `foreign` is where the honesty statement lands for this mode. A prompt
+    pointed at something that is not this lab fails on every line it sends --
+    the route is a constant in the lab program and that host does not serve
+    it -- and "the command did not run" is the line an operator reads as "no
+    command execution here". So it is said again under it, every time, and the
+    child's own stderr above carries the block in full.
+    """
     if done.returncode != 0:
         # Not output, and not printed where output goes: the lab program
         # exited non-zero, which on this form means the command did not run.
@@ -2422,6 +2525,12 @@ def _shell_said(done):
             "[the command did not run: the lab program exited %d. What is above is\\n"
             "that program saying so, not output from the target.]\\n" % done.returncode
         )
+        if foreign:
+            sys.stderr.write(
+                "[and this address is not this lab's, so a line that does not run is\\n"
+                " what a host that does not serve this lab's route looks like. It is\\n"
+                " not evidence that this host cannot be made to run commands.]\\n"
+            )
         return
     printed = done.stdout
     first, newline, rest = printed.partition("\\n")
@@ -2441,10 +2550,17 @@ def _shell_repl(address):
     exactly what a terminal's shape implies and does not have.
     """
     sys.stderr.write(
-        "%s --lab-address %s --shell: a prompt, not a session.\\n"
+        "%s %s --shell: a prompt, not a session.\\n"
         % (os.path.basename(sys.argv[0]), address)
     )
     sys.stderr.write(SHELL_OPENING)
+    # The same statement the one-command form prints after its verdict, said
+    # once here because this mode has no verdict to print it after -- and
+    # again by every line that does not run, and on the marker in front of
+    # every line that does.
+    foreign = not _loopback(_lab_host(address))
+    if foreign:
+        _lab_target_said(sys.stderr, address)
     sys.stderr.flush()
     cwd = ""
     while True:
@@ -2453,7 +2569,10 @@ def _shell_repl(address):
         # mode redirected to a file is a transcript of what the target said.
         # Which is also why this reads the line itself rather than through
         # input(), whose prompt goes to stdout.
-        sys.stderr.write("lab %s [cd simulated] %s$ " % (address, cwd or "."))
+        sys.stderr.write(
+            "%s %s [cd simulated] %s$ "
+            % ("NOT-THIS-LAB" if foreign else "lab", address, cwd or ".")
+        )
         sys.stderr.flush()
         try:
             line = sys.stdin.readline()
@@ -2478,11 +2597,8 @@ def _shell_repl(address):
             cwd = _shell_cd(cwd, words[1] if len(words) > 1 else "")
             continue
         sent = ("cd %s && " % shlex.quote(cwd) + line) if cwd else line
-        if _shell_is_a_flag(sent):
-            sys.stderr.write(SHELL_IS_THE_ADDRESS_FLAG)
-            continue
         try:
-            _shell_said(_shell_run(address, sent))
+            _shell_said(_shell_run(address, sent), foreign)
         except KeyboardInterrupt:
             sys.stderr.write(
                 "\\n[stopped waiting. The command may still be running on the target:\\n"
@@ -2499,18 +2615,24 @@ def _shell_repl(address):
 def _shell_mode(argv):
     """The prompt, and every reason there is not one.
 
-    The address, the loopback check and the refusal of `--input` are
-    `_lab_address`'s, because they are the same questions about the same
-    address: what this adds is the flag that has to be asked for and the
-    refusal of a command that belongs to the one-command form.
+    Its own flags out, and what is left is the one argument the rest of this
+    file takes: the address. The texts it refuses on are `_lab_target`'s,
+    because they are the same questions about the same argument -- what this
+    adds is the flag that has to be asked for, and the refusal of a command
+    on the command line, which belongs to the one-command form.
     """
     _shell_allowed(argv, SHELL_NOT_ALLOWED)
     rest = [item for item in argv[1:] if item not in SHELL_FLAGS]
-    where = _lab_address([argv[0], *rest])
-    if len(where) > 2:
+    if not rest or rest[0].startswith("-"):
+        sys.stderr.write(LAB_TARGET_IS_NOT_AN_ADDRESS)
+        raise SystemExit(2)
+    if any(item == "--input" or item.startswith("--input=") for item in rest[1:]):
+        sys.stderr.write(LAB_TARGET_TAKES_NO_INPUT)
+        raise SystemExit(2)
+    if len(rest) > 1:
         sys.stderr.write(SHELL_IS_NOT_ONE_COMMAND)
         raise SystemExit(2)
-    return _shell_repl(where[1])
+    return _shell_repl(rest[0])
 '''
 
 
@@ -2520,37 +2642,22 @@ def _shell_mode(argv):
 #: whatever the operator types next, for as long as they keep typing. So it
 #: is the second thing this file will not do because it was told to once.
 _SHELL_NOT_ALLOWED = (
-    "--shell opens a prompt and delivers every line you type to this lab's build as "
-    "a command, through the weakness this lab's differential proved. That is more "
+    "--shell opens a prompt and delivers every line you type to the address you gave "
+    "as a command, through the weakness this lab's differential proved. That is more "
     "than any other mode here asks of what it is pointed at: an ordinary request "
     "shows the effect once and stops. Re-run with --allow-shell once you are on a "
     "host where that is acceptable and you are permitted to do it."
 )
 
-#: The same shape as `--lab-address` refusing `--input`: which of the two the
+#: The same shape as `_lab_target` refusing `--input`: which of the two the
 #: person wants decides what runs, and guessing either way runs something
 #: they did not type.
 _SHELL_IS_NOT_ONE_COMMAND = (
     "--shell and a command on the command line are different jobs. A command there "
-    "is the one-command form -- --lab-address ADDRESS COMMAND -- which runs that one "
+    "is the one-command form -- one address, then one command -- which runs that one "
     "command and exits, and is what a demonstration in front of someone watching "
     "uses. --shell asks for the commands at a prompt instead and runs each one "
     "through that same form. Drop whichever of the two you did not mean."
-)
-
-#: The one line this prompt will not deliver. The command is one argument of a
-#: run of the form below, and that form reads every argument it is given, so a
-#: line that is the address flag replaces the address and leaves the lab
-#: program with no command -- which makes it print its own differential where
-#: the command's output goes. Said here rather than sent.
-_SHELL_IS_THE_ADDRESS_FLAG = (
-    "That line is --lab-address itself, and this prompt cannot deliver it: your line "
-    "is one argument of a run of the one-command form, and that form reads the flag "
-    "wherever it appears. Sent, it would replace the address and run this lab's own "
-    "differential with no command at all -- whose REPRODUCED would land where your "
-    "command's output goes. Nothing was sent. The address is already fixed for this "
-    "prompt; to point at another build, leave and start a new one. To run a command "
-    "whose text begins that way, quote it -- `printf %s --lab-address=x`."
 )
 
 
@@ -2609,12 +2716,16 @@ def _shell_where_you_are(plan: dict[str, Any] | None) -> str:
         )
         said.append(
             _filled(
-                "So what answers you is an adapter CVELab's model wrote"
+                "So on this lab's own build what answers you is an adapter "
+                "CVELab's model wrote"
                 + (f" around {repository}" if repository else "")
-                + ". The effect is evidence that the weakness is real in that code, "
-                "and evidence of nothing at all about any other host: not this "
-                "product in production, not a client's instance, not the machine "
-                "this lab is running on."
+                + ". There the effect is evidence that the weakness is real in that "
+                "code and evidence of nothing at all about any other host -- not "
+                "this product in production, not a client's instance, not the "
+                "machine this lab is running on. Pointed somewhere else, it is that "
+                "same route asked of a host that most likely does not serve it, and "
+                "a line that does not run says so about the route and not about the "
+                "host."
             )
         )
     elif fidelity.get("vendor_product_started") is True:
@@ -2622,9 +2733,10 @@ def _shell_where_you_are(plan: dict[str, Any] | None) -> str:
             _filled(
                 "This lab's fidelity record names no simulated component and records "
                 "the vendor's own product starting, so the route is the product's "
-                "own. It is still a build CVELab made and nothing else: the effect "
-                "is evidence about this code, and evidence of nothing at all about "
-                "any other host."
+                "own -- which another instance of that product may well serve. On "
+                "this lab's own build it is still a build CVELab made and nothing "
+                "else: the effect is evidence about this code, and evidence of "
+                "nothing at all about any other host."
             )
         )
     else:
@@ -2642,10 +2754,10 @@ def _shell_where_you_are(plan: dict[str, Any] | None) -> str:
                 "own product starting either. Read that as not recorded rather than "
                 "as the product's own -- every archived lab whose evidence is "
                 "command execution had something CVELab built in front of the "
-                "vendor's code. The effect is evidence about this code, and evidence "
-                "of nothing at all about any other host: not this product in "
-                "production, not a client's instance, not the machine this lab is "
-                "running on."
+                "vendor's code. On this lab's own build the effect is evidence about "
+                "this code, and evidence of nothing at all about any other host: not "
+                "this product in production, not a client's instance, not the machine "
+                "this lab is running on."
             )
         )
     return "\n\n".join(said) + "\n"
@@ -2657,7 +2769,7 @@ def _shell_opening(plan: dict[str, Any] | None) -> str:
         "\n"
         + _filled(
             "Each line you type is ONE command. This file is run again for that "
-            "line, in the one-command form below, the command is delivered through "
+            "line -- one address, one command -- the command is delivered through "
             "the same weakness the differential proved, and its output is printed. "
             "Nothing is held open between lines, so:"
         )
@@ -2822,13 +2934,25 @@ def _argv_offset(node: ast.AST, offsets: dict[str, int]) -> int | None:
     return None
 
 
-def shell_standing(plan: dict[str, Any] | None, validator: str) -> tuple[bool, str]:
+def shell_standing(
+    plan: dict[str, Any] | None,
+    validator: str,
+    record: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
     """Whether this lab gets the prompt, and the reason where it does not.
 
     One function, so the artifact, its `--help` and anything written about it
     cannot give different answers -- the discipline `poc_standing` already
-    holds remote mode to. Three conditions, and the third is read out of the
-    validator rather than taken on trust from the contract that asked for it.
+    holds remote mode to. Four conditions: the third is read out of the
+    validator rather than taken on trust from the contract that asked for it,
+    and the fourth is about the dispatch the prompt re-enters rather than
+    about the lab.
+
+    That fourth one is last because it is the only one that is not a fact
+    about this lab's own shape, and a lab that fails an earlier condition
+    should hear the reason that is about it. `record` defaults to nothing,
+    which reads as no proved remote mode -- the standing 262 of the 264
+    archived labs have.
     """
     if service_port(plan or {}) is None:
         return False, (
@@ -2853,6 +2977,21 @@ def shell_standing(plan: dict[str, Any] | None, validator: str) -> tuple[bool, s
             "run at a prompt, and a prompt that sent lines to this program would "
             "have every one of them refused."
         )
+    if poc_standing(record if isinstance(record, dict) else {}) == POC_SHIPPED:
+        # The prompt runs the lab program's one-command form by running this
+        # same file again with an address and a command. With one address
+        # argument and no flag, which of the two programs that reaches is
+        # decided by what the lab has: a proved remote mode spends the
+        # argument, and the prompt's child would land in argparse and have
+        # every line refused. Conservatively, as `_reads_a_second_positional`
+        # is read: the two costs are not symmetric, and a shipped prompt that
+        # cannot work is the worse one. No archived lab is both.
+        return False, (
+            "this lab has a proved remote mode, which is what one address reaches "
+            "here -- so there is no way left to hand the lab program an address, "
+            "and a prompt is one command through that program per line. Lab mode "
+            "with no argument, and remote mode with an address, are both unaffected."
+        )
     return True, ""
 
 
@@ -2864,10 +3003,6 @@ def _shell_block(plan: dict[str, Any] | None) -> str:
         .replace(
             "@@ONE_COMMAND@@",
             _python_text(_filled(_SHELL_IS_NOT_ONE_COMMAND, width=76)),
-        )
-        .replace(
-            "@@ADDRESS_FLAG@@",
-            _python_text(_filled(_SHELL_IS_THE_ADDRESS_FLAG, width=76)),
         )
         .replace("@@OPENING@@", _python_text(_shell_opening(plan)))
     )
@@ -2891,9 +3026,17 @@ def _poc_entry(standing: str, lab_address: bool, modes: tuple[str, ...] = ()) ->
     the environment, not from a command line. With no argument at all nothing
     here does anything and the lab program's own
     `if __name__ == "__main__"` starts it, which is how that mode stays what
-    it was. `--lab-address` falls through to the same program with the address
-    where it reads it. Remote mode, or its refusal, raises SystemExit here, so
-    the lab half below is never reached.
+    it was.
+
+    One address argument and no flag, and what it reaches is decided by what
+    the lab has rather than by how the address looks: a lab with a proved
+    remote mode spends the argument there, a lab without one but with a
+    published port hands it to the lab program, and a lab with neither
+    refuses it. Never by inspecting the address -- the gate that did that
+    could not tell this lab's loopback port from any other service on the
+    machine, and refused the one target an operator is most likely to have
+    the right to test. `_lab_target` says what that costs instead, in the
+    artifact's own output.
 
     `modes` names the modes of CVELab's own that take the whole run instead
     of either program: each is one `if` that raises, checked before anything
@@ -2906,17 +3049,19 @@ def _poc_entry(standing: str, lab_address: bool, modes: tuple[str, ...] = ()) ->
         if mode in modes:
             lines.append(f"    if {given}(sys.argv):")
             lines.append(f"        raise SystemExit({enter}(sys.argv))")
-    if lab_address:
-        lines.append("    if _lab_address_given(sys.argv):")
-        lines.append("        sys.argv = _lab_address(sys.argv)")
-        lines.append("    elif len(sys.argv) > 1:")
-    else:
-        lines.append("    if len(sys.argv) > 1:")
+    lines.append("    if len(sys.argv) > 1:")
     if standing == POC_SHIPPED:
         lines.append("        sys.exit(main())")
+    elif lab_address:
+        # Falls through: the lab program below reads the address where the
+        # operator typed it, and this says the one thing about it that the
+        # file can say. --help is answered in there, because the header is
+        # this file's handover document and the lab program would read it as
+        # an address.
+        lines.append("        _lab_target(sys.argv)")
     else:
-        # The header is this file's handover document, so --help prints it
-        # rather than the refusal: a lab with no remote mode still has a
+        # The header is this file's handover document, so --help prints the
+        # header rather than the refusal: a lab with no remote mode still has a
         # header worth reading, and three labs in four are that lab.
         lines.append('        if sys.argv[1] in ("-h", "--help"):')
         lines.append("            print(__doc__)")
@@ -3122,10 +3267,12 @@ def emit_field_poc(
     What comes back is one half of `PoC.py` and not a file: no shebang, no
     docstring and no entry point. `emit_poc` is what assembles the artifact.
 
-    `epilog` is the name of a constant in the other half, or `""`. It is what
-    `--help` prints under the options, and for a lab that has one that is the
-    `--lab-address` paragraph -- a flag handled before argparse is reached, so
-    its help is text here rather than an option nothing reads.
+    `epilog` is the name of a constant in the other half, or `""`, and it is
+    what `--help` prints under the options. No caller passes one any more:
+    the paragraph that went there described `--lab-address`, which is gone,
+    and a lab reaching this function spends its one argument on this mode. It
+    stays because the next mode handled before argparse is reached has the
+    same need, and the alternative is a template with no way to say anything.
     """
     embedded = {
         key: value for key, value in spec.items() if key not in ("fixture", "setup")
@@ -3285,6 +3432,25 @@ def _refusal_text(cve: str, record: dict[str, Any], standing: str) -> str:
     ) + "\n"
 
 
+def takes_lab_address(port: int | None, record: dict[str, Any] | None) -> bool:
+    """Whether this artifact's one address argument reaches the lab program.
+
+    The dispatch's own question, asked in one place because three writers
+    answer it: `_poc_entry` emits the branch, `_lab_mode_note` describes it,
+    and `deliverables` prints commands that use it. A lab that declares no
+    service port has a validator that reads no argument at all, so there is
+    nothing for an address to be; a lab with a proved remote mode spends its
+    one argument there, which is what a bare address has always done.
+
+    `port` is `exploit_contract.service_port` and `record` is what
+    `poc_record` read, so both callers have them without plumbing a plan
+    through.
+    """
+    return port is not None and poc_standing(
+        record if isinstance(record, dict) else {}
+    ) != POC_SHIPPED
+
+
 def _lab_mode_note(
     vulnerable_only: bool,
     lab_address: bool = False,
@@ -3299,10 +3465,12 @@ def _lab_mode_note(
     this file replaced opened with the identical heading, and only one of them
     could reach a live server.
 
-    `--lab-address` is described here rather than as a third mode, because
-    that is what it is: the same program, against a build of this lab, with
-    the address it was published on. What makes it safe to offer at all is
-    that it says so in the same breath.
+    The address is described here rather than as a third mode, because that
+    is what it is: the same program, with an address instead of the Compose
+    network. What that mode needs said is not where the address may point --
+    that is the operator's -- but what the program sends when it gets there,
+    because the route is a constant in it and a negative result about this
+    lab's route reads as a negative result about the host.
 
     `shell` is `shell_standing`'s answer, and the prompt belongs in this
     paragraph for the same reason: it is that same program again, run once
@@ -3317,7 +3485,7 @@ def _lab_mode_note(
     services = "`vulnerable`" if vulnerable_only else "`vulnerable` and `patched`"
     note = (
         (
-            "LAB MODE -- no argument, or --lab-address with this lab's own address:\n"
+            "LAB MODE -- no argument, or one address:\n"
             if lab_address else "LAB MODE -- no argument at all:\n"
         )
         + "\n"
@@ -3350,7 +3518,7 @@ def _lab_mode_note(
         if offered:
             prompt = (
                 "\n"
-                + f"    python3 {POC_NAME} --lab-address 127.0.0.1:32768 --shell --allow-shell\n"
+                + f"    python3 {POC_NAME} 127.0.0.1:32768 --shell --allow-shell\n"
                 + "\n"
                 + _filled(
                     "A prompt, and not a session. Every line you type is one more "
@@ -3379,30 +3547,32 @@ def _lab_mode_note(
     return (
         note
         + "\n"
-        + f"    python3 {POC_NAME} --lab-address 127.0.0.1:32768{command}\n"
+        + f"    python3 {POC_NAME} 127.0.0.1:32768{command}\n"
         + "\n"
         + _filled(
-            "The same lab program, against a build of this lab that is already "
-            "running: the address is what `bash manual.sh address <build>` prints "
-            "after `setup`."
+            "The same lab program, against whatever is already running at the "
+            "address you give it. `bash manual.sh address <build>` prints the "
+            "address of this lab's own build, which is what this is for and the "
+            "one target whose result means what it looks like it means."
             + (
-                " A second argument is one command to run on that build, delivered "
-                "through the same weakness the differential proved, whose output it "
-                "prints -- which is how the impact is shown to someone watching."
+                " A second argument is one command to run there, delivered through "
+                "the same weakness the differential proved, whose output it prints "
+                "-- which is how the impact is shown to someone watching."
                 if takes_a_command else ""
             )
-            + " It reaches a build CVELab made and shows nothing about any other "
-            "host, so it demonstrates a reproduction you brought up yourself and "
-            "nothing about anyone's server."
         )
         + "\n\n"
         + _filled(
-            "The address has to be on loopback, because that is where this lab "
-            "publishes, and an address that is not is refused. Which loopback port "
-            "is this lab's is not something this file can check -- it asks Docker "
-            "for nothing -- so pointing it at another service of your own is yours "
-            "to answer for. For an instance that is not this lab's, there is remote "
-            "mode: one address and no --lab-address."
+            "The address is yours to choose and nothing here checks it. What you "
+            "cannot choose is the route: the lab program sends the route this "
+            "lab's own differential proved, which is a constant in it, so against "
+            "anything but this lab it asks for a route that is most likely not "
+            "there. A BLOCKED or NOT_OBSERVED from such a host says that this "
+            "route is not served there and says nothing about whether the host is "
+            "affected -- it looks the same either way, and nothing here goes "
+            "looking. Whenever the address is not on loopback this file says so in "
+            "its own output, before the run and again after the verdict, because "
+            "the verdict is what gets pasted into a report."
         )
         + "\n"
         + prompt
@@ -3436,8 +3606,16 @@ def _poc_header(
     plan = plan or {}
     vulnerable_only = plan.get("lab_type") == "VULNERABLE_ONLY_REPRODUCTION"
     spec = record.get("spec") if standing == POC_SHIPPED else None
+    # "the argument chooses" for the two labs where it does: one with a
+    # proved remote mode, and one that publishes no port and refuses an
+    # address. Where the lab program takes the address, the argument chooses
+    # nothing -- the lab's own standing did, before the file was written.
     modes = (
-        "\nTwo modes, and the argument chooses.\n\n"
+        (
+            "\nTwo modes, and which one an address reaches is this lab's standing\n"
+            "rather than anything about the address.\n\n"
+            if lab_address else "\nTwo modes, and the argument chooses.\n\n"
+        )
         + _lab_mode_note(
             # `shell[0]` for what is promised and `_executes(plan)` for
             # what is explained. The ` id` appended to a printed command has
@@ -3454,11 +3632,29 @@ def _poc_header(
     )
     if spec is None:
         title = f"{cve} - this lab's own reproduction; no remote mode"
+        # Two refusals, because for one of these labs the invocation under
+        # the heading is a lie. Where the lab program takes the address, that
+        # command line does not print this and does not exit 2 -- it runs the
+        # lab program against 10.0.0.5:8080 -- and a header that showed it as
+        # the refused form would be the artifact promising a gate it no longer
+        # has.
         body = (
-            "REMOTE MODE -- refused for this lab. Exit 2, and nothing is sent:\n"
-            "\n"
-            f"    python3 {filename} 10.0.0.5:8080\n"
-            "\n"
+            (
+                "REMOTE MODE -- there is none for this lab, and nothing reaches one:\n"
+                "\n"
+                + _filled(
+                    "An address given to this file is not refused: it runs the lab "
+                    "program above, over this lab's own route. There is no mode here "
+                    "that was ever drafted or proved against an instance of yours, "
+                    "so nothing in this file carries a claim about one."
+                )
+                + "\n\n"
+                if lab_address else
+                "REMOTE MODE -- refused for this lab. Exit 2, and nothing is sent:\n"
+                "\n"
+                f"    python3 {filename} 10.0.0.5:8080\n"
+                "\n"
+            )
             + _quotable(_refusal_text(cve, record, standing))
         )
     else:
@@ -3529,35 +3725,35 @@ def emit_poc(
     """
     record = record if isinstance(record, dict) else {}
     standing = poc_standing(record)
-    # Whether the lab program takes an address at all, which is what the
-    # contract's declared port says: a lab without one is an archived lab
-    # whose validator reads no argv, and `--lab-address` there would run the
-    # differential and call it a demonstration.
-    takes_address = service_port(plan or {}) is not None
+    # Whether this file's one address argument reaches the lab program, which
+    # the declared port and the remote mode's standing decide together: a lab
+    # without a port is an archived lab whose validator reads no argv, and an
+    # address there would run the differential and call it a demonstration;
+    # a lab with a proved remote mode spends its one argument there.
+    takes_address = takes_lab_address(service_port(plan or {}), record)
     # And whether the prompt is one of this lab's modes, which is the same
     # question asked of the validator as well as of the contract: the
     # one-command form the prompt runs is asked for in prose and checked by
     # nothing, so a lab that did not write it gets no prompt and the reason
     # is printed in the header instead.
-    shell = shell_standing(plan, validator)
+    shell = shell_standing(plan, validator, record)
     header = _poc_header(
         cve, plan, record, standing, lab_address=takes_address, shell=shell,
     )
     lab, futures = _lab_half(validator)
     hoisted = f"from __future__ import {', '.join(futures)}\n" if futures else ""
     if standing == POC_SHIPPED:
-        remote = emit_field_poc(
-            cve, record["spec"], plan, POC_NAME,
-            epilog="LAB_ADDRESS_HELP" if takes_address else '""',
-        )
+        # No epilog: the paragraph that used to go under remote mode's
+        # `--help` described `--lab-address`, and a lab with a proved remote
+        # mode is exactly the lab whose one argument is remote mode's. There
+        # is nothing left for it to point at.
+        remote = emit_field_poc(cve, record["spec"], plan, POC_NAME)
     else:
         remote = _POC_NO_REMOTE_MODE.replace(
             "@@REFUSAL@@", _python_text(_refusal_text(cve, record, standing))
         )
     if takes_address:
-        remote += "\n" + _lab_address_block(
-            plan, shell=shell[0], executes=shell[0]
-        )
+        remote += "\n" + _lab_target_block(plan)
     if shell[0]:
         remote += "\n" + _shell_block(plan)
     remote += _poc_entry(

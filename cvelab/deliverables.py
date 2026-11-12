@@ -38,6 +38,7 @@ from .field import (
     LAB_POC_GUIDE_NAME,
     LEGACY_MANUAL_POC_NAMES,
     POC_NAME,
+    POC_NO_RECORD,
     POC_NOT_REQUESTED,
     POC_REFUSED,
     POC_SHIPPED,
@@ -45,6 +46,7 @@ from .field import (
     poc_record,
     poc_standing,
     shell_standing,
+    takes_lab_address,
 )
 
 ANALYSIS_SCHEMA = {
@@ -257,26 +259,72 @@ are theirs, not these.
 
 """
 
-_NOT_REQUESTED_NOTE = f"""No, because one was never asked for. `cvelab run --manual-poc`, or
+_NOT_REQUESTED_NOTE = """No, because one was never asked for. `cvelab run --manual-poc`, or
 `cvelab manual` on a lab that has already validated, attempts one: it
 drafts a single-instance spec, proves the script it emits against both of this
 lab's builds, and keeps it only if the effect showed on one and not the other.
-Until that is run, `{POC_NAME}` given an address refuses with exit 2, and nothing
-here has been proved past this lab's own builds."""
+Until that is run, {address}"""
 
-_NO_RECORD_NOTE = f"""This run kept no record of a single-instance script either way. Treat that as
+_NO_RECORD_NOTE = """This run kept no record of a single-instance script either way. Treat that as
 "not available" rather than "refused": a lab driven by its own curated runner
-never attempts one. `{POC_NAME}` given an address refuses with exit 2, and
-everything in this document reaches this lab's own builds only."""
+never attempts one. {address}"""
 
-_REFUSED_NOTE = f"""No. `{POC_NAME}` has a remote mode, and for this lab it refuses: given an
-address it prints the reason below and exits 2 without sending anything. CVELab
-drafted a single-instance script, proved it could not stand, and recorded why:
+_REFUSED_NOTE = """{address}
 
-{{reason}}
+{reason}
 
 That sentence is the limit of what this lab can show, and it is the one to
 repeat rather than implying the demonstration below would carry over."""
+
+#: What the three notes above say the address argument does, which the lab's
+#: own shape decides and not the address: `field.takes_lab_address` is the
+#: predicate, read once and passed in, so the document and the artifact's own
+#: header cannot give different answers.
+#:
+#: A lab that publishes no port has a validator that reads no argument, so the
+#: address really is refused and the sentence that says so is the one that was
+#: always here -- 247 of the 264 archived labs. A lab that publishes one hands
+#: that address to the lab program instead, and what the document owes there is
+#: not a warning about where it may point but the fact that the route is a
+#: constant: a BLOCKED from a host that never served this lab's route is the
+#: sentence an operator would otherwise write as "not affected".
+_ADDRESS_IS_REFUSED = {
+    POC_NOT_REQUESTED: f"""`{POC_NAME}` given an address refuses with exit 2, and nothing
+here has been proved past this lab's own builds.""",
+    POC_NO_RECORD: f"""`{POC_NAME}` given an address refuses with exit 2, and
+everything in this document reaches this lab's own builds only.""",
+    POC_REFUSED: f"""No. `{POC_NAME}` has a remote mode, and for this lab it refuses: given an
+address it prints the reason below and exits 2 without sending anything. CVELab
+drafted a single-instance script, proved it could not stand, and recorded why:""",
+}
+
+_ADDRESS_RUNS_THE_LAB_PROGRAM = {
+    POC_NOT_REQUESTED: f"""nothing here has been proved past this lab's own builds --
+and an address given to `{POC_NAME}` is not refused, because there is no remote
+mode for it to be refused by. It runs the lab program instead, over this lab's
+own route.""",
+    POC_NO_RECORD: f"""An address given to `{POC_NAME}` is not refused, because
+there is no remote mode for it to be refused by: it runs the lab program
+instead, over this lab's own route.""",
+    POC_REFUSED: """No, and no argument reaches one. CVELab drafted a single-instance script for
+this lab, proved it could not stand, and recorded why:""",
+}
+
+#: Said under either of the two above wherever the address does reach the lab
+#: program. The route the lab program sends is a constant in it, so a negative
+#: verdict from a foreign host is a fact about CVELab's adapter wearing the
+#: shape of a fact about that host. The artifact says this in its own output,
+#: next to the verdict; this is the same sentence where the reader met the
+#: command.
+_THE_ROUTE_IS_A_CONSTANT = f"""
+That address is yours to choose and nothing checks it. What it cannot choose is
+the route: the lab program sends the route this lab's own differential proved,
+which is a constant in it, so against anything but this lab it asks for a route
+that is most likely not there. `BLOCKED` or `NOT_OBSERVED` from such a host
+says that route is not served there and says nothing about whether the host is
+affected. `{POC_NAME}` says so itself whenever the address is not on loopback --
+before the run, and again under the verdict, which is the line that gets pasted
+into a report."""
 
 
 def _quoted(reason: str) -> str:
@@ -290,7 +338,9 @@ def _quoted(reason: str) -> str:
     return "\n".join(f"> {line}" if line.strip() else ">" for line in reason.splitlines())
 
 
-def _single_instance_note(record: dict, vulnerable_only: bool) -> str:
+def _single_instance_note(
+    record: dict, vulnerable_only: bool, takes_address: bool = False
+) -> str:
     """What the lab document says about the artifact's remote mode.
 
     `record` is what `field.poc_record` read: `report.manual_poc_field` for a
@@ -300,18 +350,31 @@ def _single_instance_note(record: dict, vulnerable_only: bool) -> str:
     document and the artifact cannot give different answers -- they were two
     files written by two modules, which is how a lab came to ship a document
     about a script that was never there.
+
+    `takes_address` is `field.takes_lab_address`, and it decides one sentence
+    in each of the three notes that are not the shipped one: whether an
+    address is refused, which is what a lab publishing no port does, or runs
+    the lab program, which is what a lab publishing one does now that the
+    flag that used to be required for it is gone. Defaulted, because a caller
+    that does not know is a caller whose lab publishes nothing.
     """
     standing = poc_standing(record)
     if standing == POC_SHIPPED:
         return _SHIPPED_NOTE.format(proof=_SHIPPED_PROOF[vulnerable_only])
+    address = (
+        _ADDRESS_RUNS_THE_LAB_PROGRAM[standing] + _THE_ROUTE_IS_A_CONSTANT
+        if takes_address else _ADDRESS_IS_REFUSED[standing]
+    )
     if standing == POC_REFUSED:
-        return _REFUSED_NOTE.format(reason=_quoted(str(record.get("reason") or "")))
+        return _REFUSED_NOTE.format(
+            address=address, reason=_quoted(str(record.get("reason") or ""))
+        )
     # The one reason core.py writes itself, rather than taking from the
     # drafter: the step was never asked for, so there is nothing to quote and
     # quoting it would read as a refusal the model made.
     if standing == POC_NOT_REQUESTED:
-        return _NOT_REQUESTED_NOTE
-    return _NO_RECORD_NOTE
+        return _NOT_REQUESTED_NOTE.format(address=address)
+    return _NO_RECORD_NOTE.format(address=address)
 
 
 #: The handed-over demo, as a template filled by substitution rather than an
@@ -629,10 +692,13 @@ def _write_generic_manual_assets(
     mode is there to be pointed at it, and with which arguments.
 
     `takes_a_command` decides the other command printed beside the address:
-    `--lab-address`, which runs the lab program against this lab's own
+    the lab program's one-command form, which runs against this lab's own
     published build and prints what one command on it returns. That is the
     form an owner demonstrates impact with, so it is printed where they are
-    already looking.
+    already looking. It is one address and no flag, like everything else this
+    artifact takes -- which of the file's two programs that address reaches is
+    `field.takes_lab_address`, computed here from the same port and the same
+    record the artifact's own dispatch was built from.
 
     It is what the artifact IMPLEMENTS and not what the plan declares, and
     the difference is the correction here. This was `_executes(plan)`, the
@@ -640,14 +706,19 @@ def _write_generic_manual_assets(
     `shell_standing` -- a declared port AND a validator that reads the
     command. Measured across 262 archived labs: 34 declare command
     execution, 2 implement it, and all 32 of the rest declare no service
-    port at all -- so the kit printed `--lab-address` for a file that does
-    not have the flag. The comment under the offers below already said what
+    port at all -- so the kit printed a flag for a file that does not have
+    one. The comment under the offers below already said what
     that costs: a printed command that fails reads as the kit being broken
     rather than as the drafter having refused the proof. One predicate for
     one question, asked of the thing that answers it.
     """
     record = record if isinstance(record, dict) else {}
     proved = poc_standing(record) == POC_SHIPPED
+    # Whether this lab's one address argument reaches the lab program, which
+    # is what decides that the commands printed below are real: on a lab with
+    # a proved remote mode the same address goes there instead, and a printed
+    # command that lands in the wrong program reads as the kit being broken.
+    lab_at_an_address = takes_lab_address(port, record)
     targets = ("vulnerable",) if vulnerable_only else ("vulnerable", "patched")
     patched_note = (
         "No patched target is available for this CVE."
@@ -658,10 +729,24 @@ def _write_generic_manual_assets(
     # and a line saying so when there is neither: a printed command that
     # exits 2 reads as the kit being broken rather than as the drafter having
     # refused the proof.
+    #
+    # `lab_at_an_address` is one of those things, and it is the one the flag's
+    # removal added: the lab program now takes the address, so for a lab that
+    # publishes a port and has no proved remote mode there IS something to
+    # point at it -- measured, 12 archived labs of that shape, where the
+    # command after the address is not offered because the validator reads
+    # none. Printing the fallback for them said "nothing here may be pointed
+    # at that address" in the runner while the document written by this same
+    # call printed the command that does, which is the disagreement between
+    # the kit and the file this predicate exists to make impossible.
+    # `takes_a_command` implies it and `proved` excludes it, so the three
+    # branches stay one line each.
     poc = f'python3 \\"$LAB_ROOT/artifacts/{POC_NAME}\\"'
     offers = []
-    if takes_a_command:
-        offers.append(f'      echo "  {poc} --lab-address $POC_AT id"')
+    if lab_at_an_address:
+        offers.append(
+            f'      echo "  {poc} $POC_AT{" id" if takes_a_command else ""}"'
+        )
     if proved:
         offers.append(
             f'      echo "  {poc} $POC_AT{_remote_arguments(record)}"'
@@ -735,23 +820,31 @@ The steps and what they bind are recorded in `plan.json` under
     # generated before the contract asked for one.
     # The command an owner demonstrates impact with, and the one thing on
     # this page that is neither the lab's differential nor a client's server:
-    # the lab program, against the build `setup` has just published, with one
-    # command to run on it. Shown only where the lab's declared evidence is
-    # command execution, because that is the only shape where the program
-    # takes a command.
+    # the lab program, against the build `setup` has just published. The
+    # command after the address is shown only where the lab's declared
+    # evidence is command execution, because that is the only shape where the
+    # program takes one -- but the address itself is shown wherever the lab
+    # program is what an address reaches, which is every lab here that has no
+    # proved remote mode. Printing the address only for the command form left
+    # the reader of every other one to find out from the script that its one
+    # argument is no longer refused.
+    # Written out per form rather than interpolated, like `_LAB_REACH` above
+    # and for the same reason: a substitution lands mid-line and prints a
+    # paragraph wrapped nowhere near the rest of the file.
+    runs = """That runs the lab program against this lab's own published build and prints
+what one command on it returns, which is how the impact of a reproduction is
+shown to someone watching. That build is the one target whose result means what
+it looks like it means.""" if takes_a_command else """That runs the lab program against this lab's own published build, which is the
+one target whose result means what it looks like it means."""
     impact = f'''```bash
 bash manual.sh setup vulnerable
-python3 {POC_NAME} --lab-address "$(bash manual.sh address vulnerable)" id
+python3 {POC_NAME} "$(bash manual.sh address vulnerable)"{' id' if takes_a_command else ''}
 ```
 
-That runs the lab program against this lab's own published build and prints
-what one command on it returns, which is how the impact of a reproduction is
-shown to someone watching. It reaches a build CVELab made and shows nothing
-about any other host: the address has to be on loopback, and an address that
-is not is refused. Which loopback port is this lab's `PoC.py` cannot check, so
-pointing it at another service of your own is yours to answer for.
+{runs}
+{_THE_ROUTE_IS_A_CONSTANT.lstrip()}
 
-''' if takes_a_command else ""
+''' if lab_at_an_address else ""
     rehearsal = impact + f'''```bash
 bash manual.sh setup vulnerable
 python3 {POC_NAME} "$(bash manual.sh address vulnerable)"{_remote_arguments(record)}
@@ -764,11 +857,11 @@ person running the script by hand has none of it.
 Where you point it is yours to answer for. It sends live requests to whatever
 address you give it, so give it only a host your engagement covers, and keep
 that authorization in writing.
-''' if proved else impact + f'''Remote mode refuses for this lab, so there is nothing of yours to point at
-that address: `python3 {POC_NAME} <address>` prints the recorded reason and
-exits 2 without sending anything. The section above carries that reason. Lab
-mode -- `{POC_NAME}` with no argument, which is what `exploit` runs inside the
-lab{', and `--lab-address` above' if takes_a_command else ''} -- is unaffected.
+''' if proved else impact + '''Remote mode -- a script CVELab drafts and proves against one instance of
+yours -- was refused for this lab, and no argument reaches one: the address
+above goes to the lab program. The section above carries the recorded reason.
+Lab mode with no argument, which is what `exploit` runs inside the lab, is
+unaffected.
 '''
     direct_section = f'''## The address this lab publishes
 
@@ -803,15 +896,49 @@ kit that publishes the port.
     # one replaced opened with the identical line `# {{cve}} Manual PoC`, so
     # the reader could not tell from the heading, the filename or the first
     # paragraph which of the two reached a live server.
-    single_instance = _single_instance_note(record, vulnerable_only)
+    single_instance = _single_instance_note(
+        record, vulnerable_only, lab_at_an_address
+    )
+    # The one thing on this page that can be aimed outside this lab, named as
+    # what it is for this lab. It used to say "remote mode" for every lab,
+    # which is right for a lab that publishes no port -- there an address
+    # reaches remote mode or its refusal and nothing else. For a lab that
+    # publishes one and has no proved remote mode, the same argument reaches
+    # the lab program, and saying "remote mode" would have the reader looking
+    # for a mode this file does not have while the thing it warns about sat
+    # one section above.
+    outside = (
+        f"""is the address you can give `{POC_NAME}`, which on this lab runs the lab
+program over this lab's own route -- so a negative result from anywhere else is
+a fact about that route, and only where you are authorized to send it at all."""
+        if lab_at_an_address else
+        f"""is `{POC_NAME}`'s remote mode, and only where you are authorized to
+test it."""
+    )
+    # The last line of the document, which is the one a reader quotes, and it
+    # named the mode the address reaches. For a lab whose address reaches the
+    # lab program that was the wrong mode: "one address for remote mode" sent
+    # the reader looking for a mode this file does not have, and read as a
+    # promise that the argument had been proved against an instance when the
+    # section above says the opposite. Same predicate, same sentence shape, so
+    # the summary and the section cannot answer differently.
+    closing = (
+        f"""`{POC_NAME}` takes no argument
+for lab mode and one address, which runs that same lab program against a host
+instead of the Compose network. Where you point it is yours to answer for --
+only a host your engagement authorizes."""
+        if lab_at_an_address else
+        f"""`{POC_NAME}` takes no argument for
+lab mode and one address for remote mode, and where you point that is yours to
+answer for -- only a host your engagement authorizes."""
+    )
     manual_guide = f'''# {cve} Lab PoC
 
 ## What this runs against
 
 {_LAB_REACH[vulnerable_only]} The one thing here that can
 be pointed at a client's server, a staging instance, or anything else outside
-this lab is `{POC_NAME}`'s remote mode, and only where you are authorized to
-test it.
+this lab {outside}
 
 ## Can this be pointed at a live instance?
 
@@ -875,9 +1002,7 @@ distribution itself is another.
 
 {_EXIT_STATUS[vulnerable_only]}
 
-`manual.sh` takes Docker service names only. `{POC_NAME}` takes no argument for
-lab mode and one address for remote mode, and where you point that is yours to
-answer for -- only a host your engagement authorizes.
+`manual.sh` takes Docker service names only. {closing}
 '''
     write_text(artifacts / LAB_POC_GUIDE_NAME, manual_guide)
 
@@ -1033,12 +1158,15 @@ def create_deliverables(
     # is whether the artifact beside it offers the command form, and only
     # the validator can answer that. Reading the declaration instead printed
     # the command for 32 of the 34 labs that declare command execution,
-    # every one of which declares no port and so has no `--lab-address` at
-    # all. Same predicate the artifact's own prompt is gated on, read once
-    # here and not re-derived, so the kit and the file cannot disagree.
+    # every one of which declares no port and so reaches none of this. Same
+    # predicate the artifact's own prompt is gated on, read once here and not
+    # re-derived, so the kit and the file cannot disagree -- including the
+    # record, which that predicate now reads too: a lab with a proved remote
+    # mode spends its one address argument there, so the lab program's
+    # command form is not reachable and is not printed.
     _write_generic_manual_assets(
         cve, lab_dir, artifacts, vulnerable_only, seeds, service_port(plan), record,
-        shell_standing(plan, validator)[0],
+        shell_standing(plan, validator, record)[0],
     )
     # Where the guard in `core.run_lab` is settled, because this is the line
     # above that makes it answerable.
