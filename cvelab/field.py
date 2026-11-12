@@ -2070,6 +2070,13 @@ def _check_all(target, args, findings, run):
 #: mode, which is exactly the lab whose one argument reaches the lab program.
 #: The validator of a lab that declares no port reads no argument at all, and
 #: a lab with a proved remote mode spends its one argument there.
+#:
+#: And for one more: a lab with a proved remote mode that also has the prompt.
+#: There the address an operator types is still remote mode's, and the lab
+#: program is reached at an address only in a child the prompt started -- but
+#: it is reached, so the statement this block exists to make is owed, and the
+#: prompt's own code reads `_loopback`, `_lab_host` and `_lab_target_said`
+#: from here rather than carrying a second copy that could drift from them.
 _POC_LAB_TARGET = '''import atexit, ipaddress
 
 LAB_TARGET_IS_NOT_AN_ADDRESS = (
@@ -2125,9 +2132,7 @@ def _lab_target_said(stream, where):
     Said twice for one run: once before it, because an operator who learns
     this from the output has already sent it, and once after, because the
     verdict is the line that gets pasted into a report and a paragraph in the
-    header does not travel with it. The run's own recorded reason for having
-    no remote mode goes under it, since that is the finding an operator
-    pointing this at someone's host most needs to read.
+    header does not travel with it. @@UNDER_IT@@
 
     Nothing raises out of here. It is registered with atexit, where an
     exception would replace the lab program's own exit status -- the one bit
@@ -2147,7 +2152,7 @@ def _lab_target_said(stream, where):
         )
         stream.write(LAB_TARGET_IS_NOT_THIS_LAB)
         stream.write("\\n")
-        stream.write(REMOTE_MODE_REFUSED)
+        stream.write(@@STANDING@@)
         stream.write(
             "--------------------------------------------------------------------------\\n"
         )
@@ -2253,18 +2258,53 @@ _LAB_TARGET_IS_NOT_AN_ADDRESS = (
     "inside the lab's own Compose network, which needs no address."
 )
 
-#: `--input` belongs to remote mode, and a file carrying this block has none:
-#: the block is emitted only where the lab program takes the address, which is
-#: only where remote mode was never proved. So this says there is none rather
-#: than naming a second mode the operator could have meant -- and it says how
-#: to run a command that really does begin that way, because the second
-#: argument is now a command and a refusal of one is a false refusal.
+#: `--input` belongs to remote mode, and the file this block is usually
+#: emitted into has none: it goes wherever the lab program is what an address
+#: reaches, which is every lab that published a port and proved no remote
+#: mode. So this says there is none rather than naming a second mode the
+#: operator could have meant -- and it says how to run a command that really
+#: does begin that way, because the second argument is now a command and a
+#: refusal of one is a false refusal.
 _LAB_TARGET_TAKES_NO_INPUT = (
     "--input belongs to remote mode -- the single-instance script CVELab drafts and "
     "proves against one target of yours -- and this file has none; the header says "
     "why. The argument here is an address, and anything after it is one command for "
     "the lab program to run there, so --input is neither of those. To run a command "
     "whose first word is --input, quote it: `printf %s --input=x`."
+)
+
+#: The same refusal in the one file that does have a remote mode and carries
+#: this block anyway: a lab with a proved mode AND the prompt, where the block
+#: is reached at the prompt and in the prompt's own child. There `--input` is
+#: a flag this file really has, so the refusal points at it instead of denying
+#: it -- a flag named as absent in a file that has it is the thing an operator
+#: stops trusting the header over.
+_LAB_TARGET_INPUT_IS_REMOTE_MODES = (
+    "--input belongs to remote mode -- the single-instance script CVELab drafted for "
+    "this finding and proved against one target of yours -- and remote mode is what "
+    "one address and no prompt reaches here, so that is where --input goes. At a "
+    "prompt the argument is an address and every line typed is one command for the "
+    "lab program, so --input is neither of those. To run a command whose first word "
+    "is --input, quote it: `printf %s --input=x`."
+)
+
+#: The sentence of `_lab_target_said`'s own docstring that names what the
+#: block ends on, which is the one line of that docstring the two shapes do
+#: not share. Hand-wrapped and indented, unlike every other text here, for
+#: one reason: it is emitted INSIDE that docstring rather than as a literal
+#: beside it, so `_filled` cannot place it and the wrapping is the emitted
+#: wrapping. The first of the two is the text the archive carries, to the
+#: byte.
+_LAB_SAID_ENDS_ON = (
+    "The run's own recorded reason for having\n"
+    "    no remote mode goes under it, since that is the finding an operator\n"
+    "    pointing this at someone's host most needs to read."
+)
+_LAB_SAID_ENDS_ON_PROVED = (
+    "This file has a remote mode and the\n"
+    "    sentence that says it is not what ran goes under it, since that is the\n"
+    "    finding an operator pointing a prompt at someone's host most needs to\n"
+    "    read: what answered is the lab program, over this lab's own route."
 )
 
 
@@ -2377,13 +2417,20 @@ def _lab_target_statement(plan: dict[str, Any] | None) -> str:
     return "\n\n".join(said) + "\n"
 
 
-def _lab_target_block(plan: dict[str, Any] | None) -> str:
+def _lab_target_block(plan: dict[str, Any] | None, proved: bool = False) -> str:
     """The address argument's own code, with this lab's words about this lab in it.
 
     There is no `--help` paragraph under it any more, and that is the point:
     there is no flag left to document under one. Where the address goes is in
-    the header's LAB MODE note, and `--help` prints the header for a file with
-    no remote mode -- which is every file this block is emitted into.
+    the header's LAB MODE note, and `--help` prints the header for a file
+    with no remote mode -- which is every file this block is emitted into
+    except one: a lab that proved a remote mode and also has the prompt
+    carries it for the prompt's sake, and there `--help` is argparse's.
+
+    `proved` is that lab, and the two texts it changes are the two in here
+    that are about remote mode's standing rather than about the address: the
+    refusal of `--input`, which is a flag that file has, and the sentence
+    `_lab_target_said` ends on.
     """
     return (
         _POC_LAB_TARGET
@@ -2393,9 +2440,21 @@ def _lab_target_block(plan: dict[str, Any] | None) -> str:
         )
         .replace(
             "@@NO_INPUT@@",
-            _python_text(_filled(_LAB_TARGET_TAKES_NO_INPUT, width=76)),
+            _python_text(_filled(
+                _LAB_TARGET_INPUT_IS_REMOTE_MODES if proved
+                else _LAB_TARGET_TAKES_NO_INPUT,
+                width=76,
+            )),
         )
         .replace("@@FOREIGN@@", _python_text(_lab_target_statement(plan)))
+        .replace(
+            "@@STANDING@@",
+            "REMOTE_MODE_IS_NOT_THIS_RUN" if proved else "REMOTE_MODE_REFUSED",
+        )
+        .replace(
+            "@@UNDER_IT@@",
+            _LAB_SAID_ENDS_ON_PROVED if proved else _LAB_SAID_ENDS_ON,
+        )
     )
 
 
@@ -2416,13 +2475,15 @@ def _lab_target_block(plan: dict[str, Any] | None) -> str:
 #: is reached. The subprocess also keeps that program's exit status, which is
 #: the one bit that says whether the command ran at all.
 #:
-#: One address and no flag, which is the dispatch this mode now re-enters:
+#: One address and no flag, which is the dispatch this mode re-enters:
 #: `_poc_entry` hands a bare argv[1] to the lab program for a lab that has no
 #: proved remote mode, and to remote mode's `main()` for a lab that has one.
 #: Those are different programs against different specs, and a prompt over
-#: the wrong one would have every line refused by argparse -- so
-#: `shell_standing` refuses the mode where remote mode was proved rather than
-#: shipping a prompt that cannot work.
+#: the wrong one would have every line refused by argparse. So on a lab that
+#: has both, the prompt tells its own child which of the two it means, in the
+#: environment rather than in argv: `_POC_SHELL_CHILD` below is that channel,
+#: `@@CHANNEL@@` is where this block's child picks it up, and both are
+#: emitted only for the lab whose dispatch has that choice to make.
 _POC_SHELL = '''import os, posixpath, re, shlex, subprocess, sys
 
 SHELL_NOT_ALLOWED = (
@@ -2499,7 +2560,7 @@ def _shell_run(address, command):
     """
     return subprocess.run(
         [sys.executable, __file__, address, command],
-        capture_output=True, text=True,
+        capture_output=True, text=True,@@CHANNEL@@
     )
 
 
@@ -2634,6 +2695,119 @@ def _shell_mode(argv):
         raise SystemExit(2)
     return _shell_repl(rest[0])
 '''
+
+
+#: The prompt's own channel to its own child, emitted for the one lab shape
+#: whose dispatch has a choice to make: a proved remote mode AND the prompt.
+#:
+#: It grants nothing. Both programs in this file are already reachable -- the
+#: lab program with no argument, remote mode with an address -- and all this
+#: decides is which of the two an address reaches inside a child the prompt
+#: started. The environment is where the lab program takes its instructions
+#: from already (CVELAB_MANUAL_ACTION, CVELAB_TARGET, CVELAB_BOUND), so it is
+#: the channel this file already has for exactly this: there is no new
+#: argument, nothing new in `--help`, and nothing here an operator types. A
+#: hidden argv token would be worse than no argv change at all -- a flag
+#: named in a file that does not have it is the thing an operator types next.
+#:
+#: The value is the prompt's own pid and the child checks it against its own
+#: parent, which is what makes this the prompt's channel rather than a
+#: setting: a variable left in an operator's shell is not the prompt, and is
+#: said and ignored rather than silently running the other program for a
+#: command line whose address the header says reaches remote mode. On every
+#: other lab shape the variable is not emitted and not read at all -- there
+#: the lab program is what an address already reaches, or no address reaches
+#: either program, so there is nothing for it to choose.
+#:
+#: The second constant is the one sentence in `_lab_target_said` that is
+#: about remote mode's standing. For a lab that has none that is the recorded
+#: reason, `REMOTE_MODE_REFUSED`; here there is one, and what is worth saying
+#: is that it is not what just ran.
+_POC_SHELL_CHILD = '''SHELL_CHILD = "CVELAB_POC_SHELL_PARENT"
+
+REMOTE_MODE_IS_NOT_THIS_RUN = (
+@@NOT_THIS_RUN@@)
+
+#: What `--help` says about the mode it is not the help for. On this lab
+#: `--help` is argparse's -- one address is remote mode's, so that is where
+#: it goes -- and the prompt is handled before argparse is reached, which is
+#: the need remote mode's epilog was kept for.
+SHELL_IN_HELP = (
+@@IN_HELP@@)
+
+
+def _shell_child_env():
+    """The environment the prompt starts a line of its own in.
+
+    Everything this process has, plus this process's pid under the one name
+    the child reads. The parent's own environment is untouched, so the name
+    exists in children of the prompt and nowhere else.
+    """
+    return dict(os.environ, **{SHELL_CHILD: str(os.getpid())})
+
+
+def _shell_child():
+    """Whether this run is a line typed at this same file's own prompt.
+
+    Which is the whole of what it decides: this lab has a proved remote mode,
+    so a bare address is remote mode's, and the prompt runs the lab program's
+    one-command form -- the same program lab mode runs, at an address. Both
+    were reachable before this existed; this chooses between them for the
+    prompt's own child and for nothing else.
+
+    Set and not matching is not this file's prompt. It is said rather than
+    honoured, because honouring it would run a different program against a
+    different spec than the header says that command line runs, and the one
+    thing lost by ignoring it is nothing: lab mode needs no argument at all.
+    """
+    said = os.environ.get(SHELL_CHILD)
+    if said is None:
+        return False
+    if said == str(os.getppid()):
+        return True
+    sys.stderr.write(
+        "[%s is set in this environment. That name is this file's prompt naming a\\n"
+        " child of its own, and its value is that prompt's pid: this run's parent is\\n"
+        " not it, so this is not that child. Ignored -- the address reaches remote\\n"
+        " mode, which is what the header says it reaches. The prompt is --shell, and\\n"
+        " the lab program needs no argument at all.]\\n" % SHELL_CHILD
+    )
+    sys.stderr.flush()
+    return False
+'''
+
+#: The options `--help` lists are remote mode's, and on this lab shape they
+#: are not the whole file. One text for one question: `shell_standing` decides
+#: whether there is a prompt and every surface repeats it, and this is the
+#: surface that would otherwise not -- the header says it, the kit says it,
+#: and `--help` here never reaches the header.
+_SHELL_IN_HELP = (
+    "This file holds two programs. The options above are remote mode's: the script "
+    "CVELab drafted for this finding and proved against a single instance, which is "
+    "what one address reaches. The other is the lab program -- with no argument at "
+    "all it runs this lab's own differential, and with --shell --allow-shell after "
+    "an address it opens a prompt that runs its one-command form once per line "
+    "against that address. The prompt is not remote mode and carries no claim about "
+    "any host; this file's own docstring says what each of the two is worth."
+)
+
+
+#: What `_lab_target_said` says about remote mode where there is one, which is
+#: only ever read in this file's own prompt or in a child of it.
+#:
+#: The lab program at an address is this lab's own route, and on this shape it
+#: is not the mode that was drafted and proved against a single instance --
+#: so a verdict from a line typed here is a verdict about that route, and the
+#: operator needs to know which of the two programs answered them.
+_REMOTE_MODE_IS_NOT_THIS_RUN = (
+    "This file does have a remote mode -- a script CVELab drafted for this finding "
+    "and proved against a single instance -- and it is not what ran here. What ran "
+    "is the lab program, over the route this lab's own differential proved, which "
+    "is a constant in it: that is what a line typed at this file's prompt runs, one "
+    "run of it per line. Remote mode is what one address and no prompt reaches. So "
+    "read the verdict above as this lab's route on that host, and reach for remote "
+    "mode where what you need is the script that was proved against one instance."
+)
 
 
 #: Refused rather than reported as nothing found, on the pattern
@@ -2943,16 +3117,24 @@ def shell_standing(
 
     One function, so the artifact, its `--help` and anything written about it
     cannot give different answers -- the discipline `poc_standing` already
-    holds remote mode to. Four conditions: the third is read out of the
-    validator rather than taken on trust from the contract that asked for it,
-    and the fourth is about the dispatch the prompt re-enters rather than
-    about the lab.
+    holds remote mode to. Three conditions, every one of them a fact about
+    this lab's own shape, so a lab refused the mode hears a reason about
+    itself. The third is read out of the validator rather than taken on trust
+    from the contract that asked for it.
 
-    That fourth one is last because it is the only one that is not a fact
-    about this lab's own shape, and a lab that fails an earlier condition
-    should hear the reason that is about it. `record` defaults to nothing,
-    which reads as no proved remote mode -- the standing 262 of the 264
-    archived labs have.
+    There was a fourth, and it was the only one that was not about the lab:
+    a lab with a proved remote mode spends its one address argument there, so
+    the prompt's child would have landed in argparse and had every line
+    refused. Measured on a lab generated after that was written -- a declared
+    port, code execution, a validator that implements the one-command form
+    AND a proved remote mode -- it withheld the prompt from exactly the most
+    capable shape a lab has. The prompt reaches the lab program in its own
+    child through the environment now, which is neither the address path nor
+    a flag: `_POC_SHELL_CHILD` is that channel, the dispatch no longer
+    decides this, and the condition is gone.
+
+    `record` is still taken, because the two blocks that channel needs are
+    emitted off it and both writers already hold it; nothing here reads it.
     """
     if service_port(plan or {}) is None:
         return False, (
@@ -2977,26 +3159,17 @@ def shell_standing(
             "run at a prompt, and a prompt that sent lines to this program would "
             "have every one of them refused."
         )
-    if poc_standing(record if isinstance(record, dict) else {}) == POC_SHIPPED:
-        # The prompt runs the lab program's one-command form by running this
-        # same file again with an address and a command. With one address
-        # argument and no flag, which of the two programs that reaches is
-        # decided by what the lab has: a proved remote mode spends the
-        # argument, and the prompt's child would land in argparse and have
-        # every line refused. Conservatively, as `_reads_a_second_positional`
-        # is read: the two costs are not symmetric, and a shipped prompt that
-        # cannot work is the worse one. No archived lab is both.
-        return False, (
-            "this lab has a proved remote mode, which is what one address reaches "
-            "here -- so there is no way left to hand the lab program an address, "
-            "and a prompt is one command through that program per line. Lab mode "
-            "with no argument, and remote mode with an address, are both unaffected."
-        )
     return True, ""
 
 
-def _shell_block(plan: dict[str, Any] | None) -> str:
-    """The prompt's own code, with this lab's words about this lab in it."""
+def _shell_block(plan: dict[str, Any] | None, proved: bool = False) -> str:
+    """The prompt's own code, with this lab's words about this lab in it.
+
+    `proved` is whether this lab has a remote mode, which decides one thing:
+    whether the child this prompt starts is told it is the prompt's, because
+    that is the only lab shape where a bare address would reach the other
+    program. Where it would not, the channel is not emitted and not read.
+    """
     return (
         _POC_SHELL
         .replace("@@NOT_ALLOWED@@", _python_text(_filled(_SHELL_NOT_ALLOWED, width=76)))
@@ -3005,6 +3178,19 @@ def _shell_block(plan: dict[str, Any] | None) -> str:
             _python_text(_filled(_SHELL_IS_NOT_ONE_COMMAND, width=76)),
         )
         .replace("@@OPENING@@", _python_text(_shell_opening(plan)))
+        .replace("@@CHANNEL@@", "\n        env=_shell_child_env()," if proved else "")
+    )
+
+
+def _shell_child_block() -> str:
+    """The channel's own code, for the one lab shape that has a choice to make."""
+    return (
+        _POC_SHELL_CHILD
+        .replace(
+            "@@NOT_THIS_RUN@@",
+            _python_text(_filled(_REMOTE_MODE_IS_NOT_THIS_RUN, width=76)),
+        )
+        .replace("@@IN_HELP@@", _python_text(_filled(_SHELL_IN_HELP, width=76)))
     )
 
 
@@ -3043,6 +3229,14 @@ def _poc_entry(standing: str, lab_address: bool, modes: tuple[str, ...] = ()) ->
     else reads argv, so a mode joins `_POC_OWN_MODES` rather than this
     dispatch. None of them can be reached with no argument at all, which is
     what keeps that path what it was.
+
+    The prompt is the one of them that re-enters this dispatch, because it
+    runs the lab program's one-command form by running this file again, and
+    on a lab with a proved remote mode the argument it has to use is remote
+    mode's. So there the environment chooses, and only in a child the prompt
+    started: `_shell_child` is that question, and the answer is the same two
+    programs reachable the same two ways -- what it chooses is which of them
+    an address reaches inside the prompt's own child, and nothing else.
     """
     lines = ['\nif __name__ == "__main__":']
     for mode, given, enter in _POC_OWN_MODES:
@@ -3050,7 +3244,16 @@ def _poc_entry(standing: str, lab_address: bool, modes: tuple[str, ...] = ()) ->
             lines.append(f"    if {given}(sys.argv):")
             lines.append(f"        raise SystemExit({enter}(sys.argv))")
     lines.append("    if len(sys.argv) > 1:")
-    if standing == POC_SHIPPED:
+    if standing == POC_SHIPPED and "shell" in modes:
+        lines.append("        if _shell_child():")
+        # The same fall-through the branch below takes, for the same reason:
+        # the lab program reads the address and the command where the prompt
+        # put them, and `_lab_target` says the one thing this file can say
+        # about where that is.
+        lines.append("            _lab_target(sys.argv)")
+        lines.append("        else:")
+        lines.append("            sys.exit(main())")
+    elif standing == POC_SHIPPED:
         lines.append("        sys.exit(main())")
     elif lab_address:
         # Falls through: the lab program below reads the address where the
@@ -3532,6 +3735,12 @@ def takes_lab_address(port: int | None, record: dict[str, Any] | None) -> bool:
     nothing for an address to be; a lab with a proved remote mode spends its
     one argument there, which is what a bare address has always done.
 
+    An address an operator types, which is what all three writers are about.
+    The prompt reaches the lab program at an address on a lab that answers
+    False here, in a child it starts itself and tells so in the environment
+    -- not through the argument this answers for, and not on a command line
+    any of the three print.
+
     `port` is `exploit_contract.service_port` and `record` is what
     `poc_record` read, so both callers have them without plumbing a plan
     through.
@@ -3564,12 +3773,13 @@ def _lab_mode_note(
 
     `shell` is `shell_standing`'s answer, and the prompt belongs in this
     paragraph for the same reason: it is that same program again, run once
-    per line. Where the lab takes an address and declares command execution
-    and the prompt is still absent, the reason is printed here -- that lab
-    qualified in every way its contract states and the mode is missing
-    anyway, which is a fact about the lab and not about this file. Where the
-    lab was never a candidate, nothing is said: a paragraph about a mode that
-    could not apply is noise in three artifacts out of four.
+    per line. Wherever the lab declares command execution, this says what the
+    prompt is or why there is none -- the declaration and not the address,
+    because every reason `shell_standing` gives is a fact about the lab and
+    an operator holding that lab is owed it whether or not an address reaches
+    anything. Where the lab declares something else, nothing is said: a
+    paragraph about a mode it was never a candidate for is noise, which is
+    229 of the 264 archived labs.
     """
     builds = "one Docker build" if vulnerable_only else "two Docker builds"
     services = "`vulnerable`" if vulnerable_only else "`vulnerable` and `patched`"
@@ -3591,8 +3801,6 @@ def _lab_mode_note(
         )
         + "\n"
     )
-    if not lab_address:
-        return note
     # Two answers and not one, which a test caught when they were the same.
     # `takes_a_command` is what the validator IMPLEMENTS and it decides what
     # is PROMISED -- the ` id` printed after the address, and the sentence
@@ -3601,19 +3809,29 @@ def _lab_mode_note(
     # declares command execution and does not implement it is exactly the
     # lab that needs to be told why it has no prompt, so gating the
     # explanation on the implementation deleted it where it was most owed.
-    command = " id" if takes_a_command else ""
     prompt = ""
     if shell is not None and declares_a_command:
         offered, reason = shell
         if offered:
+            # What one line is, said where the line it is one run of may not
+            # be printed: above this paragraph for a lab whose address
+            # reaches the lab program, and nowhere in the file for a lab
+            # whose address reaches remote mode -- where the prompt is still
+            # the lab program, reached in a child of the prompt's own.
+            runs = (
+                "the command above -- one command, through the same weakness, its "
+                "output printed"
+                if lab_address else
+                "the lab program's one-command form -- one address and one command, "
+                "through the same weakness, its output printed"
+            )
             prompt = (
                 "\n"
                 + f"    python3 {POC_NAME} 127.0.0.1:32768 --shell --allow-shell\n"
                 + "\n"
                 + _filled(
                     "A prompt, and not a session. Every line you type is one more "
-                    "run of the command above -- one command, through the same "
-                    "weakness, its output printed -- so there is no persistent "
+                    f"run of {runs} -- so there is no persistent "
                     "environment, no interactive programs, no job control and no "
                     "signals, and `cd` is tracked by the prompt rather than on the "
                     "target. It asks for --allow-shell because it runs whatever you "
@@ -3621,6 +3839,21 @@ def _lab_mode_note(
                     "other mode here asks; without the flag nothing is sent. The "
                     "prompt says all of this again before the first line, together "
                     "with the sentences below."
+                )
+                + (
+                    ""
+                    if lab_address else
+                    "\n\n"
+                    + _filled(
+                        "An address on its own reaches remote mode in this file, "
+                        "which the section below is about, and a line typed at this "
+                        "prompt does not: it reaches the lab program -- the same "
+                        "program lab mode runs, at the address you gave the prompt. "
+                        "Nothing new is reachable either way and there is no further "
+                        "flag; the prompt tells its own child which of the two "
+                        "programs it means, in the environment, where the lab "
+                        "program already takes its instructions from."
+                    )
                 )
                 + "\n\n"
                 + _quotable(_shell_where_you_are(plan))
@@ -3634,6 +3867,19 @@ def _lab_mode_note(
                 )
                 + "\n"
             )
+    if not lab_address:
+        # The explanation is owed on the declaration, and the declaration is
+        # not the address: a lab that declares command execution and has no
+        # address at all was refused the prompt for a fact about itself, and
+        # returning before this paragraph swallowed that reason on every one
+        # of them. Measured over the 264 archived labs before this line
+        # moved: 35 declare command execution, 3 carry the prompt, and the
+        # reason reached 0 artifacts -- the branch above it was dead on the
+        # whole archive. 32 hear it now, and a lab that declares something
+        # other than command execution still hears nothing, because a
+        # paragraph about a mode it was never a candidate for is noise.
+        return note + prompt
+    command = " id" if takes_a_command else ""
     return (
         note
         + "\n"
@@ -3833,19 +4079,37 @@ def emit_poc(
     lab, futures = _lab_half(validator)
     hoisted = f"from __future__ import {', '.join(futures)}\n" if futures else ""
     if standing == POC_SHIPPED:
-        # No epilog: the paragraph that used to go under remote mode's
-        # `--help` described `--lab-address`, and a lab with a proved remote
-        # mode is exactly the lab whose one argument is remote mode's. There
-        # is nothing left for it to point at.
-        remote = emit_field_poc(cve, record["spec"], plan, POC_NAME)
+        # No epilog, unless the prompt is in the file: the paragraph that used
+        # to go under remote mode's `--help` described `--lab-address`, and a
+        # lab with a proved remote mode is exactly the lab whose one argument
+        # is remote mode's. Where that lab also has the prompt there is
+        # something left for it to point at, and it is the one surface that
+        # cannot reach the header: `--help` on this lab is argparse's, and the
+        # prompt is handled before argparse is reached.
+        remote = emit_field_poc(
+            cve, record["spec"], plan, POC_NAME,
+            epilog="SHELL_IN_HELP" if shell[0] else '""',
+        )
     else:
         remote = _POC_NO_REMOTE_MODE.replace(
             "@@REFUSAL@@", _python_text(_refusal_text(cve, record, standing))
         )
-    if takes_address:
-        remote += "\n" + _lab_target_block(plan)
+    # The address argument's own block goes in wherever the lab program is
+    # reached at an address, which is one shape wider than `takes_address`:
+    # a lab with a proved remote mode and the prompt reaches it in the
+    # prompt's own child, and the prompt's code reads this block's `_loopback`
+    # and `_lab_target_said` whichever shape it is in. `proved` is the only
+    # thing that differs between the two, and both blocks take it.
+    proved = standing == POC_SHIPPED
+    if takes_address or shell[0]:
+        remote += "\n" + _lab_target_block(plan, proved)
     if shell[0]:
-        remote += "\n" + _shell_block(plan)
+        remote += "\n" + _shell_block(plan, proved)
+        if proved:
+            # The channel, and nothing but: one name in the environment, the
+            # parent's half, the child's half, and the one sentence this
+            # shape changes in the block above.
+            remote += "\n" + _shell_child_block()
     remote += _poc_entry(
         standing,
         takes_address,
