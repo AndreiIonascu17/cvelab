@@ -1479,7 +1479,13 @@ class TheOneAddressArgumentTests(unittest.TestCase):
             artifacts.mkdir()
             deliverables._write_generic_manual_assets(
                 "CVE-2026-0001", lab, artifacts, False, False, 8080,
-                {"shipped": False, "reason": "the effect is internal"}, True,
+                {"shipped": False, "reason": "the effect is internal"},
+                # `shell_standing`'s whole answer, which is what the writer
+                # takes: granted, so the one-command form is there to print.
+                # The declaration beside it is the shape that can exist --
+                # the standing grants the prompt only where the contract
+                # declared command execution.
+                (True, ""), True,
             )
             runner = (artifacts / "manual.sh").read_text()
             guide = (artifacts / field.LAB_POC_GUIDE_NAME).read_text()

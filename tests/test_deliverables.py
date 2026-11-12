@@ -1293,5 +1293,228 @@ class TheGateReadsTheComputedVerdictTests(unittest.TestCase):
         )
 
 
+class TheDocumentSaysWhetherThereIsAPromptTests(unittest.TestCase):
+    """Whether the delivered document names the prompt, or says why not.
+
+    It did neither, for any lab shape, including the three archived labs that
+    have one: the prompt was in the artifact's header and in the artifact's
+    own output, and nowhere in the document the operator opens first. The
+    closing line counted the invocations the file takes, and counted two.
+
+    Driven through `create_deliverables`, like the two kit tests above and for
+    the same reason: the writer was always right about the arguments it was
+    handed, and what the document says about the prompt is decided by which
+    arguments reach it. The expectation is read off `field.shell_standing`
+    rather than written out, so each assertion is a comparison between the one
+    function that decides and a surface that repeats it.
+
+    Enumerated from the shapes, because that is what let this through: the
+    shape that matters most -- a proved remote mode beside a prompt -- has no
+    archived lab whose report.json records it, so nothing measured over the
+    archive's reports would have noticed the document saying nothing.
+    """
+
+    CVE = "CVE-2099-1004"
+
+    #: Each shape by what makes it one: the evidence the contract declares,
+    #: the port it publishes, whether its validator implements the one-command
+    #: form, and whether a remote mode was proved. The middle two are the
+    #: refusals that owe a reason; the last is the lab that was never a
+    #: candidate and is owed silence.
+    SHAPES = {
+        "a prompt, at this lab's own published build": (
+            "code_execution", 8080, True, False,
+        ),
+        "a prompt beside a proved remote mode": (
+            "code_execution", 8080, True, True,
+        ),
+        "declared the form, publishes no port": (
+            "code_execution", None, True, False,
+        ),
+        "declared the form, validator reads no command": (
+            "code_execution", 8080, False, False,
+        ),
+        "declared something else entirely": (
+            "unauthorized_read", 8080, True, False,
+        ),
+    }
+
+    HEADING = "## Is there a prompt?"
+
+    @staticmethod
+    def flat(text: str) -> str:
+        """The text with its line wrapping collapsed, as the class above."""
+        return " ".join(text.split())
+
+    def deliver(
+        self, evidence: str, port: int | None, implements: bool, proved: bool
+    ) -> tuple[str, str, dict, str]:
+        """One lab of that shape, delivered: its document and its artifact."""
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        lab = Path(temporary.name) / self.CVE
+        (lab / "validator").mkdir(parents=True)
+        contract = {
+            "attack_summary": "Send the local canary request.",
+            "preconditions": ["Docker"],
+            "observable_effect": "Protected canary is returned.",
+            "evidence_type": evidence,
+        }
+        if port is not None:
+            contract["service_port"] = port
+        plan = {
+            "cve": self.CVE,
+            "cwe": "CWE-22",
+            "lab_type": "SOURCE_REPRODUCTION",
+            "repository": "https://example.invalid/vendor/project.git",
+            "revisions": {"vulnerable": "a" * 40, "patched": "b" * 40},
+            "exploit_contract": contract,
+            "fidelity": {
+                "execution_level": "source_component",
+                "vendor_product_started": False,
+                "exercised_vendor_components": ["vendor parser"],
+                "simulated_components": ["the adapter route"],
+                "rationale": "The parser is real.",
+            },
+            "safety": {"target_scope": "internal_docker_network_only"},
+        }
+        (lab / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+        (lab / "dossier.json").write_text(
+            json.dumps({"source": "unit-test", "descriptions": ["Test CVE"]}),
+            encoding="utf-8",
+        )
+        # A real validator either way: `shell_standing` reads the file, so a
+        # stand-in that merely claimed to implement the form would make this a
+        # test of its own fixture.
+        validator = (
+            (Path(__file__).parent / "fixtures" / "operator_validator.py")
+            .read_text(encoding="utf-8")
+            if implements
+            else "# CVELAB_MANUAL_ACTION CVELAB_TARGET exploit verify\n"
+        )
+        (lab / "validator" / "validator.py").write_text(validator, encoding="utf-8")
+        report = {
+            "validated_at": "2099-01-01T00:00:00Z",
+            "validation": {
+                "attack_executed": True,
+                "proof_quality": "security_effect_observed",
+                "observable_effect": "Protected canary is returned.",
+                "evidence_type": evidence,
+                "vulnerable": {"confirmed": True, "raw_observations": {"status": 200}},
+                "patched": {"confirmed": False, "blocked": True},
+                "differential_confirmed": True,
+            },
+            "proof_contract": contract,
+            "proof_checks": {"vulnerable_confirmed": True},
+            "real_poc_verified": True,
+            "product_e2e_verified": False,
+        }
+        if proved:
+            report["manual_poc_field"] = {
+                "cve": self.CVE, "shipped": True, "container_port": port or 8080,
+                "spec": _PROVED_SPEC,
+            }
+        delivered = create_deliverables(self.CVE, lab, {"ok": True, "report": report})
+        self.assertTrue(delivered["ok"], delivered)
+        artifacts = lab / "artifacts"
+        return (
+            (artifacts / LAB_POC_GUIDE_NAME).read_text(encoding="utf-8"),
+            (artifacts / POC_NAME).read_text(encoding="utf-8"),
+            plan,
+            validator,
+        )
+
+    def section(self, guide: str) -> str:
+        """The prompt's own section, or "" where the document says nothing."""
+        if self.HEADING not in guide:
+            return ""
+        return guide.split(self.HEADING)[1].split("\n## ")[0]
+
+    def test_each_shape_is_told_what_the_standing_told_the_artifact(self) -> None:
+        """The document and the header give one answer, or neither does.
+
+        Three outcomes, and the third is as much the contract as the other
+        two: a lab whose declared evidence was never command execution hears
+        nothing at all, because a section about a prompt it was never a
+        candidate for is noise in a document read next to a client. That is
+        229 of the 264 archived labs, and it is the same judgement the
+        artifact's own header makes from the same two answers.
+        """
+        for name, shape in self.SHAPES.items():
+            with self.subTest(shape=name):
+                guide, poc, plan, validator = self.deliver(*shape)
+                offered, reason = shell_standing(plan, validator)
+                header = poc.split('"""')[1]
+                if offered:
+                    self.assertIn(self.HEADING, guide)
+                    self.assertIn(
+                        f'{POC_NAME} "$(bash manual.sh address vulnerable)" '
+                        "--shell --allow-shell",
+                        guide,
+                    )
+                    self.assertIn(
+                        "A prompt, and not a session.", self.flat(self.section(guide))
+                    )
+                    # And the header names it too, which is what makes the
+                    # document a second surface and not a second answer.
+                    self.assertIn("--shell --allow-shell", header)
+                elif field._executes(plan):
+                    self.assertIn(self.HEADING, guide)
+                    # The reason, as the one function gave it, in both.
+                    self.assertIn(self.flat(reason), self.flat(self.section(guide)))
+                    self.assertIn(self.flat(reason), self.flat(header))
+                    self.assertNotIn("--allow-shell", guide)
+                else:
+                    self.assertNotIn(self.HEADING, guide)
+                    self.assertNotIn("--allow-shell", guide)
+                    # Nor the reason: it is true of this lab, and it answers a
+                    # question nobody holding this lab would ask.
+                    self.assertNotIn(self.flat(reason), self.flat(guide))
+
+    def test_the_closing_line_names_every_invocation_the_file_takes(self) -> None:
+        """The line a reader quotes, which counted two where there are three.
+
+        `_CLOSING` is keyed by both predicates, so the count is pinned for all
+        four shapes rather than for the one that ships most. The prompt is
+        named as an invocation and not as a third mode -- it is the lab
+        program once per line -- so the sentences elsewhere in this document
+        that say the file holds two modes are still true beside it.
+        """
+        self.assertEqual(len(set(deliverables._CLOSING.values())), 4)
+        for name, shape in self.SHAPES.items():
+            with self.subTest(shape=name):
+                guide, _poc, plan, validator = self.deliver(*shape)
+                offered = shell_standing(plan, validator)[0]
+                # Flattened: one of the four shapes wraps the flag pair across
+                # a line, and the contract is the sentence rather than the
+                # column it broke at.
+                closing = self.flat(guide.rstrip().rsplit("`manual.sh` takes", 1)[1])
+
+                self.assertIn("takes no argument", closing)
+                self.assertIs("--shell --allow-shell" in closing, offered)
+                self.assertNotIn("three modes", self.flat(guide))
+
+    def test_no_prompt_section_is_wider_than_the_document_around_it(self) -> None:
+        """The same seam as the single-instance notes, measured the same way.
+
+        A substituted reason lands mid-paragraph, so the section that carries
+        one is flowed rather than hand-broken, and this is what says the flow
+        happened. Nothing unsubstituted either: a stray field would reach the
+        reader as a brace in a document they are reading out loud.
+        """
+        for name, shape in self.SHAPES.items():
+            with self.subTest(shape=name):
+                guide, _poc, _plan, _validator = self.deliver(*shape)
+                section = self.section(guide)
+                over = [
+                    line for line in section.splitlines()
+                    if len(line) > deliverables._NOTE_WIDTH
+                ]
+
+                self.assertEqual(over, [], f"{len(over[0]) if over else 0} columns")
+                self.assertNotIn("{", section)
+                self.assertNotIn("}", section)
+
+
 if __name__ == "__main__":
     unittest.main()
