@@ -1512,13 +1512,43 @@ def _validate_generated(
             # refuse the other for being written correctly. The prose in
             # _OPERATOR_CONTRACT states the behaviour; this catches the
             # script that never looks at its arguments at all.
-            if "sys.argv" not in item["content"]:
+            #
+            # With one hole closed, because sys.argv[0] is not an argument:
+            # it is the name the script was invoked as, which the usage-line
+            # check below asks for by name, so a script can carry the token
+            # for that alone and still read no address. The lab would then
+            # declare a port, the artifact would offer an address, and the
+            # program handed one would drop it. So every use being argv[0]
+            # is refused and any other use -- bare sys.argv, sys.argv[1],
+            # sys.argv[1:], len(sys.argv) -- satisfies this, which leaves
+            # the looseness above intact: of the 269 archived validators, 17
+            # mention sys.argv and only 3 spell sys.argv[1], the rest
+            # reaching the address through one of the others. This asks for
+            # nothing a correct validator does not already do -- none of the
+            # 269 is refused by it -- unlike the banned literal that
+            # rejected every validator written exactly as asked.
+            argv_uses = list(re.finditer(r"sys\.argv", item["content"]))
+            if not argv_uses:
                 raise RuntimeError(
                     "Validator reads no positional argument: it must accept an "
                     "optional <host>:<port> as sys.argv[1] and send its requests "
                     "there instead of to the Compose service name, so the same "
                     "script an operator reads is one they can run against an "
                     "instance. With no argument it must behave exactly as it does "
+                    "now, from CVELAB_MANUAL_ACTION, CVELAB_TARGET and CVELAB_BOUND."
+                )
+            if all(
+                item["content"][use.end():use.end() + 3] == "[0]"
+                for use in argv_uses
+            ):
+                raise RuntimeError(
+                    "Validator mentions sys.argv only as sys.argv[0], which is the "
+                    "name it was invoked as and not an argument: it must also read "
+                    "the optional <host>:<port> an operator passes -- as sys.argv[1], "
+                    "sys.argv[1:], len(sys.argv), however the script takes it -- and "
+                    "send its requests there instead of to the Compose service name, "
+                    "so the same script an operator reads is one they can run against "
+                    "an instance. With no argument it must behave exactly as it does "
                     "now, from CVELAB_MANUAL_ACTION, CVELAB_TARGET and CVELAB_BOUND."
                 )
             # The usage line, measured on a generated lab as
