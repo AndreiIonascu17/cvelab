@@ -380,6 +380,46 @@ class TheAddressPathTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no positional argument"):
             sourcegen._validate_generated(generated_files(without))
 
+    def test_a_script_that_only_names_itself_is_refused_for_that(self) -> None:
+        """The one way the token can be present and the address still ignored.
+
+        sys.argv[0] is the name the script was invoked as -- which the usage
+        line above is asked for by name -- so a validator can carry the
+        token for that alone and read no argument. The lab would declare a
+        port, the artifact would offer an address, and the program handed
+        one would drop it. The refusal has to name this mistake rather than
+        the other, because the text is what the next attempt is given.
+        """
+        from tests.test_sourcegen_contract import generated_files
+
+        named = fixture_source().replace(
+            "sys.exit(main(sys.argv))", "sys.exit(main([sys.argv[0]]))"
+        )
+        self.assertIn("sys.argv[0]", named)
+        with self.assertRaisesRegex(RuntimeError, r"only as sys\.argv\[0\]"):
+            sourcegen._validate_generated(generated_files(named))
+
+    def test_naming_itself_and_reading_an_argument_is_accepted(self) -> None:
+        """Both uses in one script, the shape the archive is written in.
+
+        Of 269 archived validators 17 mention sys.argv and only 3 spell
+        sys.argv[1]; the rest reach the address as sys.argv[1:],
+        main(sys.argv) or len(sys.argv), and 11 of the 17 carry a
+        sys.argv[0] use as well, for the usage line. A check that read the
+        first use and stopped, or that pinned a subscript, would refuse
+        those for being written correctly.
+        """
+        from tests.test_sourcegen_contract import generated_files
+
+        for spelling in (
+            "sys.exit(main([sys.argv[0], *sys.argv[1:]]))",
+            "sys.exit(main([sys.argv[0]] if len(sys.argv) > 9 else sys.argv))",
+        ):
+            with self.subTest(spelling=spelling):
+                sourcegen._validate_generated(generated_files(
+                    fixture_source().replace("sys.exit(main(sys.argv))", spelling)
+                ))
+
 
 class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
     """`--shell`, measured against the script the contract is satisfiable by.
