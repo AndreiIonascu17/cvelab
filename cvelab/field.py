@@ -2322,7 +2322,7 @@ def _lab_target_statement(plan: dict[str, Any] | None) -> str:
 
     So the three things the verdict cannot carry on its own are here with it:
     what the route is, in the lab's own words for it; who wrote the thing
-    that serves it, read the way `_shell_where_you_are` reads the same field;
+    that serves it, read the way `_prompt_where_you_are` reads the same field;
     and which verdicts are findings about the host and which are findings
     about the route. The last paragraph is the one that matters, because it
     is the sentence the operator would otherwise write themselves.
@@ -2379,7 +2379,7 @@ def _lab_target_statement(plan: dict[str, Any] | None) -> str:
             )
         )
     else:
-        # The same silence `_shell_where_you_are` and `deliverables._fidelity`
+        # The same silence `_prompt_where_you_are` and `deliverables._fidelity`
         # resolve the same way: an empty list can mean nothing was simulated
         # or that the lab said nothing, and only `vendor_product_started`
         # tells them apart.
@@ -2481,18 +2481,18 @@ def _lab_target_block(plan: dict[str, Any] | None, proved: bool = False) -> str:
 #: Those are different programs against different specs, and a prompt over
 #: the wrong one would have every line refused by argparse. So on a lab that
 #: has both, the prompt tells its own child which of the two it means, in the
-#: environment rather than in argv: `_POC_SHELL_CHILD` below is that channel,
+#: environment rather than in argv: `_POC_PROMPT_CHILD` below is that channel,
 #: `@@CHANNEL@@` is where this block's child picks it up, and both are
 #: emitted only for the lab whose dispatch has that choice to make.
-_POC_SHELL = '''import os, posixpath, re, shlex, subprocess, sys
+_POC_PROMPT = '''import os, posixpath, re, shlex, subprocess, sys
 
-SHELL_NOT_ALLOWED = (
+PROMPT_NOT_ALLOWED = (
 @@NOT_ALLOWED@@)
 
-SHELL_IS_NOT_ONE_COMMAND = (
+PROMPT_IS_NOT_ONE_COMMAND = (
 @@ONE_COMMAND@@)
 
-SHELL_OPENING = (
+PROMPT_OPENING = (
 @@OPENING@@)
 
 #: Cosmetic, and that is all it may ever be. The contract asks the lab
@@ -2509,23 +2509,23 @@ SHELL_OPENING = (
 #: An output line is a line of output and almost never a caption for itself;
 #: a header this misses is a header printed into the transcript, which is the
 #: direction to miss in.
-SHELL_HEADER_LINE = re.compile(r"(?i)^.{0,48}command.{0,12}output[^:\\n]{0,10}:\\s*$")
+PROMPT_HEADER_LINE = re.compile(r"(?i)^.{0,48}command.{0,12}output[^:\\n]{0,10}:\\s*$")
 
 #: A `cd` the prompt tracks is one argument and nothing else. A line that
 #: joins commands is sent as typed, where its `cd` is real and lasts exactly
 #: as long as that one command -- which is what the prompt would be claiming
 #: if it tracked it.
-SHELL_JOINED = ("&&", "||", ";", "|", "&", ">", "<", "$(", "`")
+PROMPT_JOINED = ("&&", "||", ";", "|", "&", ">", "<", "$(", "`")
 
 #: The flags these modes take, which are stripped before the address is read
 #: out of what is left. A mode added beside this one adds its own name here.
-SHELL_FLAGS = ("--shell", "--allow-shell")
+PROMPT_FLAGS = ("--prompt", "--allow-prompt")
 
-def _shell_given(argv):
-    return "--shell" in argv[1:]
+def _prompt_given(argv):
+    return "--prompt" in argv[1:]
 
 
-def _shell_allowed(argv, refusal):
+def _prompt_allowed(argv, refusal):
     """The one flag that is not implied, for any mode that asks this much.
 
     Refused rather than reported as nothing found, which is the difference
@@ -2533,12 +2533,12 @@ def _shell_allowed(argv, refusal):
     target worse than it found it. The refusal is the caller's, because what
     is being asked for is what the operator has to agree to.
     """
-    if "--allow-shell" not in argv[1:]:
+    if "--allow-prompt" not in argv[1:]:
         sys.stderr.write(refusal)
         raise SystemExit(2)
 
 
-def _shell_cd(cwd, where):
+def _prompt_cd(cwd, where):
     """The directory the next command is prefixed with. Tracked here only.
 
     No argument means the directory the weakness itself runs in: there is no
@@ -2550,7 +2550,7 @@ def _shell_cd(cwd, where):
     return posixpath.normpath(posixpath.join(cwd, where))
 
 
-def _shell_run(address, command):
+def _prompt_run(address, command):
     """One command, as one run of this same file in the form proved below.
 
     Two arguments and nothing else, which is also the form an operator types
@@ -2564,7 +2564,7 @@ def _shell_run(address, command):
     )
 
 
-def _shell_said(done, foreign=False):
+def _prompt_said(done, foreign=False):
     """What the lab program said, printed as output only when it was output.
 
     `foreign` is where the honesty statement lands for this mode. A prompt
@@ -2595,7 +2595,7 @@ def _shell_said(done, foreign=False):
         return
     printed = done.stdout
     first, newline, rest = printed.partition("\\n")
-    if newline and SHELL_HEADER_LINE.search(first):
+    if newline and PROMPT_HEADER_LINE.search(first):
         printed = rest
     sys.stdout.write(printed)
     if printed and not printed.endswith("\\n"):
@@ -2603,7 +2603,7 @@ def _shell_said(done, foreign=False):
     sys.stdout.flush()
 
 
-def _shell_repl(address):
+def _prompt_repl(address):
     """A prompt that looks like a terminal and is not one.
 
     Every line is one invocation. The limits are printed before the first
@@ -2611,10 +2611,10 @@ def _shell_repl(address):
     exactly what a terminal's shape implies and does not have.
     """
     sys.stderr.write(
-        "%s %s --shell: a prompt, not a session.\\n"
+        "%s %s --prompt: one command per line, and not a session.\\n"
         % (os.path.basename(sys.argv[0]), address)
     )
-    sys.stderr.write(SHELL_OPENING)
+    sys.stderr.write(PROMPT_OPENING)
     # The same statement the one-command form prints after its verdict, said
     # once here because this mode has no verdict to print it after -- and
     # again by every line that does not run, and on the marker in front of
@@ -2653,13 +2653,13 @@ def _shell_repl(address):
             words = shlex.split(line)
         except ValueError:
             words = line.split()
-        joined = any(item in line for item in SHELL_JOINED)
+        joined = any(item in line for item in PROMPT_JOINED)
         if words and words[0] == "cd" and len(words) <= 2 and not joined:
-            cwd = _shell_cd(cwd, words[1] if len(words) > 1 else "")
+            cwd = _prompt_cd(cwd, words[1] if len(words) > 1 else "")
             continue
         sent = ("cd %s && " % shlex.quote(cwd) + line) if cwd else line
         try:
-            _shell_said(_shell_run(address, sent), foreign)
+            _prompt_said(_prompt_run(address, sent), foreign)
         except KeyboardInterrupt:
             sys.stderr.write(
                 "\\n[stopped waiting. The command may still be running on the target:\\n"
@@ -2673,7 +2673,7 @@ def _shell_repl(address):
             )
 
 
-def _shell_mode(argv):
+def _prompt_mode(argv):
     """The prompt, and every reason there is not one.
 
     Its own flags out, and what is left is the one argument the rest of this
@@ -2682,8 +2682,8 @@ def _shell_mode(argv):
     adds is the flag that has to be asked for, and the refusal of a command
     on the command line, which belongs to the one-command form.
     """
-    _shell_allowed(argv, SHELL_NOT_ALLOWED)
-    rest = [item for item in argv[1:] if item not in SHELL_FLAGS]
+    _prompt_allowed(argv, PROMPT_NOT_ALLOWED)
+    rest = [item for item in argv[1:] if item not in PROMPT_FLAGS]
     if not rest or rest[0].startswith("-"):
         sys.stderr.write(LAB_TARGET_IS_NOT_AN_ADDRESS)
         raise SystemExit(2)
@@ -2691,9 +2691,9 @@ def _shell_mode(argv):
         sys.stderr.write(LAB_TARGET_TAKES_NO_INPUT)
         raise SystemExit(2)
     if len(rest) > 1:
-        sys.stderr.write(SHELL_IS_NOT_ONE_COMMAND)
+        sys.stderr.write(PROMPT_IS_NOT_ONE_COMMAND)
         raise SystemExit(2)
-    return _shell_repl(rest[0])
+    return _prompt_repl(rest[0])
 '''
 
 
@@ -2723,7 +2723,7 @@ def _shell_mode(argv):
 #: about remote mode's standing. For a lab that has none that is the recorded
 #: reason, `REMOTE_MODE_REFUSED`; here there is one, and what is worth saying
 #: is that it is not what just ran.
-_POC_SHELL_CHILD = '''SHELL_CHILD = "CVELAB_POC_SHELL_PARENT"
+_POC_PROMPT_CHILD = '''PROMPT_CHILD = "CVELAB_POC_PROMPT_PARENT"
 
 REMOTE_MODE_IS_NOT_THIS_RUN = (
 @@NOT_THIS_RUN@@)
@@ -2732,21 +2732,21 @@ REMOTE_MODE_IS_NOT_THIS_RUN = (
 #: `--help` is argparse's -- one address is remote mode's, so that is where
 #: it goes -- and the prompt is handled before argparse is reached, which is
 #: the need remote mode's epilog was kept for.
-SHELL_IN_HELP = (
+PROMPT_IN_HELP = (
 @@IN_HELP@@)
 
 
-def _shell_child_env():
+def _prompt_child_env():
     """The environment the prompt starts a line of its own in.
 
     Everything this process has, plus this process's pid under the one name
     the child reads. The parent's own environment is untouched, so the name
     exists in children of the prompt and nowhere else.
     """
-    return dict(os.environ, **{SHELL_CHILD: str(os.getpid())})
+    return dict(os.environ, **{PROMPT_CHILD: str(os.getpid())})
 
 
-def _shell_child():
+def _prompt_child():
     """Whether this run is a line typed at this same file's own prompt.
 
     Which is the whole of what it decides: this lab has a proved remote mode,
@@ -2760,7 +2760,7 @@ def _shell_child():
     different spec than the header says that command line runs, and the one
     thing lost by ignoring it is nothing: lab mode needs no argument at all.
     """
-    said = os.environ.get(SHELL_CHILD)
+    said = os.environ.get(PROMPT_CHILD)
     if said is None:
         return False
     if said == str(os.getppid()):
@@ -2769,26 +2769,27 @@ def _shell_child():
         "[%s is set in this environment. That name is this file's prompt naming a\\n"
         " child of its own, and its value is that prompt's pid: this run's parent is\\n"
         " not it, so this is not that child. Ignored -- the address reaches remote\\n"
-        " mode, which is what the header says it reaches. The prompt is --shell, and\\n"
-        " the lab program needs no argument at all.]\\n" % SHELL_CHILD
+        " mode, which is what the header says it reaches. The prompt is --prompt, and\\n"
+        " the lab program needs no argument at all.]\\n" % PROMPT_CHILD
     )
     sys.stderr.flush()
     return False
 '''
 
 #: The options `--help` lists are remote mode's, and on this lab shape they
-#: are not the whole file. One text for one question: `shell_standing` decides
+#: are not the whole file. One text for one question: `prompt_standing` decides
 #: whether there is a prompt and every surface repeats it, and this is the
 #: surface that would otherwise not -- the header says it, the kit says it,
 #: and `--help` here never reaches the header.
-_SHELL_IN_HELP = (
+_PROMPT_IN_HELP = (
     "This file holds two programs. The options above are remote mode's: the script "
     "CVELab drafted for this finding and proved against a single instance, which is "
     "what one address reaches. The other is the lab program -- with no argument at "
-    "all it runs this lab's own differential, and with --shell --allow-shell after "
-    "an address it opens a prompt that runs its one-command form once per line "
-    "against that address. The prompt is not remote mode and carries no claim about "
-    "any host; this file's own docstring says what each of the two is worth."
+    "all it runs this lab's own differential, and with --prompt --allow-prompt after "
+    "an address it reads commands one line at a time and runs its one-command form "
+    "once per line against that address. Nothing is held open between lines. The "
+    "prompt is not remote mode and carries no claim about any host; this file's own "
+    "docstring says what each of the two is worth."
 )
 
 
@@ -2815,27 +2816,27 @@ _REMOTE_MODE_IS_NOT_THIS_RUN = (
 #: what it is pointed at than an ordinary request, and this one asks for
 #: whatever the operator types next, for as long as they keep typing. So it
 #: is the second thing this file will not do because it was told to once.
-_SHELL_NOT_ALLOWED = (
-    "--shell opens a prompt and delivers every line you type to the address you gave "
-    "as a command, through the weakness this lab's differential proved. That is more "
-    "than any other mode here asks of what it is pointed at: an ordinary request "
-    "shows the effect once and stops. Re-run with --allow-shell once you are on a "
+_PROMPT_NOT_ALLOWED = (
+    "--prompt delivers every line you type to the address you gave, one command per "
+    "line, through the weakness this lab's differential proved. That is more than any "
+    "other mode here asks of what it is pointed at: an ordinary request shows the "
+    "effect once and stops. Re-run with --allow-prompt once you are on a "
     "host where that is acceptable and you are permitted to do it."
 )
 
 #: The same shape as `_lab_target` refusing `--input`: which of the two the
 #: person wants decides what runs, and guessing either way runs something
 #: they did not type.
-_SHELL_IS_NOT_ONE_COMMAND = (
-    "--shell and a command on the command line are different jobs. A command there "
+_PROMPT_IS_NOT_ONE_COMMAND = (
+    "--prompt and a command on the command line are different jobs. A command there "
     "is the one-command form -- one address, then one command -- which runs that one "
     "command and exits, and is what a demonstration in front of someone watching "
-    "uses. --shell asks for the commands at a prompt instead and runs each one "
+    "uses. --prompt asks for the commands a line at a time instead and runs each one "
     "through that same form. Drop whichever of the two you did not mean."
 )
 
 
-def _shell_where_you_are(plan: dict[str, Any] | None) -> str:
+def _prompt_where_you_are(plan: dict[str, Any] | None) -> str:
     """Whose route answers the commands, said before the first one is typed.
 
     Measured, which is why it is here at all, and stated as the universal it
@@ -2937,7 +2938,7 @@ def _shell_where_you_are(plan: dict[str, Any] | None) -> str:
     return "\n\n".join(said) + "\n"
 
 
-def _shell_opening(plan: dict[str, Any] | None) -> str:
+def _prompt_opening(plan: dict[str, Any] | None) -> str:
     """What the prompt says about itself before the first line is typed."""
     return (
         "\n"
@@ -2974,7 +2975,7 @@ def _shell_opening(plan: dict[str, Any] | None) -> str:
             "with no argument returns to it."
         )
         + "\n\nWHERE YOU ACTUALLY ARE\n\n"
-        + _shell_where_you_are(plan)
+        + _prompt_where_you_are(plan)
         + "\n"
         + _filled("Ctrl-D, `exit` or `quit` leaves.")
         + "\n\n"
@@ -3002,7 +3003,7 @@ def _reads_a_second_positional(validator: str) -> bool:
 
     Read conservatively, because the two costs are not symmetric: a false
     negative is a missing mode on a lab that would have supported it, and a
-    false positive is a shipped shell that cannot work. So this looks for one
+    false positive is a shipped prompt that cannot work. So this looks for one
     thing -- an indexed read of the positional at argv[2], however the
     validator spells the way it got there -- through the three spellings in
     hand, which are those two labs and the fixture written to the contract by
@@ -3014,7 +3015,7 @@ def _reads_a_second_positional(validator: str) -> bool:
 
     A slice is deliberately not an index here: `argv[2:]` is as often the
     refusal of an argument as the reading of one -- `if argv[2:]: usage()` --
-    and a shell shipped on that reading would refuse every line it sent. A
+    and a prompt shipped on that reading would refuse every line it sent. A
     validator that reads its command only through a slice loses the mode and
     keeps everything else.
     """
@@ -3108,7 +3109,7 @@ def _argv_offset(node: ast.AST, offsets: dict[str, int]) -> int | None:
     return None
 
 
-def shell_standing(
+def prompt_standing(
     plan: dict[str, Any] | None,
     validator: str,
     record: dict[str, Any] | None = None,
@@ -3130,7 +3131,7 @@ def shell_standing(
     AND a proved remote mode -- it withheld the prompt from exactly the most
     capable shape a lab has. The prompt reaches the lab program in its own
     child through the environment now, which is neither the address path nor
-    a flag: `_POC_SHELL_CHILD` is that channel, the dispatch no longer
+    a flag: `_POC_PROMPT_CHILD` is that channel, the dispatch no longer
     decides this, and the condition is gone.
 
     `record` is still taken, because the two blocks that channel needs are
@@ -3162,7 +3163,7 @@ def shell_standing(
     return True, ""
 
 
-def _shell_block(plan: dict[str, Any] | None, proved: bool = False) -> str:
+def _prompt_block(plan: dict[str, Any] | None, proved: bool = False) -> str:
     """The prompt's own code, with this lab's words about this lab in it.
 
     `proved` is whether this lab has a remote mode, which decides one thing:
@@ -3171,26 +3172,26 @@ def _shell_block(plan: dict[str, Any] | None, proved: bool = False) -> str:
     program. Where it would not, the channel is not emitted and not read.
     """
     return (
-        _POC_SHELL
-        .replace("@@NOT_ALLOWED@@", _python_text(_filled(_SHELL_NOT_ALLOWED, width=76)))
+        _POC_PROMPT
+        .replace("@@NOT_ALLOWED@@", _python_text(_filled(_PROMPT_NOT_ALLOWED, width=76)))
         .replace(
             "@@ONE_COMMAND@@",
-            _python_text(_filled(_SHELL_IS_NOT_ONE_COMMAND, width=76)),
+            _python_text(_filled(_PROMPT_IS_NOT_ONE_COMMAND, width=76)),
         )
-        .replace("@@OPENING@@", _python_text(_shell_opening(plan)))
-        .replace("@@CHANNEL@@", "\n        env=_shell_child_env()," if proved else "")
+        .replace("@@OPENING@@", _python_text(_prompt_opening(plan)))
+        .replace("@@CHANNEL@@", "\n        env=_prompt_child_env()," if proved else "")
     )
 
 
-def _shell_child_block() -> str:
+def _prompt_child_block() -> str:
     """The channel's own code, for the one lab shape that has a choice to make."""
     return (
-        _POC_SHELL_CHILD
+        _POC_PROMPT_CHILD
         .replace(
             "@@NOT_THIS_RUN@@",
             _python_text(_filled(_REMOTE_MODE_IS_NOT_THIS_RUN, width=76)),
         )
-        .replace("@@IN_HELP@@", _python_text(_filled(_SHELL_IN_HELP, width=76)))
+        .replace("@@IN_HELP@@", _python_text(_filled(_PROMPT_IN_HELP, width=76)))
     )
 
 
@@ -3199,7 +3200,7 @@ def _shell_child_block() -> str:
 #: that takes the run. A mode is one entry here and one block above it, and
 #: the dispatch below does not change.
 _POC_OWN_MODES = (
-    ("shell", "_shell_given", "_shell_mode"),
+    ("prompt", "_prompt_given", "_prompt_mode"),
 )
 
 
@@ -3234,7 +3235,7 @@ def _poc_entry(standing: str, lab_address: bool, modes: tuple[str, ...] = ()) ->
     runs the lab program's one-command form by running this file again, and
     on a lab with a proved remote mode the argument it has to use is remote
     mode's. So there the environment chooses, and only in a child the prompt
-    started: `_shell_child` is that question, and the answer is the same two
+    started: `_prompt_child` is that question, and the answer is the same two
     programs reachable the same two ways -- what it chooses is which of them
     an address reaches inside the prompt's own child, and nothing else.
     """
@@ -3244,8 +3245,8 @@ def _poc_entry(standing: str, lab_address: bool, modes: tuple[str, ...] = ()) ->
             lines.append(f"    if {given}(sys.argv):")
             lines.append(f"        raise SystemExit({enter}(sys.argv))")
     lines.append("    if len(sys.argv) > 1:")
-    if standing == POC_SHIPPED and "shell" in modes:
-        lines.append("        if _shell_child():")
+    if standing == POC_SHIPPED and "prompt" in modes:
+        lines.append("        if _prompt_child():")
         # The same fall-through the branch below takes, for the same reason:
         # the lab program reads the address and the command where the prompt
         # put them, and `_lab_target` says the one thing this file can say
@@ -3754,7 +3755,7 @@ def _lab_mode_note(
     vulnerable_only: bool,
     lab_address: bool = False,
     takes_a_command: bool = False,
-    shell: tuple[bool, str] | None = None,
+    prompt: tuple[bool, str] | None = None,
     plan: dict[str, Any] | None = None,
     declares_a_command: bool = False,
 ) -> str:
@@ -3771,11 +3772,11 @@ def _lab_mode_note(
     because the route is a constant in it and a negative result about this
     lab's route reads as a negative result about the host.
 
-    `shell` is `shell_standing`'s answer, and the prompt belongs in this
+    `prompt` is `prompt_standing`'s answer, and it belongs in this
     paragraph for the same reason: it is that same program again, run once
     per line. Wherever the lab declares command execution, this says what the
     prompt is or why there is none -- the declaration and not the address,
-    because every reason `shell_standing` gives is a fact about the lab and
+    because every reason `prompt_standing` gives is a fact about the lab and
     an operator holding that lab is owed it whether or not an address reaches
     anything. Where the lab declares something else, nothing is said: a
     paragraph about a mode it was never a candidate for is noise, which is
@@ -3809,9 +3810,9 @@ def _lab_mode_note(
     # declares command execution and does not implement it is exactly the
     # lab that needs to be told why it has no prompt, so gating the
     # explanation on the implementation deleted it where it was most owed.
-    prompt = ""
-    if shell is not None and declares_a_command:
-        offered, reason = shell
+    prompt_note = ""
+    if prompt is not None and declares_a_command:
+        offered, reason = prompt
         if offered:
             # What one line is, said where the line it is one run of may not
             # be printed: above this paragraph for a lab whose address
@@ -3825,20 +3826,20 @@ def _lab_mode_note(
                 "the lab program's one-command form -- one address and one command, "
                 "through the same weakness, its output printed"
             )
-            prompt = (
+            prompt_note = (
                 "\n"
-                + f"    python3 {POC_NAME} 127.0.0.1:32768 --shell --allow-shell\n"
+                + f"    python3 {POC_NAME} 127.0.0.1:32768 --prompt --allow-prompt\n"
                 + "\n"
                 + _filled(
-                    "A prompt, and not a session. Every line you type is one more "
-                    f"run of {runs} -- so there is no persistent "
-                    "environment, no interactive programs, no job control and no "
-                    "signals, and `cd` is tracked by the prompt rather than on the "
-                    "target. It asks for --allow-shell because it runs whatever you "
-                    "type for as long as you keep typing, which is more than any "
-                    "other mode here asks; without the flag nothing is sent. The "
-                    "prompt says all of this again before the first line, together "
-                    "with the sentences below."
+                    "One command per line, and not a session. Every line you type "
+                    f"is one more run of {runs} -- so nothing is held open between "
+                    "lines: no persistent environment, no interactive programs, no "
+                    "job control and no signals, and `cd` is tracked by the prompt "
+                    "rather than on the target. It asks for --allow-prompt because "
+                    "it runs whatever you type for as long as you keep typing, "
+                    "which is more than any other mode here asks; without the flag "
+                    "nothing is sent. The prompt says all of this again before the "
+                    "first line, together with the sentences below."
                 )
                 + (
                     ""
@@ -3856,10 +3857,10 @@ def _lab_mode_note(
                     )
                 )
                 + "\n\n"
-                + _quotable(_shell_where_you_are(plan))
+                + _quotable(_prompt_where_you_are(plan))
             )
         elif reason:
-            prompt = (
+            prompt_note = (
                 "\n"
                 + _filled(
                     "There is no prompt in this file -- no mode where line after "
@@ -3878,7 +3879,7 @@ def _lab_mode_note(
         # whole archive. 32 hear it now, and a lab that declares something
         # other than command execution still hears nothing, because a
         # paragraph about a mode it was never a candidate for is noise.
-        return note + prompt
+        return note + prompt_note
     command = " id" if takes_a_command else ""
     return (
         note
@@ -3911,7 +3912,7 @@ def _lab_mode_note(
             "the verdict is what gets pasted into a report."
         )
         + "\n"
-        + prompt
+        + prompt_note
     )
 
 
@@ -3924,7 +3925,7 @@ def _poc_header(
     lab_mode: bool = True,
     lab_address: bool = False,
     filename: str = POC_NAME,
-    shell: tuple[bool, str] | None = None,
+    prompt: tuple[bool, str] | None = None,
 ) -> str:
     """The merged docstring: both modes, and what each one is worth.
 
@@ -3935,7 +3936,7 @@ def _poc_header(
     a file nobody opened. Both claims are here now, and the remote one says
     whether it was proved.
 
-    `shell` is `shell_standing`'s answer, passed in rather than worked out
+    `prompt` is `prompt_standing`'s answer, passed in rather than worked out
     here: it is read from the lab's own validator, which this function is not
     given and `emit_poc` is.
     """
@@ -3953,14 +3954,14 @@ def _poc_header(
             if lab_address else "\nTwo modes, and the argument chooses.\n\n"
         )
         + _lab_mode_note(
-            # `shell[0]` for what is promised and `_executes(plan)` for
+            # `prompt[0]` for what is promised and `_executes(plan)` for
             # what is explained. The ` id` appended to a printed command has
             # to be a command the validator answers, and only
-            # `shell_standing` reads the validator; the paragraph saying why
+            # `prompt_standing` reads the validator; the paragraph saying why
             # there is no prompt is owed on the declaration, because a lab
             # that declares the form and does not implement it is the one
             # that needs it.
-            vulnerable_only, lab_address, bool(shell and shell[0]), shell, plan,
+            vulnerable_only, lab_address, bool(prompt and prompt[0]), prompt, plan,
             declares_a_command=_executes(plan),
         )
         + "\n"
@@ -4072,9 +4073,9 @@ def emit_poc(
     # one-command form the prompt runs is asked for in prose and checked by
     # nothing, so a lab that did not write it gets no prompt and the reason
     # is printed in the header instead.
-    shell = shell_standing(plan, validator, record)
+    prompt = prompt_standing(plan, validator, record)
     header = _poc_header(
-        cve, plan, record, standing, lab_address=takes_address, shell=shell,
+        cve, plan, record, standing, lab_address=takes_address, prompt=prompt,
     )
     lab, futures = _lab_half(validator)
     hoisted = f"from __future__ import {', '.join(futures)}\n" if futures else ""
@@ -4088,7 +4089,7 @@ def emit_poc(
         # prompt is handled before argparse is reached.
         remote = emit_field_poc(
             cve, record["spec"], plan, POC_NAME,
-            epilog="SHELL_IN_HELP" if shell[0] else '""',
+            epilog="PROMPT_IN_HELP" if prompt[0] else '""',
         )
     else:
         remote = _POC_NO_REMOTE_MODE.replace(
@@ -4101,19 +4102,19 @@ def emit_poc(
     # and `_lab_target_said` whichever shape it is in. `proved` is the only
     # thing that differs between the two, and both blocks take it.
     proved = standing == POC_SHIPPED
-    if takes_address or shell[0]:
+    if takes_address or prompt[0]:
         remote += "\n" + _lab_target_block(plan, proved)
-    if shell[0]:
-        remote += "\n" + _shell_block(plan, proved)
+    if prompt[0]:
+        remote += "\n" + _prompt_block(plan, proved)
         if proved:
             # The channel, and nothing but: one name in the environment, the
             # parent's half, the child's half, and the one sentence this
             # shape changes in the block above.
-            remote += "\n" + _shell_child_block()
+            remote += "\n" + _prompt_child_block()
     remote += _poc_entry(
         standing,
         takes_address,
-        tuple(name for name, given in (("shell", shell[0]),) if given),
+        tuple(name for name, given in (("prompt", prompt[0]),) if given),
     )
     upper = "#!/usr/bin/env python3\n" + header + hoisted + "\n" + remote + "\n"
     # Only the half CVELab wrote. The lower half is this lab's own validator

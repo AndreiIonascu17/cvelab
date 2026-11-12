@@ -49,7 +49,7 @@ from .field import (
     emit_poc,
     poc_record,
     poc_standing,
-    shell_standing,
+    prompt_standing,
     takes_lab_address,
 )
 
@@ -415,24 +415,25 @@ into a report."""
 #: address can be given and stopped, so an operator who did not open the
 #: artifact's own header did not learn that a third one exists.
 #:
-#: `field.shell_standing` decides, here as in that header, and the wording is
+#: `field.prompt_standing` decides, here as in that header, and the wording is
 #: the artifact's own -- `field._lab_mode_note` writes the same paragraph into
-#: the header and `field._POC_SHELL` prints it again before the first line is
+#: the header and `field._POC_PROMPT` prints it again before the first line is
 #: typed. Three surfaces, one answer; this was the surface giving none.
 #:
 #: Named as an invocation and never as a third mode. The prompt is the lab
 #: program again, once per line -- `field._lab_mode_note`'s docstring is the
 #: account -- so the sentences in this document that say the file holds two
 #: modes stay true and stay as they are.
-_PROMPT_IS_NOT_A_SESSION = f"""A prompt, and not a session. Every line you type is one more run of the lab
-program's one-command form -- one address and one command, through the weakness
-this lab's differential proved, its output printed -- so there is no persistent
-environment, no interactive programs, no job control and no signals, and `cd`
-is tracked by the prompt rather than on the target. It asks for `--allow-shell`
-because it runs whatever you type for as long as you keep typing, which is more
-than any other mode here asks; without the flag nothing is sent. `{POC_NAME}` says
-all of this again at the prompt, before the first line, together with whose
-route answers the commands."""
+_PROMPT_IS_NOT_A_SESSION = f"""One command per line, and not a session. Every line you type is one more run
+of the lab program's one-command form -- one address and one command, through
+the weakness this lab's differential proved, its output printed -- so nothing
+is held open between lines: no persistent environment, no interactive
+programs, no job control and no signals, and `cd` is tracked by the prompt
+rather than on the target. It asks for `--allow-prompt` because it runs
+whatever you type for as long as you keep typing, which is more than any other
+mode here asks; without the flag nothing is sent. `{POC_NAME}` says all of this
+again at the prompt, before the first line, together with whose route answers
+the commands."""
 
 #: Where the lines go, which the lab's own standing decides and not the
 #: address: `field.takes_lab_address` is the predicate, the same one the
@@ -459,7 +460,7 @@ environment, where the lab program already takes its instructions from -- so
 nothing new is reachable either way and there is no further flag.""",
 }
 
-#: Said where the lab declared command execution and `field.shell_standing`
+#: Said where the lab declared command execution and `field.prompt_standing`
 #: refused it the prompt anyway, which is a fact about the lab every time: 32
 #: of the 264 archived labs, each one a real candidate turned down for
 #: something about itself. The artifact prints this same sentence in its own
@@ -481,7 +482,7 @@ _NO_PROMPT_NOTE = (
 #: The last line of the document, which is the one a reader quotes. It names
 #: what the file takes, so it is keyed on both answers that decide that: where
 #: the address goes (`field.takes_lab_address`) and whether there is a prompt
-#: to give one to (`field.shell_standing`).
+#: to give one to (`field.prompt_standing`).
 #:
 #: It named the mode the address reaches, and for a lab whose address reaches
 #: the lab program that was the wrong mode: "one address for remote mode" sent
@@ -500,12 +501,12 @@ for lab mode and one address, which runs that same lab program against a host
 instead of the Compose network. Where you point it is yours to answer for --
 only a host your engagement authorizes.""",
     (False, True): f"""`{POC_NAME}` takes no argument for
-lab mode, one address for remote mode, and that address with `--shell
---allow-shell` for a prompt that runs the lab program once per line. Where you
+lab mode, one address for remote mode, and that address with `--prompt
+--allow-prompt` for a prompt that runs the lab program once per line. Where you
 point either is yours to answer for -- only a host your engagement authorizes.""",
     (True, True): f"""`{POC_NAME}` takes no argument
 for lab mode, one address, which runs that same lab program against a host
-instead of the Compose network, and that address with `--shell --allow-shell`
+instead of the Compose network, and that address with `--prompt --allow-prompt`
 for a prompt that runs it once per line. Where you point it is yours to answer
 for -- only a host your engagement authorizes.""",
 }
@@ -913,7 +914,7 @@ def _write_generic_manual_assets(
     seeds: bool = False,
     port: int | None = None,
     record: dict | None = None,
-    shell: tuple[bool, str] | None = None,
+    prompt: tuple[bool, str] | None = None,
     declares_a_command: bool = False,
 ) -> None:
     """Write the kit the lab is handed over with: runner, wrapper and guide.
@@ -938,7 +939,7 @@ def _write_generic_manual_assets(
     The record decides what the kit says about the address: whether remote
     mode is there to be pointed at it, and with which arguments.
 
-    `shell` is `field.shell_standing`'s whole answer -- whether this lab has
+    `prompt` is `field.prompt_standing`'s whole answer -- whether this lab has
     the prompt, and the reason where it has none -- and it decides two things
     that are one fact. The first is the other command printed beside the
     address: the lab program's one-command form, which runs against this
@@ -955,7 +956,7 @@ def _write_generic_manual_assets(
     It is what the artifact IMPLEMENTS and not what the plan declares, and
     the difference is the correction here. This was `_executes(plan)`, the
     declared evidence shape, while the artifact offers the form on
-    `shell_standing` -- a declared port AND a validator that reads the
+    `prompt_standing` -- a declared port AND a validator that reads the
     command. Measured across 262 archived labs: 34 declare command
     execution, 2 implement it, and all 32 of the rest declare no service
     port at all -- so the kit printed a flag for a file that does not have
@@ -973,11 +974,11 @@ def _write_generic_manual_assets(
     """
     record = record if isinstance(record, dict) else {}
     proved = poc_standing(record) == POC_SHIPPED
-    # One bit from `shell`, under the name the sentences below need it by: the
+    # One bit from `prompt`, under the name the sentences below need it by: the
     # form the lab program takes after an address. The prompt is that form once
     # per line, so reading the same bit twice under two names is how the kit
     # and the document would come to disagree about one file.
-    takes_a_command = bool(shell and shell[0])
+    takes_a_command = bool(prompt and prompt[0])
     # Whether this lab's one address argument reaches the lab program, which
     # is what decides that the commands printed below are real: on a lab with
     # a proved remote mode the same address goes there instead, and a printed
@@ -1191,7 +1192,7 @@ test it."""
     )
     # The prompt, where this lab has one, and the reason where it was a
     # candidate and was refused. The same split the artifact's own header
-    # makes, from the same two answers: `shell` is what `shell_standing` said
+    # makes, from the same two answers: `prompt` is what `prompt_standing` said
     # and `declares_a_command` is what the contract declared. A lab that
     # declared some other evidence hears nothing, because a section about a
     # prompt it was never a candidate for is noise in a document read standing
@@ -1202,8 +1203,8 @@ test it."""
     # publish no port at all, so the section about the address they publish is
     # the section saying they publish none.
     prompt_section = ""
-    if shell is not None and declares_a_command:
-        offered, reason = shell
+    if prompt is not None and declares_a_command:
+        offered, reason = prompt
         if offered:
             prompt_section = f'''## Is there a prompt?
 
@@ -1211,7 +1212,7 @@ Yes.
 
 ```bash
 bash manual.sh setup vulnerable
-python3 {POC_NAME} "$(bash manual.sh address vulnerable)" --shell --allow-shell
+python3 {POC_NAME} "$(bash manual.sh address vulnerable)" --prompt --allow-prompt
 ```
 
 {_PROMPT_IS_NOT_A_SESSION}
@@ -1452,7 +1453,7 @@ def create_deliverables(
     # the two cannot disagree. The declared port is read from the contract in
     # plan.json and not inferred; a lab that declares none is an archived one,
     # and gets the kit it always had.
-    # `shell_standing` and not `_executes`: the question the kit is asking
+    # `prompt_standing` and not `_executes`: the question the kit is asking
     # is whether the artifact beside it offers the command form, and only
     # the validator can answer that. Reading the declaration instead printed
     # the command for 32 of the 34 labs that declare command execution,
@@ -1471,7 +1472,7 @@ def create_deliverables(
     # and the header cannot answer it differently.
     _write_generic_manual_assets(
         cve, lab_dir, artifacts, vulnerable_only, seeds, service_port(plan), record,
-        shell_standing(plan, validator, record), _executes(plan),
+        prompt_standing(plan, validator, record), _executes(plan),
     )
     # Where the guard in `core.run_lab` is settled, because this is the line
     # above that makes it answerable.

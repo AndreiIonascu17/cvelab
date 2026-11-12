@@ -1259,7 +1259,7 @@ class TheOneAddressArgumentTests(unittest.TestCase):
             with self.subTest(stale=stale):
                 done = self.ran(
                     text, "127.0.0.1:32768", "id",
-                    environment={"CVELAB_POC_SHELL_PARENT": "1"} if stale else None,
+                    environment={"CVELAB_POC_PROMPT_PARENT": "1"} if stale else None,
                 )
                 self.assertNotIn("lab program against", done.stdout)
                 # argparse's, because remote mode's `main()` took the run:
@@ -1267,7 +1267,7 @@ class TheOneAddressArgumentTests(unittest.TestCase):
                 self.assertEqual(done.returncode, 2)
                 self.assertIn("unrecognized arguments: id", done.stderr)
                 if stale:
-                    self.assertIn("CVELAB_POC_SHELL_PARENT is set", done.stderr)
+                    self.assertIn("CVELAB_POC_PROMPT_PARENT is set", done.stderr)
                     self.assertIn("Ignored", done.stderr)
 
     def test_argv_arrives_whole_and_nothing_is_rewritten(self) -> None:
@@ -1296,7 +1296,7 @@ class TheOneAddressArgumentTests(unittest.TestCase):
         # holds that refusal, and the text says how to quote one.
         for carried in ("cd /tmp && echo --lab-address=not-a-flag-here",
                         "echo --input=x printed as a word",
-                        "echo --shell --allow-shell"):
+                        "echo --prompt --allow-prompt"):
             with self.subTest(command=carried):
                 done = self.ran(text, "127.0.0.1:32768", carried)
                 self.assertEqual(done.returncode, 0, done.stderr)
@@ -1480,7 +1480,7 @@ class TheOneAddressArgumentTests(unittest.TestCase):
             deliverables._write_generic_manual_assets(
                 "CVE-2026-0001", lab, artifacts, False, False, 8080,
                 {"shipped": False, "reason": "the effect is internal"},
-                # `shell_standing`'s whole answer, which is what the writer
+                # `prompt_standing`'s whole answer, which is what the writer
                 # takes: granted, so the one-command form is there to print.
                 # The declaration beside it is the shape that can exist --
                 # the standing grants the prompt only where the contract
@@ -1499,7 +1499,7 @@ class TheOneAddressArgumentTests(unittest.TestCase):
 
 
 class ThePromptTests(unittest.TestCase):
-    """`--shell`: a prompt over the one-command form, and not a session.
+    """`--prompt`: the one-command form run once per line, and not a session.
 
     WHY IT IS A PROMPT AND NOT A CHANNEL
 
@@ -1639,7 +1639,7 @@ class ThePromptTests(unittest.TestCase):
 
     #: The standing this mode is emitted for, and the one these tests have to
     #: use: a lab with a proved remote mode spends its one address argument
-    #: there, so `shell_standing` gives it no prompt at all.
+    #: there, so `prompt_standing` gives it no prompt at all.
     REFUSED = {"shipped": False, "reason": "the effect is internal"}
     #: The address this lab could have published, used where the run is about
     #: the prompt and not about where it is pointed.
@@ -1684,7 +1684,7 @@ class ThePromptTests(unittest.TestCase):
     ) -> subprocess.CompletedProcess:
         return self.ran(
             self.artifact(**kept), self.LOCAL if where is None else where,
-            "--shell", "--allow-shell", typed=typed,
+            "--prompt", "--allow-prompt", typed=typed,
         )
 
     # --- the line it builds -----------------------------------------------
@@ -1728,17 +1728,17 @@ class ThePromptTests(unittest.TestCase):
         still reaches remote mode, which the dispatch tests hold, and there
         is no new flag to type.
         """
-        offered, reason = field.shell_standing(self.PLAN, self.LAB, self.proved())
+        offered, reason = field.prompt_standing(self.PLAN, self.LAB, self.proved())
         self.assertTrue(offered, reason)
         self.assertEqual(reason, "")
         text = self.artifact(self.proved())
-        for present in ("--shell", "--allow-shell", "CVELAB_POC_SHELL_PARENT"):
+        for present in ("--prompt", "--allow-prompt", "CVELAB_POC_PROMPT_PARENT"):
             with self.subTest(present=present):
                 self.assertIn(present, text)
         # The channel is not a flag and not something to type, so it is not
         # in the handover document an operator reads either.
-        self.assertNotIn("--shell-child", text)
-        self.assertNotIn("CVELAB_POC_SHELL_PARENT", text.split('"""')[1])
+        self.assertNotIn("--prompt-child", text)
+        self.assertNotIn("CVELAB_POC_PROMPT_PARENT", text.split('"""')[1])
         # And the lines run: one process per line, reaching the lab program
         # rather than the argparse that answers the same address.
         done = self.prompted("id\npwd\n", record=self.proved())
@@ -1750,8 +1750,8 @@ class ThePromptTests(unittest.TestCase):
         )
         # And the same lab and the same validator with the other record,
         # where the address needs no help reaching the lab program.
-        self.assertTrue(field.shell_standing(self.PLAN, self.LAB, self.REFUSED)[0])
-        self.assertNotIn("CVELAB_POC_SHELL_PARENT", self.artifact())
+        self.assertTrue(field.prompt_standing(self.PLAN, self.LAB, self.REFUSED)[0])
+        self.assertNotIn("CVELAB_POC_PROMPT_PARENT", self.artifact())
 
     def test_the_name_the_prompt_sets_is_not_a_setting_an_operator_holds(self) -> None:
         """What a value left in a shell may do to this file, which is nothing.
@@ -1769,11 +1769,11 @@ class ThePromptTests(unittest.TestCase):
         """
         done = self.ran(
             self.artifact(self.proved()), "127.0.0.1:32768", "id",
-            environment={"CVELAB_POC_SHELL_PARENT": "1"},
+            environment={"CVELAB_POC_PROMPT_PARENT": "1"},
         )
         self.assertNotIn("ran id against", done.stdout)
-        self.assertIn("CVELAB_POC_SHELL_PARENT is set", done.stderr)
-        self.assertIn("The prompt is --shell", done.stderr)
+        self.assertIn("CVELAB_POC_PROMPT_PARENT is set", done.stderr)
+        self.assertIn("The prompt is --prompt", done.stderr)
         # Remote mode took the run, as the header says it does.
         self.assertEqual(done.returncode, 2)
         self.assertIn("unrecognized arguments: id", done.stderr)
@@ -1791,10 +1791,10 @@ class ThePromptTests(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         said = " ".join(done.stdout.split())
         self.assertIn("This file holds two programs", said)
-        self.assertIn("--shell --allow-shell after an address", said)
+        self.assertIn("--prompt --allow-prompt after an address", said)
         self.assertIn("once per line against that address", said)
         # And the channel stays out of it: it is not something to type.
-        self.assertNotIn("CVELAB_POC_SHELL_PARENT", done.stdout)
+        self.assertNotIn("CVELAB_POC_PROMPT_PARENT", done.stdout)
 
     def test_the_output_is_printed_with_the_drafters_header_line_dropped(self) -> None:
         done = self.prompted("id\npwd\n")
@@ -1928,7 +1928,7 @@ class ThePromptTests(unittest.TestCase):
     def test_it_says_what_it_is_not_before_anything_is_typed(self) -> None:
         said = " ".join(self.prompted("").stderr.split())
         for sentence in (
-            "a prompt, not a session",
+            "one command per line, and not a session",
             "Each line you type is ONE command",
             "no persistent environment",
             "no interactive programs",
@@ -1991,7 +1991,7 @@ class ThePromptTests(unittest.TestCase):
         }
         for name, plan in plans.items():
             with self.subTest(plan=name):
-                said = " ".join(field._shell_where_you_are(plan).split())
+                said = " ".join(field._prompt_where_you_are(plan).split())
                 self.assertIn("does not say what answers this route", said)
                 self.assertIn("Read that as not recorded", said)
                 self.assertNotIn("the route is the product's own", said)
@@ -2002,7 +2002,7 @@ class ThePromptTests(unittest.TestCase):
             self.PLAN,
             fidelity={"simulated_components": [], "vendor_product_started": True},
         )
-        said = " ".join(field._shell_where_you_are(started).split())
+        said = " ".join(field._prompt_where_you_are(started).split())
         self.assertIn("records the vendor's own product starting", said)
         self.assertIn("so the route is the product's own", said)
 
@@ -2012,23 +2012,23 @@ class ThePromptTests(unittest.TestCase):
         for name in (field.POC_NAME, "validator.py"):
             with self.subTest(name=name):
                 done = self.ran(
-                    text, self.LOCAL, "--shell", "--allow-shell",
+                    text, self.LOCAL, "--prompt", "--allow-prompt",
                     typed="", name=name,
                 )
-                self.assertIn(f"{name} 127.0.0.1:32768 --shell", done.stderr)
+                self.assertIn(f"{name} 127.0.0.1:32768 --prompt", done.stderr)
 
     def test_the_header_and_the_help_both_offer_it(self) -> None:
         header = self.artifact().split('"""')[1]
         lab = header[header.index("LAB MODE"):header.index("REMOTE MODE")]
         self.assertIn(
-            "python3 PoC.py 127.0.0.1:32768 --shell --allow-shell\n", lab,
+            "python3 PoC.py 127.0.0.1:32768 --prompt --allow-prompt\n", lab,
         )
         # `--help` on a lab with no remote mode prints the header, which is
         # where that line lives: there is no argparse here to put an options
         # list under.
         said = " ".join(self.ran(self.artifact(), "--help").stdout.split())
-        self.assertIn("python3 PoC.py 127.0.0.1:32768 --shell --allow-shell", said)
-        self.assertIn("It asks for --allow-shell", said)
+        self.assertIn("python3 PoC.py 127.0.0.1:32768 --prompt --allow-prompt", said)
+        self.assertIn("It asks for --allow-prompt", said)
 
     # --- every refusal ----------------------------------------------------
 
@@ -2036,15 +2036,15 @@ class ThePromptTests(unittest.TestCase):
         """The precedent is --allow-disruption: every other mode in the file
         asks no more of what it is pointed at than an ordinary request.
         """
-        done = self.ran(self.artifact(), self.LOCAL, "--shell", typed="id\n")
+        done = self.ran(self.artifact(), self.LOCAL, "--prompt", typed="id\n")
         self.assertEqual(done.returncode, 2)
         self.assertEqual(done.stdout, "")
-        self.assertIn("Re-run with --allow-shell", done.stderr)
+        self.assertIn("Re-run with --allow-prompt", done.stderr)
         self.assertIn("you are permitted to do it", done.stderr)
 
     def test_it_refuses_a_command_on_the_command_line(self) -> None:
         done = self.ran(
-            self.artifact(), self.LOCAL, "--shell", "--allow-shell", "id",
+            self.artifact(), self.LOCAL, "--prompt", "--allow-prompt", "id",
             typed="",
         )
         self.assertEqual(done.returncode, 2)
@@ -2054,7 +2054,7 @@ class ThePromptTests(unittest.TestCase):
 
     def test_it_refuses_to_be_mixed_with_remote_mode(self) -> None:
         done = self.ran(
-            self.artifact(), self.LOCAL, "--shell", "--allow-shell",
+            self.artifact(), self.LOCAL, "--prompt", "--allow-prompt",
             "--input", "target_path=/theirs", typed="",
         )
         self.assertEqual(done.returncode, 2)
@@ -2063,8 +2063,8 @@ class ThePromptTests(unittest.TestCase):
         self.assertIn("this file has none", done.stderr)
 
     def test_it_cannot_be_used_without_an_address(self) -> None:
-        for argv in (["--shell", "--allow-shell"],
-                     ["--shell", "--allow-shell", "--show-bodies"]):
+        for argv in (["--prompt", "--allow-prompt"],
+                     ["--prompt", "--allow-prompt", "--show-bodies"]):
             with self.subTest(argv=argv):
                 done = self.ran(self.artifact(), *argv, typed="id\n")
                 self.assertEqual(done.returncode, 2)
@@ -2111,10 +2111,10 @@ class ThePromptTests(unittest.TestCase):
         plan = dict(self.PLAN)
         plan.pop("exploit_contract")
         text = self.artifact(plan=plan)
-        for absent in ("--shell", "--allow-shell", "no prompt in this file"):
+        for absent in ("--prompt", "--allow-prompt", "no prompt in this file"):
             with self.subTest(absent=absent):
                 self.assertNotIn(absent, text)
-        done = self.ran(text, "--shell", "--allow-shell", typed="id\n")
+        done = self.ran(text, "--prompt", "--allow-prompt", typed="id\n")
         self.assertEqual(done.returncode, 2)
         self.assertEqual(done.stdout, "")
         # This lab publishes no port and has no proved remote mode, so an
@@ -2144,7 +2144,7 @@ class ThePromptTests(unittest.TestCase):
             },
         )
         text = self.artifact(plan=plan)
-        for absent in ("--shell", "--allow-shell"):
+        for absent in ("--prompt", "--allow-prompt"):
             with self.subTest(absent=absent):
                 self.assertNotIn(absent, text)
         header = text.split('"""')[1]
@@ -2154,7 +2154,7 @@ class ThePromptTests(unittest.TestCase):
         self.assertIn("There is no prompt in this file", lab)
         self.assertIn("declares no service port", lab)
         # The same answer the function gives, in the words it gives it in.
-        self.assertIn(field.shell_standing(plan, self.LAB)[1], lab)
+        self.assertIn(field.prompt_standing(plan, self.LAB)[1], lab)
 
     def test_a_lab_with_no_command_evidence_carries_no_trace_of_it(self) -> None:
         plan = dict(
@@ -2162,15 +2162,15 @@ class ThePromptTests(unittest.TestCase):
             exploit_contract=dict(self.CONTRACT, evidence_type="unauthorized_read"),
         )
         text = self.artifact(plan=plan)
-        for absent in ("--shell", "--allow-shell", "no prompt in this file"):
+        for absent in ("--prompt", "--allow-prompt", "no prompt in this file"):
             with self.subTest(absent=absent):
                 self.assertNotIn(absent, text)
         self.assertEqual(
-            field.shell_standing(plan, self.LAB)[0], False
+            field.prompt_standing(plan, self.LAB)[0], False
         )
         self.assertIn(
             "declared evidence is unauthorized_read",
-            field.shell_standing(plan, self.LAB)[1],
+            field.prompt_standing(plan, self.LAB)[1],
         )
 
     def test_a_validator_without_the_command_form_gets_no_prompt(self) -> None:
@@ -2185,10 +2185,10 @@ class ThePromptTests(unittest.TestCase):
         a form the lab program refuses is a prompt where every line exits 2.
         """
         text = self.artifact(validator=self.NO_COMMAND)
-        for absent in ("--shell", "--allow-shell"):
+        for absent in ("--prompt", "--allow-prompt"):
             with self.subTest(absent=absent):
                 self.assertNotIn(absent, text)
-        offered, reason = field.shell_standing(self.PLAN, self.NO_COMMAND)
+        offered, reason = field.prompt_standing(self.PLAN, self.NO_COMMAND)
         self.assertFalse(offered)
         self.assertIn("takes an address and no command", reason)
         # And the reason is printed where the operator reads it, not left in
@@ -2205,7 +2205,7 @@ class ThePromptTests(unittest.TestCase):
         """Conservative, because the two costs are not symmetric.
 
         A false negative is a missing mode on a lab that would have
-        supported it; a false positive is a shipped shell that cannot work.
+        supported it; a false positive is a shipped prompt that cannot work.
         The three positives are the two archived labs that implement the form
         and the fixture written to the contract by hand.
         """
@@ -2242,7 +2242,7 @@ class ThePromptTests(unittest.TestCase):
         for record in (None, {"shipped": False, "reason": "no"}, {}):
             with self.subTest(record=record):
                 text = self.artifact({} if record is None else record)
-                self.assertIn("--shell", text)
+                self.assertIn("--prompt", text)
                 self.assertEqual(
                     text.partition(field.POC_LAB_MODE_MARKER)[2], self.LAB
                 )
@@ -2317,9 +2317,9 @@ class ThePromptTests(unittest.TestCase):
                 texts[name] = written
         for outcome in ("proved", "refused"):
             with self.subTest(outcome=outcome):
-                self.assertIn("--shell", texts[outcome])
-        self.assertIn("CVELAB_POC_SHELL_PARENT", texts["proved"])
-        self.assertNotIn("CVELAB_POC_SHELL_PARENT", texts["refused"])
+                self.assertIn("--prompt", texts[outcome])
+        self.assertIn("CVELAB_POC_PROMPT_PARENT", texts["proved"])
+        self.assertNotIn("CVELAB_POC_PROMPT_PARENT", texts["refused"])
         self.assertIn("the effect is internal", texts["refused"])
         self.assertNotIn("the effect is internal", texts["proved"])
 
