@@ -422,7 +422,7 @@ class TheAddressPathTests(unittest.TestCase):
 
 
 class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
-    """`--shell`, measured against the script the contract is satisfiable by.
+    """`--prompt`, measured against the script the contract is satisfiable by.
 
     The fixture beside these tests is the smallest validator
     `_OPERATOR_CONTRACT` admits, and it implements the one-command form the
@@ -498,16 +498,16 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
         return finished.stdout, finished.stderr, finished.returncode
 
     def test_the_prompt_is_offered_for_a_validator_that_implements_the_form(self) -> None:
-        offered, reason = field.shell_standing(
+        offered, reason = field.prompt_standing(
             self.plan(), FIXTURE.read_text(encoding="utf-8")
         )
         self.assertTrue(offered, reason)
-        self.assertIn("--shell", self.artifact())
+        self.assertIn("--prompt", self.artifact())
 
     def test_a_typed_line_arrives_at_the_product_as_one_command(self) -> None:
         with stub(seeded=False) as (address, asked):
             said, complained, code = self.ran(
-                self.artifact(), address, "--shell", "--allow-shell",
+                self.artifact(), address, "--prompt", "--allow-prompt",
                 typed="id\n", port=address.rsplit(":", 1)[1],
             )
         self.assertEqual(code, 0, complained)
@@ -541,7 +541,7 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
         """
         with stub(seeded=False) as (address, asked):
             said, complained, code = self.ran(
-                self.artifact(self.proved()), address, "--shell", "--allow-shell",
+                self.artifact(self.proved()), address, "--prompt", "--allow-prompt",
                 typed="id\n", port=address.rsplit(":", 1)[1],
             )
         self.assertEqual(code, 0, complained)
@@ -556,7 +556,7 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
     def test_each_line_is_its_own_invocation_and_its_own_session(self) -> None:
         with stub(seeded=False) as (address, asked):
             said, complained, code = self.ran(
-                self.artifact(), address, "--shell", "--allow-shell",
+                self.artifact(), address, "--prompt", "--allow-prompt",
                 typed="id\necho two\nexit\n", port=address.rsplit(":", 1)[1],
             )
         self.assertEqual(code, 0, complained)
@@ -572,7 +572,7 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
     def test_the_directory_it_tracks_rides_on_the_command_itself(self) -> None:
         with stub(seeded=False) as (address, asked):
             self.ran(
-                self.artifact(), address, "--shell", "--allow-shell",
+                self.artifact(), address, "--prompt", "--allow-prompt",
                 typed="cd /srv\nls\n", port=address.rsplit(":", 1)[1],
             )
         self.assertEqual(
@@ -583,7 +583,7 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
     def test_the_no_argument_path_is_unchanged_with_the_prompt_in_the_file(self) -> None:
         """The path every proof rests on, measured with the mode present."""
         text = self.artifact()
-        self.assertIn("_shell_given(sys.argv)", text)
+        self.assertIn("_prompt_given(sys.argv)", text)
         with tempfile.TemporaryDirectory() as temporary:
             alone = Path(temporary) / "validator.py"
             alone.write_text(FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
@@ -604,9 +604,9 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
 
     def test_a_lab_that_declares_no_port_is_offered_no_prompt(self) -> None:
         text = self.artifact(exploit_contract=None)
-        self.assertNotIn("--shell", text)
-        self.assertNotIn("--allow-shell", text)
-        _, complained, code = self.ran(text, "--shell", "--allow-shell")
+        self.assertNotIn("--prompt", text)
+        self.assertNotIn("--allow-prompt", text)
+        _, complained, code = self.ran(text, "--prompt", "--allow-prompt")
         self.assertEqual(code, 2)
         self.assertIn("no remote mode", complained)
 
@@ -779,7 +779,7 @@ class TheRunnerPublishesOnePortTests(unittest.TestCase):
         impossible. Measured: 12 archived labs are this shape.
 
         No command after the address, because the validator this kit is
-        written beside reads none. That half is `shell_standing`'s and is
+        written beside reads none. That half is `prompt_standing`'s and is
         pinned where the two artifacts are compared.
         """
         runner = written_kit(port=8080)["manual.sh"]

@@ -29,7 +29,7 @@ from cvelab.deliverables import (
     POC_NAME,
     create_deliverables,
 )
-from cvelab.field import shell_standing
+from cvelab.field import prompt_standing
 
 #: A spec that was proved, as `report.manual_poc_field` carries one. The
 #: three keys `field.poc_standing` reads are the three a half-written record
@@ -1136,7 +1136,7 @@ class TheGateReadsTheComputedVerdictTests(unittest.TestCase):
 
         The condition here was `_executes(plan)`, the evidence shape the
         plan DECLARES, while the artifact offers the command form on
-        `shell_standing` -- a declared service port and a validator that
+        `prompt_standing` -- a declared service port and a validator that
         reads the command. Measured across 262 archived labs: 34 declare
         command execution, 2 implement it, and every one of the other 32
         declares no port at all, so `manual.sh` and the guide printed a
@@ -1222,7 +1222,7 @@ class TheGateReadsTheComputedVerdictTests(unittest.TestCase):
                     validator, encoding="utf-8"
                 )
 
-                self.assertIs(shell_standing(plan, validator)[0], expected)
+                self.assertIs(prompt_standing(plan, validator)[0], expected)
                 self.assertTrue(create_deliverables(self.CVE, lab, self.result())["ok"])
 
                 runner = (lab / "artifacts" / "manual.sh").read_text(encoding="utf-8")
@@ -1304,7 +1304,7 @@ class TheDocumentSaysWhetherThereIsAPromptTests(unittest.TestCase):
     Driven through `create_deliverables`, like the two kit tests above and for
     the same reason: the writer was always right about the arguments it was
     handed, and what the document says about the prompt is decided by which
-    arguments reach it. The expectation is read off `field.shell_standing`
+    arguments reach it. The expectation is read off `field.prompt_standing`
     rather than written out, so each assertion is a comparison between the one
     function that decides and a surface that repeats it.
 
@@ -1383,7 +1383,7 @@ class TheDocumentSaysWhetherThereIsAPromptTests(unittest.TestCase):
             json.dumps({"source": "unit-test", "descriptions": ["Test CVE"]}),
             encoding="utf-8",
         )
-        # A real validator either way: `shell_standing` reads the file, so a
+        # A real validator either way: `prompt_standing` reads the file, so a
         # stand-in that merely claimed to implement the form would make this a
         # test of its own fixture.
         validator = (
@@ -1443,30 +1443,31 @@ class TheDocumentSaysWhetherThereIsAPromptTests(unittest.TestCase):
         for name, shape in self.SHAPES.items():
             with self.subTest(shape=name):
                 guide, poc, plan, validator = self.deliver(*shape)
-                offered, reason = shell_standing(plan, validator)
+                offered, reason = prompt_standing(plan, validator)
                 header = poc.split('"""')[1]
                 if offered:
                     self.assertIn(self.HEADING, guide)
                     self.assertIn(
                         f'{POC_NAME} "$(bash manual.sh address vulnerable)" '
-                        "--shell --allow-shell",
+                        "--prompt --allow-prompt",
                         guide,
                     )
                     self.assertIn(
-                        "A prompt, and not a session.", self.flat(self.section(guide))
+                        "One command per line, and not a session.",
+                        self.flat(self.section(guide)),
                     )
                     # And the header names it too, which is what makes the
                     # document a second surface and not a second answer.
-                    self.assertIn("--shell --allow-shell", header)
+                    self.assertIn("--prompt --allow-prompt", header)
                 elif field._executes(plan):
                     self.assertIn(self.HEADING, guide)
                     # The reason, as the one function gave it, in both.
                     self.assertIn(self.flat(reason), self.flat(self.section(guide)))
                     self.assertIn(self.flat(reason), self.flat(header))
-                    self.assertNotIn("--allow-shell", guide)
+                    self.assertNotIn("--allow-prompt", guide)
                 else:
                     self.assertNotIn(self.HEADING, guide)
-                    self.assertNotIn("--allow-shell", guide)
+                    self.assertNotIn("--allow-prompt", guide)
                     # Nor the reason: it is true of this lab, and it answers a
                     # question nobody holding this lab would ask.
                     self.assertNotIn(self.flat(reason), self.flat(guide))
@@ -1484,14 +1485,14 @@ class TheDocumentSaysWhetherThereIsAPromptTests(unittest.TestCase):
         for name, shape in self.SHAPES.items():
             with self.subTest(shape=name):
                 guide, _poc, plan, validator = self.deliver(*shape)
-                offered = shell_standing(plan, validator)[0]
+                offered = prompt_standing(plan, validator)[0]
                 # Flattened: one of the four shapes wraps the flag pair across
                 # a line, and the contract is the sentence rather than the
                 # column it broke at.
                 closing = self.flat(guide.rstrip().rsplit("`manual.sh` takes", 1)[1])
 
                 self.assertIn("takes no argument", closing)
-                self.assertIs("--shell --allow-shell" in closing, offered)
+                self.assertIs("--prompt --allow-prompt" in closing, offered)
                 self.assertNotIn("three modes", self.flat(guide))
 
     def test_no_prompt_section_is_wider_than_the_document_around_it(self) -> None:
