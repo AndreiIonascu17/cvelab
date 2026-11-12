@@ -3301,28 +3301,72 @@ def emit_field_poc(
     )
 
 
-#: The four answers a lab can give to "may this be pointed at a live instance",
-#: as one function so that the script and the document beside it cannot give
+#: The answers a lab can give to "may this be pointed at a live instance", as
+#: one function so that the script and the document beside it cannot give
 #: different ones. They were two files written by two modules, which is how a
 #: lab came to ship a document about a script that was never there.
+#:
+#: Three of these are "no" for three unrelated reasons, and the one that used
+#: to carry all three said the wrong thing for two of them. POC_REFUSED is the
+#: drafter's judgement about the finding -- the effect cannot be shown from one
+#: instance -- and its recorded reason is a fact about the vulnerability, which
+#: is why the document tells the reader to repeat it. POC_NOT_PROVED is CVELab
+#: drafting a script, running it, and failing: measured on the archive, 11 of
+#: 264 labs, every one of which ships a kit telling a client that our tooling
+#: failure was "the limit of what this lab can show". POC_NOT_REPRODUCED is a
+#: lab with no finding to hand over at all, where nothing was ever drafted.
 POC_SHIPPED = "shipped"
 POC_REFUSED = "refused"
+POC_NOT_PROVED = "not_proved"
+POC_NOT_REPRODUCED = "not_reproduced"
 POC_NOT_REQUESTED = "not_requested"
 POC_NO_RECORD = "no_record"
 
-#: The one reason core.run_lab writes itself rather than taking from the
-#: drafter: the step was never asked for. Quoting it as a refusal would read
-#: as a judgement the model made about the finding.
+#: Every answer `poc_standing` can give. Both writers key text off the standing
+#: -- `_refusal_text` here, and two dicts in `deliverables` -- so a standing
+#: with no entry is a KeyError at delivery time, on exactly the labs that have
+#: the new shape and no others. This is what a test enumerates instead.
+POC_STANDINGS = (
+    POC_SHIPPED,
+    POC_REFUSED,
+    POC_NOT_PROVED,
+    POC_NOT_REPRODUCED,
+    POC_NOT_REQUESTED,
+    POC_NO_RECORD,
+)
+
+#: The two reasons CVELab writes itself rather than taking from the drafter,
+#: compared by equality so the sentence has one definition instead of a literal
+#: in one module and a grep in another.
+#:
+#: `core.run_lab` writes the first when the step was never asked for, and
+#: `manual_poc_step` the second before it asks anything at all. Quoting either
+#: as a refusal would read as a judgement the model made about the finding.
 NOT_REQUESTED_REASON = "not requested"
+NOT_REPRODUCED_REASON = "the lab did not reproduce, so there was nothing to hand over"
 
 
 def poc_standing(record: dict[str, Any] | None) -> str:
-    """Which of the four states this lab's remote mode is in.
+    """Which of the states in POC_STANDINGS this lab's remote mode is in.
 
     A record claiming `shipped` without a usable spec and port is read as no
     claim at all. The spec and the port are what remote mode is made of, and
     a half-written record used to mean the script was emitted from whatever
     the next draft happened to say.
+
+    `proof_checks` is what separates our own failure from the drafter's
+    judgement, and it separates them exactly: the checks are written by
+    `prove_manual_poc` after the script has been emitted and run against the
+    builds, so a record carrying them is a record of a run of ours, and a
+    record without them never got as far as a script. Verified on all 264
+    archived labs; no record contradicts it.
+
+    It is asked last, and only of a record that has a reason and claims no
+    handover, because the question before it is whether there is a claim at
+    all. 26 archived labs carry green `proof_checks` and `shipped: true` with
+    no `spec` -- legacy records whose spec lived in a file this key never had
+    -- and they are successes, not failures. Asking about `proof_checks` first
+    would hand all 26 the note that says our script could not be made to hold.
     """
     if not isinstance(record, dict) or not record:
         return POC_NO_RECORD
@@ -3337,6 +3381,15 @@ def poc_standing(record: dict[str, Any] | None) -> str:
         return POC_NO_RECORD
     if reason == NOT_REQUESTED_REASON:
         return POC_NOT_REQUESTED
+    if reason == NOT_REPRODUCED_REASON:
+        return POC_NOT_REPRODUCED
+    # A mapping, not merely the key: a record carrying `proof_checks: null` is
+    # half-written in the same way the shipped claim above can be, and the
+    # conservative read of a broken claim about our own run is that there was
+    # no run. An empty mapping is still a run, which is the shape the proof
+    # writes when a strategy's checks are all it has.
+    if isinstance(record.get("proof_checks"), dict):
+        return POC_NOT_PROVED
     return POC_REFUSED
 
 
@@ -3398,7 +3451,44 @@ def _quotable(text: str) -> str:
 
 
 def _refusal_text(cve: str, record: dict[str, Any], standing: str) -> str:
-    """What remote mode says when there is none, in the drafter's own words."""
+    """What remote mode says when there is none, in the drafter's own words.
+
+    Except for POC_NOT_PROVED, where the words are CVELab's own and the
+    paragraph under the quote has to say so. Both texts quote the recorded
+    reason -- it is the only thing that says which part of the attempt to
+    look at -- and they differ in what the reader is told the sentence is
+    worth: a refusal is the limit of what this lab can show, and a script of
+    ours that did not hold up is not a fact about the vulnerability at all.
+    """
+    if standing == POC_NOT_PROVED:
+        return (
+            _filled(
+                f"{cve} has no remote mode in this file. CVELab drafted a "
+                "single-instance script for this finding, emitted it, ran it against "
+                "this lab's own builds, and could not make it hold up. What it "
+                "recorded is about that script:"
+            )
+            + "\n\n"
+            + _wrapped(str(record.get("reason") or ""))
+            + "\n\n"
+            + _filled(
+                "That is CVELab's own attempt failing, not a finding about the "
+                "vulnerability, and it is not a sentence to carry to anyone as the "
+                "limit of what this lab shows. The lab's own differential below "
+                "proved the effect and is untouched by it. A drafted spec is "
+                "sampled, so asking again may well produce one that holds: "
+                "`cvelab manual` on this lab with --redraft asks for another, and "
+                "--spec proves one of yours."
+            )
+            + "\n"
+        )
+    if standing == POC_NOT_REPRODUCED:
+        return _filled(
+            f"{cve} has no remote mode, and none was attempted: this lab did not "
+            "reproduce, so there was no demonstrated effect for a single-instance "
+            "script to carry. Nothing was drafted, and nothing was run against an "
+            "instance of anything. Read the lab's own report before anything here."
+        ) + "\n"
     if standing == POC_REFUSED:
         return (
             _filled(
@@ -4798,9 +4888,15 @@ def run_manual_poc(
         )
         if "spec" not in drafted:
             # Not an error in the tool: most effects cannot be shown this way,
-            # and the answer says which this is.
+            # and the answer says which this is. So `ok` is true -- the step
+            # did its job and the job's answer is "no". This read `False`, and
+            # `cli` turns that into exit 2, which made `cvelab manual` report
+            # a proved impossibility the same way it reports a crash: 62 of
+            # the 264 archived labs have this answer and every one of them was
+            # a non-zero exit. `shipped` beside it is what says there is no
+            # script, and nothing but the exit status changes here.
             progress.step(f"nothing to hand over: {drafted['reason']}")
-            return {"ok": False, "cve": cve, "lab_dir": str(lab_dir), "shipped": False,
+            return {"ok": True, "cve": cve, "lab_dir": str(lab_dir), "shipped": False,
                     **drafted}
         spec = drafted["spec"]
         container_port = container_port or drafted["container_port"]
@@ -4858,6 +4954,16 @@ def run_manual_poc(
     write_manual_poc(cve, lab_dir, plan, spec, container_port, outcome)
     if not outcome["shipped"]:
         progress.step(f"nothing handed over: {outcome.get('reason')}")
+    # The handover, so `shipped` and nothing else: every way of not shipping
+    # that reaches this line is CVELab's own or the operator's, and neither is
+    # a result. A spec existed here and was proved, so a failure is either the
+    # script failing the differential -- POC_NOT_PROVED, the thing the
+    # artifact's header now declines to blame on the vulnerability -- or an
+    # attempt that never ran: a value only the operator has, a container that
+    # is not up, a service that stopped, a sidecar that would not build. Each
+    # of those is something to go and fix, which is what exit 2 is for. The
+    # one answer that is a result rather than a failure is the drafter
+    # declining to write a spec at all, and that returns above.
     return {"ok": bool(outcome["shipped"]), "cve": cve, "lab_dir": str(lab_dir), **outcome}
 
 
@@ -5978,10 +6084,10 @@ def manual_poc_step(
         reproduced: bool,
     ) -> dict[str, Any]:
         if not reproduced:
-            return {
-                "shipped": False,
-                "reason": "the lab did not reproduce, so there was nothing to hand over",
-            }
+            # The constant, because `poc_standing` compares against it: this
+            # sentence is not a refusal about observability and must not be
+            # rendered as one. 42 of the 264 archived labs carry it.
+            return {"shipped": False, "reason": NOT_REPRODUCED_REASON}
         if not ai_is_configured(api_key, model, provider):
             return {"shipped": False, "reason": "no model configured for the spec call"}
         progress.step("asking whether the effect can be shown on one instance")

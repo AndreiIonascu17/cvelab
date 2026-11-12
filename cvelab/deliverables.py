@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import textwrap
 from pathlib import Path
 
 from . import policy
@@ -39,6 +40,8 @@ from .field import (
     LEGACY_MANUAL_POC_NAMES,
     POC_NAME,
     POC_NO_RECORD,
+    POC_NOT_PROVED,
+    POC_NOT_REPRODUCED,
     POC_NOT_REQUESTED,
     POC_REFUSED,
     POC_SHIPPED,
@@ -192,8 +195,8 @@ def _manual_poc_verdict(report: dict) -> str:
     return "separate curated runner" if verified is None else str(verified)
 
 
-#: What the lab document says about remote mode, for each of the four states
-#: a lab can be in.
+#: What the lab document says about remote mode, for each of the states in
+#: `field.POC_STANDINGS` a lab can be in.
 #:
 #: This is the half that matters more than the merge. A reader opens a file
 #: called "Manual PoC", follows it, watches it work, and learns nothing about
@@ -203,9 +206,10 @@ def _manual_poc_verdict(report: dict) -> str:
 #: record ("a stock application that calls the affected helper does not report
 #: that state"), but it lived only in report.json, and nobody reads report.json
 #: before a client meeting. So it goes in the document the reader actually
-#: opens, and in the script's own header beside it. The four states are the
-#: same four questions as before, asked of one script's two modes rather than
-#: of whether a second file is there.
+#: opens, and in the script's own header beside it. They are the same questions
+#: as before, asked of one script's two modes rather than of whether a second
+#: file is there -- with the two `field.poc_standing` learned to tell apart
+#: from a refusal, which are below.
 _SHIPPED_NOTE = f"""Yes. `{POC_NAME}` beside this document has two modes, and the argument
 chooses: with none it is the lab program documented below, and given the
 address of an instance you are permitted to test it is the single-instance
@@ -269,12 +273,70 @@ _NO_RECORD_NOTE = """This run kept no record of a single-instance script either 
 "not available" rather than "refused": a lab driven by its own curated runner
 never attempts one. {address}"""
 
+#: Both notes that quote the record end on `{route}` rather than carrying the
+#: route paragraph inside `{address}`, and that is the whole of why the slot
+#: exists.
+#:
+#: `{address}` ends on a colon for these two standings, because the colon
+#: introduces the quote. Where the lab publishes a port, the route paragraph
+#: used to be appended to `{address}` -- and it begins with a single newline, so
+#: it landed in the same paragraph as that colon. What the reader got was a
+#: colon promising the drafter's reason and delivering nine lines about the
+#: route, with the blockquote arriving after them. Measured: 7 archived labs,
+#: all refused; none of the 11 whose script was drafted and not proved declares
+#: a port yet, and a future one would.
+#:
+#: So the route goes last, after the sentence that frames the quote. It answers
+#: a different question -- where this file's one address may point, and what a
+#: negative verdict from it is worth -- and that question is owed its answer
+#: after the one in the heading rather than wedged inside it.
+#: `_ADDRESS_IS_REFUSED` needs no slot: nothing is appended there, so its colon
+#: was always adjacent to its quote, and that adjacency is the shape being
+#: restored rather than abandoned.
 _REFUSED_NOTE = """{address}
 
 {reason}
 
 That sentence is the limit of what this lab can show, and it is the one to
-repeat rather than implying the demonstration below would carry over."""
+repeat rather than implying the demonstration below would carry over.{route}"""
+
+#: The note that used to be _REFUSED_NOTE's, for the labs where it was false.
+#:
+#: Measured across the 264 archived labs: 11 of them record a script of
+#: CVELab's own that was written, emitted and run and did not hold up -- "the
+#: script did not tell the two builds apart", "the script did not finish
+#: against both builds" -- and all 11 ship a kit. Every one of them was handed
+#: the note above, which calls that our own sentence "the limit of what this
+#: lab can show" and "the one to repeat". It is not a statement about the
+#: vulnerability at all: `field._spec_complaint` feeds the same reason back to
+#: the next draft as OUR problem, with the script's output attached, precisely
+#: because "did not tell the two builds apart" says nothing about the finding.
+#:
+#: So the reason is still quoted -- it is the only thing that says which part
+#: of the attempt to look at -- and the paragraph under it says whose failure
+#: it is, that the lab's differential proof is untouched, and nothing at all
+#: about repeating it to anyone.
+_NOT_PROVED_NOTE = """{address}
+
+{reason}
+
+That is CVELab's own script failing, and not a finding about the
+vulnerability. A spec was drafted for this lab, emitted as a script and run
+against both builds, and it could not be made to hold up against them; the
+sentence above is quoted because it says which part of that attempt to look
+at. The differential proof below is this lab's own, it is what established
+the effect, and none of this weakens it. A drafted spec is sampled, so asking
+again may well produce one that holds: `cvelab manual` on this lab with
+`--redraft` asks for another, and `--spec` proves one of yours.{route}"""
+
+#: A lab with nothing to hand over, because it had nothing. No document is
+#: written for one of these -- `create_deliverables` refuses the whole kit on
+#: `real_poc_verified`, and all 42 in the archive have empty artifacts -- but
+#: the standing is read by both writers and this is the entry it needs, rather
+#: than a KeyError on the first lab whose kit is ever rendered another way.
+_NOT_REPRODUCED_NOTE = """No, and the question was never reached: this lab did not reproduce, so there
+was no demonstrated effect for a single-instance script to carry. Nothing was
+drafted and nothing was run against an instance. {address}"""
 
 #: What the three notes above say the address argument does, which the lab's
 #: own shape decides and not the address: `field.takes_lab_address` is the
@@ -296,6 +358,12 @@ everything in this document reaches this lab's own builds only.""",
     POC_REFUSED: f"""No. `{POC_NAME}` has a remote mode, and for this lab it refuses: given an
 address it prints the reason below and exits 2 without sending anything. CVELab
 drafted a single-instance script, proved it could not stand, and recorded why:""",
+    POC_NOT_PROVED: f"""Not out of this lab. `{POC_NAME}` given an address refuses with exit 2 and
+sends nothing. CVELab drafted a single-instance script for this finding,
+emitted it, ran it against both of this lab's builds, and could not make it
+hold up. What it recorded is about that script:""",
+    POC_NOT_REPRODUCED: f"""`{POC_NAME}` given an address refuses with exit 2, and nothing
+in this lab was proved against anything.""",
 }
 
 _ADDRESS_RUNS_THE_LAB_PROGRAM = {
@@ -306,8 +374,20 @@ own route.""",
     POC_NO_RECORD: f"""An address given to `{POC_NAME}` is not refused, because
 there is no remote mode for it to be refused by: it runs the lab program
 instead, over this lab's own route.""",
-    POC_REFUSED: """No, and no argument reaches one. CVELab drafted a single-instance script for
-this lab, proved it could not stand, and recorded why:""",
+    POC_REFUSED: """No. The one address this file takes does not reach a single-instance script,
+because there is none, and it is not refused either -- it runs the lab program,
+which the last paragraph here is about. CVELab drafted a single-instance script
+for this lab, proved it could not stand, and recorded why:""",
+    POC_NOT_PROVED: """Not out of this lab. The one address this file takes does not reach a
+single-instance script, because there is none, and it is not refused either --
+it runs the lab program, which the last paragraph here is about. CVELab drafted
+a single-instance script for this finding, emitted it, ran it against both of
+this lab's builds, and could not make it hold up. What it recorded is about
+that script:""",
+    POC_NOT_REPRODUCED: f"""An address given to `{POC_NAME}` is not refused, because
+there is no remote mode for it to be refused by: it runs the lab program
+instead, over this lab's own route -- a program whose own differential did not
+reproduce here.""",
 }
 
 #: Said under either of the two above wherever the address does reach the lab
@@ -325,6 +405,36 @@ says that route is not served there and says nothing about whether the host is
 affected. `{POC_NAME}` says so itself whenever the address is not on loopback --
 before the run, and again under the verdict, which is the line that gets pasted
 into a report."""
+
+
+#: The column the emitted Markdown is hard-wrapped at, measured rather than
+#: chosen: every other note shape renders at 79 or under, so that is the
+#: document's own width and a line past it is a line the generator broke.
+_NOTE_WIDTH = 79
+
+
+def _flowed(paragraph: str) -> str:
+    """One paragraph re-wrapped, for a paragraph assembled from two halves.
+
+    Where a note splices a standing's own sentence into the middle of its
+    prose, each half is hard-wrapped for the half it was written beside, and
+    the join lands wherever the two happen to meet. The `not_reproduced` note
+    was 107 columns wide at that seam without an address and 101 with one, in
+    a document read next to a client, where an overrun reads as the generator
+    having broken rather than as prose.
+
+    Re-wrapped rather than hand-broken, because hand-breaking is correct only
+    until the next edit to either half: a sentence added to the lead, or a
+    word to the standing's entry, puts the overrun back with nothing to
+    notice it. Flowing the joined text cannot overrun whatever either half
+    becomes. `break_on_hyphens` is off so the `--` this prose uses as a dash
+    is not split across lines, and `break_long_words` so a backticked
+    `PoC.py` stays one token.
+    """
+    return textwrap.fill(
+        " ".join(paragraph.split()), width=_NOTE_WIDTH,
+        break_long_words=False, break_on_hyphens=False,
+    )
 
 
 def _quoted(reason: str) -> str:
@@ -345,36 +455,68 @@ def _single_instance_note(
 
     `record` is what `field.poc_record` read: `report.manual_poc_field` for a
     run of this CVELab, falling back to the old `Manual-PoC.json` beside an
-    archived lab. `field.poc_standing` decides which of the four it is, and
+    archived lab. `field.poc_standing` decides which standing it is, and
     the same function decides what the script's own header says, so the
     document and the artifact cannot give different answers -- they were two
     files written by two modules, which is how a lab came to ship a document
     about a script that was never there.
 
     `takes_address` is `field.takes_lab_address`, and it decides one sentence
-    in each of the three notes that are not the shipped one: whether an
-    address is refused, which is what a lab publishing no port does, or runs
-    the lab program, which is what a lab publishing one does now that the
-    flag that used to be required for it is gone. Defaulted, because a caller
-    that does not know is a caller whose lab publishes nothing.
+    in each of the notes that are not the shipped one: whether an address is
+    refused, which is what a lab publishing no port does, or runs the lab
+    program, which is what a lab publishing one does now that the flag that
+    used to be required for it is gone. Defaulted, because a caller that does
+    not know is a caller whose lab publishes nothing. On the two notes that
+    quote the record it also decides where the route paragraph lands, which
+    the comment on `_REFUSED_NOTE` is about.
     """
     standing = poc_standing(record)
     if standing == POC_SHIPPED:
         return _SHIPPED_NOTE.format(proof=_SHIPPED_PROOF[vulnerable_only])
-    address = (
-        _ADDRESS_RUNS_THE_LAB_PROGRAM[standing] + _THE_ROUTE_IS_A_CONSTANT
-        if takes_address else _ADDRESS_IS_REFUSED[standing]
+    lead = (
+        _ADDRESS_RUNS_THE_LAB_PROGRAM[standing] if takes_address
+        else _ADDRESS_IS_REFUSED[standing]
     )
-    if standing == POC_REFUSED:
-        return _REFUSED_NOTE.format(
-            address=address, reason=_quoted(str(record.get("reason") or ""))
+    # The two that quote the record, which are not the same answer: one is the
+    # drafter's judgement about the finding and the other is a script of ours
+    # that did not hold up, and the paragraph under the quote is the whole
+    # difference between them.
+    #
+    # They are also the two whose lead ends on a colon, so the route paragraph
+    # goes in `{route}` at the end instead of being appended here: appended, it
+    # joined the colon's own paragraph and stood between the colon and the
+    # quote it introduces. The leading newline is this template's, because
+    # `_THE_ROUTE_IS_A_CONSTANT` opens with one of its own and a paragraph
+    # break needs both.
+    if standing in (POC_REFUSED, POC_NOT_PROVED):
+        template = _REFUSED_NOTE if standing == POC_REFUSED else _NOT_PROVED_NOTE
+        return template.format(
+            address=lead,
+            reason=_quoted(str(record.get("reason") or "")),
+            route=("\n" + _THE_ROUTE_IS_A_CONSTANT) if takes_address else "",
         )
+    # The rest splice the standing's own sentence into their own prose and end
+    # there, so the route paragraph is appended here -- and as its own
+    # paragraph, which is the break the two above just got. Appended to the
+    # lead it joined the spliced sentence's paragraph, and nine lines about
+    # the route ran on from a sentence about something else.
+    route = ("\n" + _THE_ROUTE_IS_A_CONSTANT) if takes_address else ""
+    if standing == POC_NOT_REPRODUCED:
+        # Flowed, because this is the note whose seam overran: 107 columns
+        # without an address and 101 with one. The other two splice a short
+        # enough entry to stay inside the width today, and they are left as
+        # written rather than reflowed -- reflowing them would rewrite the
+        # document for the 135 archived labs that have no record at all, for
+        # a line that is already 71 columns. `_flowed` says why the fix is a
+        # re-wrap and not a hand-break; the width test is what holds the two
+        # that were not reflowed.
+        return _flowed(_NOT_REPRODUCED_NOTE.format(address=lead)) + route
     # The one reason core.py writes itself, rather than taking from the
     # drafter: the step was never asked for, so there is nothing to quote and
     # quoting it would read as a refusal the model made.
     if standing == POC_NOT_REQUESTED:
-        return _NOT_REQUESTED_NOTE.format(address=address)
-    return _NO_RECORD_NOTE.format(address=address)
+        return _NOT_REQUESTED_NOTE.format(address=lead) + route
+    return _NO_RECORD_NOTE.format(address=lead) + route
 
 
 #: The handed-over demo, as a template filled by substitution rather than an
@@ -1643,7 +1785,7 @@ This result does not authorize or establish exploitability of any remote deploym
     }
     # There is no separate single-instance script to list any more, so the
     # claim is a key rather than a file: remote mode is inside `poc` above,
-    # and whether it was proved for this lab is one of four answers.
+    # and whether it was proved for this lab is one of `field.POC_STANDINGS`.
     result["remote_mode"] = poc_standing(record)
     result["deliverables"].update({
         name: str(path) for name, path in optional_deliverables.items() if path.is_file()

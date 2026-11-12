@@ -23,7 +23,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cvelab import core, field, upload
+from cvelab import core, deliverables, field, upload
 from cvelab.deliverables import (
     LAB_POC_GUIDE_NAME,
     POC_NAME,
@@ -570,6 +570,29 @@ class TheLabDocumentStatesItsReachTests(_DeliveredLabHarness):
     is why none of this needed a change to core.py.
     """
 
+    #: One record per standing, so the tests that have to cover every answer
+    #: enumerate the same set. Keyed by what `field.poc_standing` must call
+    #: each one, which one of those tests asserts against `POC_STANDINGS` --
+    #: a record that stops being read as its key would otherwise quietly test
+    #: a different standing twice.
+    STANDING_RECORDS = {
+        field.POC_SHIPPED: {
+            "shipped": True, "container_port": 8080, "spec": _PROVED_SPEC,
+        },
+        field.POC_REFUSED: {"shipped": False, "reason": "the effect is internal"},
+        field.POC_NOT_PROVED: {
+            "shipped": False, "reason": "the script did not finish against both builds",
+            "proof_checks": {"script_ran_on_both": False}, "runs": {},
+        },
+        field.POC_NOT_REPRODUCED: {
+            "shipped": False, "reason": field.NOT_REPRODUCED_REASON,
+        },
+        field.POC_NOT_REQUESTED: {
+            "shipped": False, "reason": field.NOT_REQUESTED_REASON,
+        },
+        field.POC_NO_RECORD: {},
+    }
+
     def guide(
         self,
         report_extra: dict,
@@ -698,6 +721,234 @@ class TheLabDocumentStatesItsReachTests(_DeliveredLabHarness):
         self.assertIn("kept no record of a single-instance script either way", self.flat(guide))
         self.assertNotIn("drafted a single-instance script", self.flat(guide))
         self.assertNotIn("has two modes", self.flat(guide))
+
+    def test_a_script_of_our_own_that_failed_is_not_the_findings_limit(self) -> None:
+        """The defect this fixes, in the document that carried it.
+
+        Measured across the 264 archived labs: 11 record a script of CVELab's
+        own that was written, emitted and run and did not hold up, and all 11
+        ship a kit. Each was handed the refusal note, which calls that
+        sentence "the limit of what this lab can show" and "the one to
+        repeat" -- a tooling failure described to a client as a fact about
+        the vulnerability. `field._spec_complaint` feeds the same sentence
+        back to the next draft as OUR problem, with the script's output
+        attached, precisely because it says nothing about the finding.
+
+        The reason is still quoted, because it is the only thing that says
+        which part of the attempt to look at. What changes is whose failure
+        the document says it is.
+        """
+        reason = "the script did not tell the two builds apart"
+        guide = self.guide({"manual_poc_field": {
+            "shipped": False, "reason": reason,
+            "proof_checks": {"script_ran_on_both": True, "manual_poc_proven": False},
+            "runs": {},
+        }})
+        flat = self.flat(guide)
+
+        self.assertIn("> " + reason, guide)
+        self.assertIn("could not make it hold up", flat)
+        self.assertIn("CVELab's own script failing, and not a finding about the "
+                      "vulnerability", flat)
+        self.assertIn("differential proof below is this lab's own", flat)
+        # The sentences that were wrong for these 11, each of which is still
+        # right for a real refusal and is asserted above for one.
+        for forbidden in (
+            "the limit of what this lab can show",
+            "it is the one to repeat",
+            "proved it could not stand",
+            "recorded why",
+        ):
+            self.assertNotIn(forbidden, flat)
+
+    def test_a_colon_that_introduces_the_quote_is_next_to_it(self) -> None:
+        """The reason follows the colon that promises it, on every shape.
+
+        Both notes that quote the record lead with a colon, and where the lab
+        publishes a port the route paragraph used to be appended to that lead
+        -- it opens with a single newline, so it joined the colon's own
+        paragraph. The reader got a colon promising the drafter's reason and
+        delivering nine lines about the route, with the blockquote after them.
+        Measured: 7 archived labs, all refused, none of them a lab whose
+        script was drafted and not proved -- none of those 11 declares a port
+        yet, and the next one would.
+
+        Both address shapes for both quoting standings, because the shape
+        that was wrong is the one that only appears when a port is declared,
+        and asserting it on the shape that was always right is how it came
+        back.
+        """
+        quoting = {
+            field.POC_REFUSED: {
+                "shipped": False, "reason": "the effect is internal to the library",
+            },
+            field.POC_NOT_PROVED: {
+                "shipped": False, "reason": "the script did not tell the two builds apart",
+                "proof_checks": {"manual_poc_proven": False}, "runs": {},
+            },
+        }
+        for standing, record in quoting.items():
+            for takes_address in (False, True):
+                with self.subTest(standing=standing, address=takes_address):
+                    note = deliverables._single_instance_note(
+                        record, False, takes_address
+                    )
+                    lines = note.splitlines()
+                    quoted = [i for i, line in enumerate(lines) if line.startswith(">")]
+                    self.assertTrue(quoted, note)
+                    # The lead ends on the colon, the quote opens two lines
+                    # later, and the only thing between them is the blank
+                    # line a Markdown blockquote needs.
+                    opening = quoted[0]
+                    self.assertEqual(lines[opening - 1], "")
+                    self.assertTrue(lines[opening - 2].endswith(":"), lines[opening - 2])
+                    self.assertIn(record["reason"], lines[opening])
+                    # And the route paragraph, where there is one, is after
+                    # the quote rather than inside the colon's paragraph.
+                    route = "That address is yours to choose"
+                    if takes_address:
+                        self.assertIn(route, note)
+                        self.assertGreater(note.index(route), note.index("\n> "))
+                        # Its own paragraph, not glued to the sentence above.
+                        self.assertIn("\n\n" + route, note)
+                    else:
+                        self.assertNotIn(route, note)
+
+    def test_no_note_is_wider_than_the_document_around_it(self) -> None:
+        """Every shape wraps at the width the rest of the file is wrapped at.
+
+        The companion to the colon: the same class of miss, in the same seam.
+        A note splices a standing's own sentence into the middle of its prose,
+        each half is hard-wrapped for the half it was written beside, and the
+        join lands wherever the two happen to meet. Measured: the
+        `not_reproduced` note ran to 107 columns with no address and 101 with
+        one, against 79 everywhere else -- in a document read next to a
+        client, where an overrun reads as the generator having broken.
+
+        Enumerated from `field.POC_STANDINGS` rather than from the shapes the
+        archive happens to hold, because that is exactly what let this
+        through: correct in the shape that ships most, ragged in a shape with
+        few archived labs or none. Both address shapes and both lab shapes,
+        for the same reason.
+
+        Blockquote lines are the one exception and are excluded. The reason
+        inside them is the drafter's own prose, prefixed line by line and
+        deliberately not re-wrapped -- `_quoted` says why -- so its width is
+        the model's and not this module's to fix.
+        """
+        for standing, record in self.STANDING_RECORDS.items():
+            for takes_address in (False, True):
+                for vulnerable_only in (False, True):
+                    with self.subTest(
+                        standing=standing, address=takes_address,
+                        vulnerable_only=vulnerable_only,
+                    ):
+                        note = deliverables._single_instance_note(
+                            record, vulnerable_only, takes_address
+                        )
+                        over = [
+                            line for line in note.splitlines()
+                            if not line.startswith(">")
+                            and len(line) > deliverables._NOTE_WIDTH
+                        ]
+                        self.assertEqual(over, [], f"{len(over[0]) if over else 0} columns")
+
+    def test_the_route_paragraph_is_never_glued_to_the_sentence_above_it(self) -> None:
+        """It is nine lines about the address, and it needs its own paragraph.
+
+        It opens with a single newline of its own, so appending it to a
+        standing's sentence put it in that sentence's paragraph. For the two
+        notes that quote the record it also landed between the colon and the
+        quote; for the other three it ran on from a sentence about something
+        else. Asserted for every standing that can carry it, so the next one
+        added cannot inherit the glue.
+        """
+        for standing, record in self.STANDING_RECORDS.items():
+            if standing == field.POC_SHIPPED:
+                continue  # No address paragraph: the argument is remote mode's.
+            with self.subTest(standing=standing):
+                note = deliverables._single_instance_note(record, False, True)
+                route = deliverables._THE_ROUTE_IS_A_CONSTANT.strip()
+                self.assertIn("\n\n" + route.splitlines()[0], note)
+                # And it is the last thing in the note, for every standing.
+                self.assertTrue(note.endswith(route), note[-200:])
+                # Nothing of it reaches a lab that publishes no port.
+                self.assertNotIn(
+                    route.splitlines()[0],
+                    deliverables._single_instance_note(record, False, False),
+                )
+
+    def test_the_address_and_the_single_instance_script_are_told_apart(self) -> None:
+        """"No" and "that address is yours to choose" are not a contradiction.
+
+        No argument reaches a single-instance script, because there is none;
+        the address does reach the lab program. Said as two different things
+        in the lead, because as consecutive sentences they read as one claim
+        reversing itself -- which is what they were when the route paragraph
+        sat directly under the lead.
+        """
+        for standing, record in (
+            (field.POC_REFUSED, {"shipped": False, "reason": "the effect is internal"}),
+            (field.POC_NOT_PROVED,
+             {"shipped": False, "reason": "the script did not finish against both builds",
+              "proof_checks": {}, "runs": {}}),
+        ):
+            with self.subTest(standing=standing):
+                note = deliverables._single_instance_note(record, False, True)
+                flat = self.flat(note)
+                self.assertIn("does not reach a single-instance script", flat)
+                self.assertIn("it is not refused either", flat)
+                self.assertIn("it runs the lab program", flat)
+                # The lead points forward at the paragraph that explains the
+                # address, so that paragraph has to be the last one. Compared
+                # against the constant rather than against its closing
+                # sentence spelled out here: the emitted text is hard-wrapped,
+                # and a reflow of it is not a change in what the note says.
+                self.assertIn("the last paragraph here is about", flat)
+                self.assertTrue(
+                    note.endswith(deliverables._THE_ROUTE_IS_A_CONSTANT.strip()),
+                    note[-200:],
+                )
+
+    def test_every_standing_has_something_for_both_writers_to_say(self) -> None:
+        """A standing with no entry is a KeyError at delivery time.
+
+        Both of the dicts below are keyed by `field.poc_standing`'s answer,
+        and they are read while a validated lab's kit is being written -- so
+        a missing entry does not fail here or on most labs. It fails on
+        exactly the labs that have the new shape, after the run that built
+        them, which is the worst place for it. Enumerated from
+        `field.POC_STANDINGS` rather than listed, so a standing added later
+        cannot be added to one dict and forgotten in the other.
+        """
+        records = self.STANDING_RECORDS
+        self.assertEqual(sorted(records), sorted(field.POC_STANDINGS))
+        notes = {}
+        for standing, record in records.items():
+            with self.subTest(standing=standing):
+                self.assertEqual(field.poc_standing(record), standing)
+                if standing != field.POC_SHIPPED:
+                    self.assertIn(standing, deliverables._ADDRESS_IS_REFUSED)
+                    self.assertIn(standing, deliverables._ADDRESS_RUNS_THE_LAB_PROGRAM)
+                # Both shapes an address can have, which is the other key the
+                # notes are chosen by.
+                for takes_address in (False, True):
+                    note = deliverables._single_instance_note(
+                        record, False, takes_address
+                    )
+                    self.assertTrue(note.strip(), standing)
+                    # Nothing left unsubstituted: a stray field would reach
+                    # the reader as a brace.
+                    self.assertNotIn("{", note)
+                    notes[(standing, takes_address)] = note
+        # And no two standings say the same thing, which is what having them
+        # as separate standings is for.
+        for takes_address in (False, True):
+            said = [
+                note for (_standing, shape), note in notes.items()
+                if shape is takes_address
+            ]
+            self.assertEqual(len(set(said)), len(field.POC_STANDINGS))
 
     def test_an_archived_labs_own_record_is_read_when_the_report_has_none(self) -> None:
         """An archived lab re-rendered by `cvelab deliverables` still reads true.

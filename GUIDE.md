@@ -1087,12 +1087,27 @@ whether this lab's route is served there, and "not affected" is a claim it
 cannot carry.
 
 `LAB-POC.md` is written for every validated lab and says which case this lab
-is, under "Can this be pointed at a live instance?": proved, refused with the
-drafter's reason quoted, never asked for, or no record either way. It is the
-same reason `report.json` keeps in `manual_poc_field.reason`, and the same four
-states the script's own header gives, decided in one place so they cannot
-disagree. That sentence is what stops a demonstration that works in the lab
-being described to a client as one that would work on their server.
+is, under "Can this be pointed at a live instance?":
+
+- **proved** -- there is a single-instance script, and the document says what it
+  was proved against;
+- **refused** -- the drafter judged the effect unobservable from one instance,
+  and its reason is quoted as the limit of what this lab can show. Most labs;
+- **drafted and not proved** -- CVELab wrote a script for this lab, ran it, and
+  could not make it hold up against the two builds. The same reason is quoted,
+  because it says which part of that attempt to look at, but it is CVELab's own
+  failure and not a fact about the vulnerability, so it is not a sentence to
+  carry to a client. The lab's differential proof is untouched;
+- **never asked for** -- `--manual-poc` was not passed;
+- **no record either way** -- a lab driven by its own curated runner.
+
+A lab that did not reproduce has a sixth answer and ships no document at all.
+It is the same reason `report.json` keeps in `manual_poc_field.reason`, and the
+same states the script's own header gives, decided in one place --
+`field.poc_standing` -- so they cannot disagree. That sentence is what stops a
+demonstration that works in the lab being described to a client as one that
+would work on their server, and what stops a failure of CVELab's own being
+described as the finding's own limit.
 
 This was two scripts until 2026-11-08, `PoC.py` and `Manual-PoC.py`, with two
 documents: the lab-only one wore the name PoC and the one that could be pointed
