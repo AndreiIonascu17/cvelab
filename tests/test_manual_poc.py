@@ -900,8 +900,8 @@ class OneArtifactTwoModesTests(unittest.TestCase):
         self.assertIn("told them apart", record["reason"])
 
 
-class TheLabAddressFlagTests(unittest.TestCase):
-    """The command form, kept because showing impact is what it is for.
+class TheOneAddressArgumentTests(unittest.TestCase):
+    """The one positional address, and which of the two programs it reaches.
 
     WHAT WAS MEASURED
 
@@ -909,14 +909,28 @@ class TheLabAddressFlagTests(unittest.TestCase):
     output -- `uid=10001(app) gid=10001(app) groups=10001(app)` on a freshly
     generated code-execution lab. It was the carried validator's own mode and
     was never proved against anything but this lab's route, which is a
-    constant in that validator: aimed at a client it would send that route,
-    find it absent and print BLOCKED, a false negative dressed as a test. A
-    bare address now means remote mode, which is proved per CVE or refuses.
+    constant in that validator: aimed at a client it sends that route, does
+    not find it, and prints BLOCKED -- a negative about the client's software
+    that is really a fact about CVELab's adapter.
 
-    The owner's reason for keeping it is that without it they cannot show a
-    client what the vulnerability does. That is a job on a lab they brought
-    up themselves, so the flag names the lab, refuses an address this lab
-    cannot have published, and says in its own help what it cannot check.
+    This class was `TheLabAddressFlagTests`, and the flag it was named for is
+    gone. It named the lab, took the address, and refused any address that
+    was not loopback. The refusal bought less than it looked: the file cannot
+    tell this lab's loopback port from any other service on the machine, so
+    it turned away the one target an operator is most likely entitled to test
+    and admitted every other one anyway. What it was protecting is still
+    real, so it is said rather than enforced -- in the file's own output,
+    before the run and again under the verdict.
+
+    WHAT IS HELD HERE
+
+    That the address reaches the lab program for a lab that publishes a port
+    and has no proved remote mode, and remote mode for a lab that has one --
+    `field.takes_lab_address`, and never how the address looks. That argv
+    arrives whole, which is what ended the class of bug the flag had twice.
+    That `--input` is still refused, because which of the two the person
+    means decides what runs. And that an address this lab cannot have
+    published runs anyway and says so, twice.
     """
 
     PLAN = {
@@ -927,8 +941,9 @@ class TheLabAddressFlagTests(unittest.TestCase):
         "exploit_contract": {"service_port": 8080, "evidence_type": "code_execution"},
     }
     #: A lab program that reports the argv it was handed, which is the whole
-    #: of what this flag does to it: the real one is the lab's validator and
-    #: reads `[addr]` or `[addr, command]` by its own generation contract.
+    #: of what the entry point above does to it: it rewrites nothing, so the
+    #: real one -- the lab's validator -- reads `[addr]` or `[addr, command]`
+    #: exactly where its own generation contract says it does.
     #:
     #: The command is read by INDEX and not by slice, which matters because
     #: `_reads_a_second_positional` is what decides whether the header and
@@ -953,17 +968,24 @@ class TheLabAddressFlagTests(unittest.TestCase):
         "    sys.exit(main())\n"
     )
 
-    def artifact(self, record: dict[str, Any] | None = None, plan: dict | None = None) -> str:
-        proved = {
+    #: The record that makes this lab's one argument the lab program's. A
+    #: proved remote mode spends it instead, so the default here is the
+    #: standing 262 of the 264 archived labs have.
+    REFUSED = {"shipped": False, "reason": "the effect is internal"}
+
+    def proved(self) -> dict[str, Any]:
+        return {
             "shipped": True, "container_port": 8080,
             "spec": field.validate_spec(_spec(
                 inputs=["target_path"],
                 probe=[{"method": "GET", "path": "{{target_path}}"}],
             )),
         }
+
+    def artifact(self, record: dict[str, Any] | None = None, plan: dict | None = None) -> str:
         return field.emit_poc(
             "CVE-2026-0001", self.PLAN if plan is None else plan, self.LAB,
-            proved if record is None else record,
+            dict(self.REFUSED) if record is None else record,
         )
 
     def ran(self, text: str, *argv: str) -> subprocess.CompletedProcess:
@@ -978,148 +1000,223 @@ class TheLabAddressFlagTests(unittest.TestCase):
         )
 
     def test_it_reaches_the_lab_program_with_the_address_and_the_command(self) -> None:
-        for text in (self.artifact(), self.artifact({"shipped": False, "reason": "no"})):
-            with self.subTest(standing=field.poc_standing(
-                {"shipped": False, "reason": "no"} if "REMOTE_MODE_REFUSED" in text else {}
-            )):
-                done = self.ran(text, "--lab-address", "127.0.0.1:32768", "id")
+        """Every standing that has no proved remote mode to spend it on.
+
+        Three of the four, which is 262 of the 264 archived labs: the
+        argument falls through to the lab program where it reads it, and the
+        exit code is that program's own.
+        """
+        for record in ({}, {"shipped": False, "reason": "no"},
+                       {"shipped": False, "reason": field.NOT_REQUESTED_REASON}):
+            with self.subTest(standing=field.poc_standing(record)):
+                done = self.ran(self.artifact(record), "127.0.0.1:32768", "id")
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assertEqual(
                     done.stdout,
                     "lab program against 127.0.0.1:32768, command=id\n",
                 )
 
-    def test_the_equals_spelling_works_too(self) -> None:
-        done = self.ran(self.artifact(), "--lab-address=127.0.0.1:32768", "id")
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("127.0.0.1:32768", done.stdout)
+    def test_a_lab_with_a_proved_remote_mode_spends_the_argument_there(self) -> None:
+        """The other half of `takes_lab_address`, and the whole dispatch.
 
-    def test_the_flag_is_read_only_ahead_of_the_command(self) -> None:
-        """A second spelling of the flag must not eat the command.
+        Which program one address reaches is the lab's standing and nothing
+        about the address: this lab publishes the same port and carries the
+        same validator as the runs above, and the argument goes to remote
+        mode because remote mode was proved. So the lab program is not
+        reachable with an address here at all, and the file carries nothing
+        that says it is.
+        """
+        text = self.artifact(self.proved())
+        self.assertFalse(field.takes_lab_address(8080, self.proved()))
+        self.assertNotIn("_lab_target", text)
+        done = self.ran(text, "127.0.0.1:32768", "id")
+        self.assertNotIn("lab program against", done.stdout)
+        # argparse's, because remote mode's `main()` took the run: one
+        # address and no second positional.
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("unrecognized arguments: id", done.stderr)
 
-        Read anywhere in argv, it did: the later spelling overwrote the
-        address and left the command list empty, which the operator contract
-        defines as "run the lab's own harmless canary command". So the
-        command vanished and the file printed the canary's observation and
-        REPRODUCED on stdout at exit 0 -- a success status for work nobody
-        asked for, from an argument the operator meant as a command, and
-        reachable from any caller that passes operator text through to this
-        entry point.
+    def test_argv_arrives_whole_and_nothing_is_rewritten(self) -> None:
+        """What ended the class of bug the flag it replaced had twice.
 
-        Both directions are checked, because a fix that refused everything
-        flag-shaped would break the other one: an argument that merely
-        CONTAINS the flag is a word in the command and has to arrive whole.
+        The flag was read by a scan over every argument, so a second
+        spelling of it anywhere overwrote the address and left the command
+        list empty -- which the operator contract defines as "run the lab's
+        own harmless canary command". The command vanished and the file
+        printed the canary's observation and REPRODUCED on stdout at exit 0:
+        a success status for work nobody asked for, from an argument the
+        operator meant as a command, reachable from any caller that passes
+        operator text through to this entry point. The prompt is that
+        caller.
+
+        There is no flag left to collide with, and the entry point rewrites
+        nothing: the address stays at argv[1] and the command at argv[2],
+        verbatim, flag-shaped or not. So the surviving half of that test is
+        the one that matters now, and it is read off the source as well as
+        measured -- a scan reintroduced anywhere above the marker is what
+        this is guarding.
         """
         text = self.artifact()
-        for twice in (["--lab-address", "127.0.0.1:32768", "--lab-address=127.0.0.1:32768"],
-                      ["--lab-address", "127.0.0.1:32768", "--lab-address", "127.0.0.1:9999"],
-                      ["--lab-address=127.0.0.1:32768", "--lab-address=127.0.0.1:9999"]):
-            with self.subTest(argv=twice):
-                done = self.ran(text, *twice)
-                self.assertEqual(done.returncode, 2, done.stderr)
-                self.assertEqual(done.stdout, "", "nothing may be sent or claimed")
+        self.assertNotIn("--lab-address", text)
+        # `--input` is the one exception and it is deliberate: the test below
+        # holds that refusal, and the text says how to quote one.
+        for carried in ("cd /tmp && echo --lab-address=not-a-flag-here",
+                        "echo --input=x printed as a word",
+                        "echo --shell --allow-shell"):
+            with self.subTest(command=carried):
+                done = self.ran(text, "127.0.0.1:32768", carried)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(
+                    done.stdout,
+                    f"lab program against 127.0.0.1:32768, command={carried}\n",
+                )
                 self.assertNotIn("REPRODUCED", done.stdout)
-                self.assertIn("given twice", done.stderr)
-        carried = "cd /tmp && echo --lab-address=not-a-flag-here"
-        done = self.ran(text, "--lab-address", "127.0.0.1:32768", carried)
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn(carried, done.stdout)
 
-    def test_an_address_this_lab_cannot_have_published_is_refused(self) -> None:
-        """The half of the question that can be answered cheaply.
+    def test_an_address_this_lab_cannot_have_published_is_said_not_refused(self) -> None:
+        """The half of the question that can be answered cheaply, printed.
 
         `manual.sh` publishes 127.0.0.1 with the port left to the kernel, so
         a host that is not loopback is certainly not this lab's. Which
         loopback port is this lab's is knowable only by asking Docker, which
-        the artifact does not do -- so that half is said rather than guessed.
+        the artifact does not do -- so neither half is enforced now, and the
+        half that can be answered is said.
+
+        Twice, and that is the assertion that carries the change: once
+        before the run, because an operator who learns it from the output
+        has already sent it, and once after, because the verdict is the line
+        that gets pasted into a report and a paragraph in the header does not
+        travel with it.
         """
         for where in ("10.0.0.5:8080", "app.example.com", "https://app.example.com",
                       "[2001:db8::1]:443", "127.0.0.1.example.com:80"):
             with self.subTest(target=where):
-                done = self.ran(self.artifact(), "--lab-address", where, "id")
-                self.assertEqual(done.returncode, 2)
-                self.assertEqual(done.stdout, "")
-                self.assertIn("not an address this lab published", done.stderr)
-                self.assertIn("manual.sh address", done.stderr)
+                done = self.ran(self.artifact(), where, "id")
+                # The lab program's own status, and its own stdout: nothing
+                # of this file's lands where the command's output goes.
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(
+                    done.stdout, f"lab program against {where}, command=id\n"
+                )
+                self.assertIn("is not an address this lab published", done.stderr)
+                self.assertIn(
+                    "WHAT WAS SENT, AND WHAT A NEGATIVE VERDICT DOES NOT MEAN",
+                    done.stderr,
+                )
+                said = " ".join(done.stderr.split())
+                self.assertIn("What you could not choose is the route", said)
+                self.assertIn("is NOT a finding about this host", said)
+                self.assertIn('"Not affected" is a claim this run cannot carry', said)
+                # And the recorded reason for having no remote mode, which is
+                # the finding an operator pointing this at someone's host
+                # most needs to read.
+                self.assertIn("the effect is internal", said)
         for where in ("127.0.0.1:32768", "127.0.0.1", "localhost:8080", "[::1]:8080"):
             with self.subTest(target=where):
-                self.assertEqual(
-                    0, self.ran(self.artifact(), "--lab-address", where).returncode
-                )
+                done = self.ran(self.artifact(), where)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                # Nothing is owed on this lab's own address, and nothing is
+                # said: a statement under every verdict would be noise in
+                # the one place the verdict means what it looks like.
+                self.assertNotIn("WHAT WAS SENT", done.stderr + done.stdout)
 
-    def test_it_cannot_be_used_without_an_address(self) -> None:
+    def test_a_dash_argument_is_not_an_address(self) -> None:
+        """The one argument is the address, so anything flag-shaped is not it.
+
+        This was `--lab-address` with no value after it, and the refusal it
+        earned is the one that survives: there is one argument, a dash is
+        not an address, and nothing is sent. `--help` is the exception and
+        is answered with the header, which is this file's handover document.
+        """
         for argv in (["--lab-address"], ["--lab-address", "--show-bodies"],
-                     ["--lab-address="]):
+                     ["--show-bodies"], ["-x"], ["--input=x"]):
             with self.subTest(argv=argv):
                 done = self.ran(self.artifact(), *argv)
                 self.assertEqual(done.returncode, 2)
-                self.assertIn("takes the address this lab was published on", done.stderr)
-                self.assertIn("not optional", done.stderr)
+                self.assertEqual(done.stdout, "")
+                self.assertIn("takes one argument and it is the address", done.stderr)
+                self.assertIn("With no argument at all", done.stderr)
+        for argv in (["-h"], ["--help"]):
+            with self.subTest(argv=argv):
+                done = self.ran(self.artifact(), *argv)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertIn("LAB MODE", done.stdout)
 
     def test_it_refuses_to_be_mixed_with_remote_mode(self) -> None:
         """Which of the two the person wants decides what is being tested."""
         done = self.ran(
-            self.artifact(), "--lab-address", "127.0.0.1:1",
-            "--input", "target_path=/theirs",
+            self.artifact(), "127.0.0.1:1", "--input", "target_path=/theirs",
         )
         self.assertEqual(done.returncode, 2)
         self.assertEqual(done.stdout, "")
-        self.assertIn("different jobs", done.stderr)
         self.assertIn("--input belongs to remote", done.stderr)
-        self.assertIn("--lab-address runs against this lab's", done.stderr)
+        self.assertIn("this file has none", done.stderr)
+        self.assertIn("The argument here is an address", done.stderr)
+        # And how to run a command that really does begin that way, because
+        # the second argument is a command and refusing one is a false
+        # refusal.
+        self.assertIn("printf %s --input=x", done.stderr)
 
-    def test_the_help_says_what_it_reaches_and_what_it_cannot_check(self) -> None:
+    def test_help_prints_the_header_and_says_what_cannot_be_checked(self) -> None:
+        """There is no options list to put a paragraph under any more.
+
+        The paragraph described `--lab-address`, and this lab has no remote
+        mode and so no argparse either -- so `--help` prints the header,
+        which is this file's handover document and carries the sentences
+        that paragraph carried.
+        """
         said = " ".join(self.ran(self.artifact(), "--help").stdout.split())
-        self.assertIn("--lab-address ADDRESS [COMMAND]", said)
-        self.assertIn("against this lab's own build on ADDRESS", said)
-        self.assertIn("shows nothing about any other host", said)
-        self.assertIn("is not something this file can check", said)
-        # And on a lab with no remote mode there is no argparse to print it,
-        # so --help prints the header, which carries the same sentences.
-        refused = self.ran(
-            self.artifact({"shipped": False, "reason": "the effect is internal"}),
-            "--help",
-        )
-        self.assertEqual(refused.returncode, 0)
-        self.assertIn(
-            "shows nothing about any other host", " ".join(refused.stdout.split())
-        )
-        self.assertIn("--lab-address", refused.stdout)
+        self.assertIn("python3 PoC.py 127.0.0.1:32768 id", said)
+        self.assertIn("The same lab program, against whatever is already running", said)
+        self.assertIn("The address is yours to choose and nothing here checks it", said)
+        self.assertIn("What you cannot choose is the route", said)
+        self.assertIn("says nothing about whether the host is affected", said)
+        self.assertNotIn("--lab-address", said)
 
     def test_the_header_says_it_in_the_same_breath_as_lab_mode(self) -> None:
         header = self.artifact().split('"""')[1]
         lab = header[header.index("LAB MODE"):header.index("REMOTE MODE")]
         flat = " ".join(lab.split())
-        self.assertIn("--lab-address 127.0.0.1:32768 id", flat)
-        self.assertIn("reaches a build CVELab made", flat)
-        self.assertIn("shows nothing about any other host", flat)
-        self.assertIn("has to be on loopback", flat)
-        self.assertIn("not something this file can check", flat)
+        self.assertIn("LAB MODE -- no argument, or one address", flat)
+        self.assertIn("python3 PoC.py 127.0.0.1:32768 id", flat)
+        self.assertIn("the one target whose result means what it looks like it means", flat)
+        self.assertIn("What you cannot choose is the route", flat)
+        self.assertIn("says nothing about whether the host is affected", flat)
+        # The gate's replacement, promised where the reader meets the command.
+        self.assertIn(
+            "this file says so in its own output, before the run and again after "
+            "the verdict",
+            flat,
+        )
 
-    def test_a_lab_that_declares_no_port_has_no_such_flag(self) -> None:
-        """Its validator reads no argument, so the flag would run the
+    def test_a_lab_that_declares_no_port_takes_no_address_for_the_lab_program(self) -> None:
+        """Its validator reads no argument, so an address there would run the
         differential and call it a demonstration. 89 archived labs are that
-        lab.
+        lab, and for them the address still reaches remote mode or its
+        refusal and nothing else.
         """
         plan = dict(self.PLAN)
         plan.pop("exploit_contract")
+        self.assertFalse(field.takes_lab_address(None, dict(self.REFUSED)))
         text = self.artifact(plan=plan)
-        self.assertNotIn("--lab-address", text)
-        done = self.ran(text, "--lab-address", "127.0.0.1:32768", "id")
+        self.assertNotIn("_lab_target", text)
+        done = self.ran(text, "127.0.0.1:32768", "id")
         self.assertEqual(done.returncode, 2)
-        self.assertIn("unrecognized arguments", done.stderr)
+        self.assertEqual(done.stdout, "")
+        # Remote mode's refusal, which is what a bare address has always
+        # reached here.
+        self.assertIn("has no remote mode", done.stderr)
 
     def test_a_lab_with_no_command_evidence_is_offered_no_command(self) -> None:
         plan = dict(self.PLAN, exploit_contract={
             "service_port": 8080, "evidence_type": "unauthorized_read",
         })
         header = self.artifact(plan=plan).split('"""')[1]
-        self.assertIn("--lab-address 127.0.0.1:32768\n", header)
-        self.assertNotIn("--lab-address 127.0.0.1:32768 id", header)
+        self.assertIn("python3 PoC.py 127.0.0.1:32768\n", header)
+        self.assertNotIn("python3 PoC.py 127.0.0.1:32768 id", header)
         self.assertNotIn("one command to run", header)
 
     def test_no_argument_at_all_is_still_untouched(self) -> None:
-        """The non-negotiable, with the flag in the file."""
+        """The non-negotiable, with the address argument in the file."""
         with tempfile.TemporaryDirectory() as root:
             alone = Path(root) / "validator.py"
             alone.write_text(self.LAB, encoding="utf-8")
@@ -1153,10 +1250,12 @@ class TheLabAddressFlagTests(unittest.TestCase):
             runner = (artifacts / "manual.sh").read_text()
             guide = (artifacts / field.LAB_POC_GUIDE_NAME).read_text()
         # Available whether or not remote mode was proved: it is this lab's
-        # own build either way.
-        self.assertIn("--lab-address $POC_AT id", runner)
-        self.assertIn('python3 PoC.py --lab-address "$(bash manual.sh address', guide)
-        self.assertIn("shows nothing about any other host", " ".join(guide.split()))
+        # own build either way, and one address with no flag like everything
+        # else this artifact takes.
+        self.assertIn("$POC_AT id", runner)
+        self.assertIn('python3 PoC.py "$(bash manual.sh address', guide)
+        self.assertIn("one target whose result means what it looks like it means",
+                      " ".join(guide.split()))
 
 
 class ThePromptTests(unittest.TestCase):
@@ -1166,26 +1265,37 @@ class ThePromptTests(unittest.TestCase):
 
     For a lab whose evidence is command execution, one echoed command proves
     execution and a terminal proves control -- and the artifact could only do
-    the first: `--lab-address ADDRESS COMMAND` runs one command per
-    invocation, imposed, because `_lab_address` rewrites argv into the shape
-    the lab program already takes. What the lower half implements is a
+    the first: `PoC.py ADDRESS COMMAND` runs one command per invocation,
+    imposed, because that is the shape the lab program takes and nothing
+    above the marker rewrites it. What the lower half implements is a
     request/response oracle, so the half above it runs that oracle in a loop:
     one process per line, the lab program's own exit status per line, and no
     attack of CVELab's anywhere. `sourcegen` is untouched, and "validator.py
     has two entry points and must have exactly two" stays true.
 
+    WHICH LAB GETS IT
+
+    One address and no flag, so which of the file's two programs that address
+    reaches is the lab's standing. A lab with a proved remote mode spends the
+    argument there, and a prompt over that program would have every line
+    refused by argparse -- so `shell_standing` refuses the mode for it rather
+    than shipping a prompt that cannot work, and the record these tests emit
+    from is the one 262 of the 264 archived labs have.
+
     WHAT THESE TESTS HOLD
 
-    That each line really does go through `--lab-address` and never as a bare
-    address, which would be remote mode -- a different program against a
-    different spec. That output is printed and the cosmetic strip of the
-    drafter's header line cannot lose any of it. That `cd` is tracked here
-    and said to be. That every refusal exits 2 and says why, including the
-    flag that has to be asked for. And that a lab which cannot support the
-    mode carries no trace of it: the form the prompt drives is asked for in
-    the generation contract's prose with no check behind it, so it is read
-    out of the validator and the reason is printed where the operator reads
-    it when it is missing.
+    That each line really is one run of this same file with the address and
+    the line as its two arguments, reaching the lab program and not remote
+    mode. That output is printed and the cosmetic strip of the drafter's
+    header line cannot lose any of it. That `cd` is tracked here and said to
+    be. That every refusal exits 2 and says why, including the flag that has
+    to be asked for. That an address this lab did not publish is not refused
+    but said, on the marker in front of every line and again under every line
+    that does not run. And that a lab which cannot support the mode carries
+    no trace of it: the form the prompt drives is asked for in the generation
+    contract's prose with no check behind it, so it is read out of the
+    validator and the reason is printed where the operator reads it when it
+    is missing.
     """
 
     CONTRACT = {
@@ -1284,21 +1394,31 @@ class ThePromptTests(unittest.TestCase):
         "    sys.exit(main())\n"
     )
 
+    #: The standing this mode is emitted for, and the one these tests have to
+    #: use: a lab with a proved remote mode spends its one address argument
+    #: there, so `shell_standing` gives it no prompt at all.
+    REFUSED = {"shipped": False, "reason": "the effect is internal"}
+    #: The address this lab could have published, used where the run is about
+    #: the prompt and not about where it is pointed.
+    LOCAL = "127.0.0.1:32768"
+
+    def proved(self) -> dict[str, Any]:
+        return {
+            "shipped": True, "container_port": 8080,
+            "spec": field.validate_spec(_spec()),
+        }
+
     def artifact(
         self,
         record: dict[str, Any] | None = None,
         plan: dict | None = None,
         validator: str | None = None,
     ) -> str:
-        proved = {
-            "shipped": True, "container_port": 8080,
-            "spec": field.validate_spec(_spec()),
-        }
         return field.emit_poc(
             "CVE-2026-0001",
             self.PLAN if plan is None else plan,
             self.LAB if validator is None else validator,
-            proved if record is None else record,
+            dict(self.REFUSED) if record is None else record,
         )
 
     def ran(
@@ -1315,45 +1435,58 @@ class ThePromptTests(unittest.TestCase):
             env={"PATH": os.environ["PATH"]},
         )
 
-    def prompted(self, typed: str, **kept: Any) -> subprocess.CompletedProcess:
+    def prompted(
+        self, typed: str, where: str | None = None, **kept: Any
+    ) -> subprocess.CompletedProcess:
         return self.ran(
-            self.artifact(**kept), "--lab-address", "127.0.0.1:32768",
+            self.artifact(**kept), self.LOCAL if where is None else where,
             "--shell", "--allow-shell", typed=typed,
         )
 
     # --- the line it builds -----------------------------------------------
 
-    def test_each_line_is_one_run_of_the_flag_and_never_a_bare_address(self) -> None:
+    def test_each_line_is_one_run_of_this_file_with_the_address_and_the_line(self) -> None:
         """The one line in this mode that cannot be written another way.
 
-        `_poc_entry` hands a bare argv[1] to remote mode's `main()`, which is
-        a different program drafted against a different spec; `--lab-address`
-        is the only branch that falls through to the lab program with the
-        address where that program reads it. So the invocation is pinned as
-        text, and then measured on a lab with no remote mode, where a bare
-        address prints the recorded reason and sends nothing.
+        Two arguments and nothing else, which is also the form an operator
+        types by hand: the child reads the address at argv[1] and the line,
+        whole, at argv[2]. This was `--lab-address` and a flag, and there is
+        no flag left -- which is why the invocation is pinned as text as well
+        as measured. What the invocation must not become is a run that
+        reaches remote mode: `_poc_entry` hands a bare argv[1] to remote
+        mode's `main()` for a lab that has one, so the prompt is emitted only
+        where the lab program is what an address reaches, and a child that
+        landed in argparse would have every line refused.
         """
         text = self.artifact()
-        self.assertIn(
-            '[sys.executable, __file__, "--lab-address", address, command]', text
-        )
-        refused = self.artifact({"shipped": False, "reason": "the effect is internal"})
-        done = self.ran(
-            refused, "--lab-address", "127.0.0.1:32768", "--shell", "--allow-shell",
-            typed="id\n",
-        )
+        self.assertIn('[sys.executable, __file__, address, command]', text)
+        self.assertNotIn("--lab-address", text)
+        done = self.prompted("id\n")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout, "ran id against 127.0.0.1:32768\n")
         self.assertNotIn("the effect is internal", done.stdout)
         self.assertNotIn("the effect is internal", done.stderr)
 
-    def test_the_address_may_be_given_in_either_spelling(self) -> None:
-        done = self.ran(
-            self.artifact(), "--lab-address=127.0.0.1:32768", "--shell",
-            "--allow-shell", typed="id\n",
-        )
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(done.stdout, "ran id against 127.0.0.1:32768\n")
+    def test_a_lab_with_a_proved_remote_mode_is_offered_no_prompt(self) -> None:
+        """The fourth condition, and the reason it is last.
+
+        One address reaches remote mode for a lab that proved one, so there
+        is no way left to hand the lab program an address -- and a prompt is
+        one command through that program per line. A shipped prompt that
+        cannot work is the worse of the two costs, so the mode is withheld
+        and the reason is a fact about the dispatch rather than about the
+        lab, which is why it is heard only after the three that are not.
+        """
+        offered, reason = field.shell_standing(self.PLAN, self.LAB, self.proved())
+        self.assertFalse(offered)
+        self.assertIn("this lab has a proved remote mode", reason)
+        self.assertIn("both unaffected", reason)
+        text = self.artifact(self.proved())
+        for absent in ("--shell", "--allow-shell"):
+            with self.subTest(absent=absent):
+                self.assertNotIn(absent, text)
+        # And the same lab, same validator, differing only in the record.
+        self.assertTrue(field.shell_standing(self.PLAN, self.LAB, self.REFUSED)[0])
 
     def test_the_output_is_printed_with_the_drafters_header_line_dropped(self) -> None:
         done = self.prompted("id\npwd\n")
@@ -1394,26 +1527,42 @@ class ThePromptTests(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout, "command output is here\n")
 
-    def test_a_line_that_is_the_address_flag_is_refused_before_it_is_sent(self) -> None:
-        """The one line this prompt cannot deliver through the form it drives.
+    def test_a_flag_shaped_line_is_delivered_as_the_command_it_is(self) -> None:
+        """The refusal this prompt no longer needs, and why.
 
-        The typed line is one argument of a run of `--lab-address ADDRESS
-        COMMAND`, and that run reads the flag wherever it appears -- so a line
-        that IS the flag replaces the address and leaves the lab program with
-        no command at all. That program then prints its own differential, so
-        `--lab-address=127.0.0.1:32768` typed as a command used to put
+        It had one: the typed line was one argument of a run of
+        `--lab-address ADDRESS COMMAND`, and that run read the flag wherever
+        it appeared -- so a line that WAS the flag replaced the address and
+        left the lab program with no command, which made it print its own
+        differential. `--lab-address=127.0.0.1:32768` typed as a command put
         `REPRODUCED` on stdout, where the command's output goes, at exit 0.
-        Refused here by name, with nothing sent, and a line that merely
-        contains the flag is still delivered as typed.
+        So the prompt refused that line by name.
+
+        There is no flag to collide with now and nothing above the marker
+        rewrites argv, so the line is a word in the command whatever it looks
+        like. That is the assertion that replaced the refusal, and it has to
+        hold for the flag's own spelling too: the collision is gone, not
+        traded for a prompt that refuses text an operator typed.
         """
         done = self.prompted(
-            "--lab-address=127.0.0.1:32768\n--lab-address\necho --lab-address=x\n"
+            "--lab-address=127.0.0.1:32768\necho --lab-address=x\n--input=y\n"
         )
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(done.stdout, "ran echo --lab-address=x against 127.0.0.1:32768\n")
+        self.assertEqual(
+            done.stdout.splitlines(),
+            [
+                "ran --lab-address=127.0.0.1:32768 against 127.0.0.1:32768",
+                "ran echo --lab-address=x against 127.0.0.1:32768",
+            ],
+        )
         self.assertNotIn("REPRODUCED", done.stdout)
-        self.assertEqual(done.stderr.count("That line is --lab-address itself"), 2)
-        self.assertIn("Nothing was sent", done.stderr)
+        # `--input` is the one line the child still refuses, because it is
+        # the one argument the entry point reads past the address. It costs
+        # nothing the old refusal did not: the line does not run, the prompt
+        # says so, and the status it reports is "did not run" rather than a
+        # success for work nobody asked for.
+        self.assertIn("--input belongs to remote mode", done.stderr)
+        self.assertIn("the command did not run", done.stderr)
 
     def test_a_line_that_did_not_run_is_not_printed_as_output(self) -> None:
         """Exit non-zero on this form means the command did not run.
@@ -1555,21 +1704,23 @@ class ThePromptTests(unittest.TestCase):
         for name in (field.POC_NAME, "validator.py"):
             with self.subTest(name=name):
                 done = self.ran(
-                    text, "--lab-address", "127.0.0.1:32768", "--shell",
-                    "--allow-shell", typed="", name=name,
+                    text, self.LOCAL, "--shell", "--allow-shell",
+                    typed="", name=name,
                 )
-                self.assertIn(f"{name} --lab-address 127.0.0.1:32768 --shell", done.stderr)
+                self.assertIn(f"{name} 127.0.0.1:32768 --shell", done.stderr)
 
     def test_the_header_and_the_help_both_offer_it(self) -> None:
         header = self.artifact().split('"""')[1]
         lab = header[header.index("LAB MODE"):header.index("REMOTE MODE")]
         self.assertIn(
-            "python3 PoC.py --lab-address 127.0.0.1:32768 --shell --allow-shell\n",
-            lab,
+            "python3 PoC.py 127.0.0.1:32768 --shell --allow-shell\n", lab,
         )
+        # `--help` on a lab with no remote mode prints the header, which is
+        # where that line lives: there is no argparse here to put an options
+        # list under.
         said = " ".join(self.ran(self.artifact(), "--help").stdout.split())
-        self.assertIn("--lab-address ADDRESS --shell --allow-shell", said)
-        self.assertIn("--allow-shell is required and not implied", said)
+        self.assertIn("python3 PoC.py 127.0.0.1:32768 --shell --allow-shell", said)
+        self.assertIn("It asks for --allow-shell", said)
 
     # --- every refusal ----------------------------------------------------
 
@@ -1577,10 +1728,7 @@ class ThePromptTests(unittest.TestCase):
         """The precedent is --allow-disruption: every other mode in the file
         asks no more of what it is pointed at than an ordinary request.
         """
-        done = self.ran(
-            self.artifact(), "--lab-address", "127.0.0.1:32768", "--shell",
-            typed="id\n",
-        )
+        done = self.ran(self.artifact(), self.LOCAL, "--shell", typed="id\n")
         self.assertEqual(done.returncode, 2)
         self.assertEqual(done.stdout, "")
         self.assertIn("Re-run with --allow-shell", done.stderr)
@@ -1588,38 +1736,66 @@ class ThePromptTests(unittest.TestCase):
 
     def test_it_refuses_a_command_on_the_command_line(self) -> None:
         done = self.ran(
-            self.artifact(), "--lab-address", "127.0.0.1:32768", "--shell",
-            "--allow-shell", "id", typed="",
+            self.artifact(), self.LOCAL, "--shell", "--allow-shell", "id",
+            typed="",
         )
         self.assertEqual(done.returncode, 2)
         self.assertEqual(done.stdout, "")
         self.assertIn("different jobs", done.stderr)
-        self.assertIn("--lab-address ADDRESS COMMAND", done.stderr)
+        self.assertIn("one address, then one command", done.stderr)
 
     def test_it_refuses_to_be_mixed_with_remote_mode(self) -> None:
         done = self.ran(
-            self.artifact(), "--lab-address", "127.0.0.1:32768", "--shell",
-            "--allow-shell", "--input", "target_path=/theirs", typed="",
+            self.artifact(), self.LOCAL, "--shell", "--allow-shell",
+            "--input", "target_path=/theirs", typed="",
         )
         self.assertEqual(done.returncode, 2)
         self.assertEqual(done.stdout, "")
-        self.assertIn("different jobs", done.stderr)
         self.assertIn("--input belongs to remote", done.stderr)
+        self.assertIn("this file has none", done.stderr)
 
     def test_it_cannot_be_used_without_an_address(self) -> None:
-        done = self.ran(self.artifact(), "--shell", "--allow-shell", typed="id\n")
-        self.assertEqual(done.returncode, 2)
-        self.assertEqual(done.stdout, "")
-        self.assertIn("not optional", done.stderr)
+        for argv in (["--shell", "--allow-shell"],
+                     ["--shell", "--allow-shell", "--show-bodies"]):
+            with self.subTest(argv=argv):
+                done = self.ran(self.artifact(), *argv, typed="id\n")
+                self.assertEqual(done.returncode, 2)
+                self.assertEqual(done.stdout, "")
+                self.assertIn(
+                    "takes one argument and it is the address", done.stderr
+                )
 
-    def test_an_address_this_lab_cannot_have_published_is_refused(self) -> None:
-        done = self.ran(
-            self.artifact(), "--lab-address", "10.0.0.5:8080", "--shell",
-            "--allow-shell", typed="id\n",
+    def test_an_address_this_lab_cannot_have_published_is_said_every_line(self) -> None:
+        """Where the honesty statement lands for a mode with no verdict.
+
+        A prompt pointed at something that is not this lab fails on every
+        line it sends -- the route is a constant in the lab program and that
+        host does not serve it -- and "the command did not run" is the line
+        an operator reads as "no command execution here". So the statement is
+        printed once before the first line, the marker says NOT-THIS-LAB in
+        front of every line, and every line that does not run says it again.
+        Nothing is refused: where this is pointed is the operator's to decide.
+        """
+        done = self.prompted("boom\nid\n", where="10.0.0.5:8080")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        # It ran, and the command's own output is on stdout where it belongs.
+        self.assertEqual(done.stdout, "ran id against 10.0.0.5:8080\n")
+        said = " ".join(done.stderr.split())
+        self.assertIn(
+            "WHAT WAS SENT, AND WHAT A NEGATIVE VERDICT DOES NOT MEAN", said
         )
-        self.assertEqual(done.returncode, 2)
-        self.assertEqual(done.stdout, "")
-        self.assertIn("not an address this lab published", done.stderr)
+        self.assertIn('"Not affected" is a claim this run cannot carry', said)
+        self.assertEqual(done.stderr.count("NOT-THIS-LAB 10.0.0.5:8080"), 3)
+        self.assertIn("the command did not run", done.stderr)
+        self.assertIn(
+            "this address is not this lab's, so a line that does not run is",
+            done.stderr,
+        )
+        # And on this lab's own address none of it is owed or said.
+        here = self.prompted("boom\n")
+        self.assertNotIn("WHAT WAS SENT", here.stderr)
+        self.assertNotIn("NOT-THIS-LAB", here.stderr)
+        self.assertIn("the command did not run", here.stderr)
 
     # --- the gate ---------------------------------------------------------
 
@@ -1632,7 +1808,10 @@ class ThePromptTests(unittest.TestCase):
                 self.assertNotIn(absent, text)
         done = self.ran(text, "--shell", "--allow-shell", typed="id\n")
         self.assertEqual(done.returncode, 2)
-        self.assertIn("unrecognized arguments", done.stderr)
+        self.assertEqual(done.stdout, "")
+        # This lab publishes no port and has no proved remote mode, so an
+        # argument reaches neither program and the file says so.
+        self.assertIn("has no remote mode", done.stderr)
 
     def test_a_lab_with_no_command_evidence_carries_no_trace_of_it(self) -> None:
         plan = dict(
@@ -1749,37 +1928,51 @@ class ThePromptTests(unittest.TestCase):
                     self.assertEqual(one.returncode, two.returncode)
 
     def test_the_two_writers_still_agree_byte_for_byte(self) -> None:
-        """The prompt is a pure function of the plan and the validator.
+        """The prompt is a pure function of the plan, the validator and the record.
 
         Two modules write this artifact -- `field.write_manual_poc` from the
         record it has just proved, `deliverables.create_deliverables` from the
         record it reads back -- and the claim that the script CVELab proved is
         the one the operator receives rests on them agreeing. A mode that read
         a clock, an environment variable or the filesystem would break that.
+
+        Both outcomes, because the record is now one of the inputs: a proved
+        remote mode spends this lab's one address argument, so it is also the
+        outcome that gets no prompt. Agreement has to hold on the artifact
+        that carries the mode and on the one that does not, and the two have
+        to differ -- otherwise this passes on a record neither writer read.
         """
         spec = field.validate_spec(_spec())
-        with tempfile.TemporaryDirectory() as root:
-            lab_dir = Path(root) / "CVE-2026-0001"
-            (lab_dir / "validator").mkdir(parents=True)
-            (lab_dir / "validator" / "validator.py").write_text(
-                self.LAB, encoding="utf-8"
-            )
-            (lab_dir / "report.json").write_text(
-                json.dumps({"real_poc_verified": True}), encoding="utf-8"
-            )
-            field.write_manual_poc(
-                "CVE-2026-0001", lab_dir, self.PLAN, spec, 8080,
-                {"shipped": True, "proof_checks": {}, "runs": {},
-                 "script": "ignored: write_manual_poc re-emits it"},
-            )
-            written = (lab_dir / "artifacts" / field.POC_NAME).read_text()
-            rendered = field.emit_poc(
-                "CVE-2026-0001", self.PLAN,
-                (lab_dir / "validator" / "validator.py").read_text(),
-                field.poc_record(lab_dir),
-            )
-        self.assertEqual(written, rendered)
-        self.assertIn("--shell", written)
+        texts = {}
+        for name, outcome in (
+            ("proved", {"shipped": True, "proof_checks": {}, "runs": {},
+                        "script": "ignored: write_manual_poc re-emits it"}),
+            ("refused", {"shipped": False, "reason": "the effect is internal",
+                         "proof_checks": {}, "runs": {}}),
+        ):
+            with self.subTest(outcome=name):
+                with tempfile.TemporaryDirectory() as root:
+                    lab_dir = Path(root) / "CVE-2026-0001"
+                    (lab_dir / "validator").mkdir(parents=True)
+                    (lab_dir / "validator" / "validator.py").write_text(
+                        self.LAB, encoding="utf-8"
+                    )
+                    (lab_dir / "report.json").write_text(
+                        json.dumps({"real_poc_verified": True}), encoding="utf-8"
+                    )
+                    field.write_manual_poc(
+                        "CVE-2026-0001", lab_dir, self.PLAN, spec, 8080, outcome,
+                    )
+                    written = (lab_dir / "artifacts" / field.POC_NAME).read_text()
+                    rendered = field.emit_poc(
+                        "CVE-2026-0001", self.PLAN,
+                        (lab_dir / "validator" / "validator.py").read_text(),
+                        field.poc_record(lab_dir),
+                    )
+                self.assertEqual(written, rendered)
+                texts[name] = written
+        self.assertNotIn("--shell", texts["proved"])
+        self.assertIn("--shell", texts["refused"])
 
 
 class TheScriptThatWasProvedIsTheScriptShippedTests(unittest.TestCase):

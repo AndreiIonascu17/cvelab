@@ -888,17 +888,16 @@ class TheGateReadsTheComputedVerdictTests(unittest.TestCase):
         `shell_standing` -- a declared service port and a validator that
         reads the command. Measured across 262 archived labs: 34 declare
         command execution, 2 implement it, and every one of the other 32
-        declares no port at all, so `manual.sh` and the guide printed
-        `PoC.py --lab-address $POC_AT id` for a file that does not have the
-        flag.
+        declares no port at all, so `manual.sh` and the guide printed a
+        command for a file whose one argument does not reach it.
 
         Tested here rather than against `_write_generic_manual_assets`,
         which is where the existing test for this line lives: that function
-        was always right about the flag it was handed, and no test covered
-        what it was handed. The defect was the argument, so the argument is
-        what this reads.
+        was always right about the argument it was handed, and no test
+        covered what it was handed. The defect was the argument, so the
+        argument is what this reads.
         """
-        offer = "--lab-address $POC_AT id"
+        offer = "$POC_AT id"
         fallback = "nothing here may be pointed at that address"
 
         # Declares command execution, implements nothing of the sort: the
@@ -914,7 +913,7 @@ class TheGateReadsTheComputedVerdictTests(unittest.TestCase):
         guide = (lab / "artifacts" / LAB_POC_GUIDE_NAME).read_text(encoding="utf-8")
         self.assertNotIn(offer, runner)
         self.assertIn(fallback, runner)
-        self.assertNotIn("PoC.py --lab-address", guide)
+        self.assertNotIn('python3 PoC.py "$(bash manual.sh address', guide)
 
         # And the shape that does implement it keeps the line, which is the
         # half of this that a stricter condition could have taken away.
@@ -935,7 +934,7 @@ class TheGateReadsTheComputedVerdictTests(unittest.TestCase):
         guide = (able / "artifacts" / LAB_POC_GUIDE_NAME).read_text(encoding="utf-8")
         self.assertIn(offer, runner)
         self.assertNotIn(fallback, runner)
-        self.assertIn("PoC.py --lab-address", guide)
+        self.assertIn('python3 PoC.py "$(bash manual.sh address vulnerable)" id', guide)
 
     def test_the_kit_and_the_artifact_say_the_same_thing(self) -> None:
         """One predicate, read once, so the two cannot come apart.
@@ -981,13 +980,31 @@ class TheGateReadsTheComputedVerdictTests(unittest.TestCase):
                 # The kit's offer and the file's own usage line, read off the
                 # two artifacts rather than off the predicate, so this is a
                 # comparison and not a restatement.
-                kit_offers = "--lab-address $POC_AT id" in runner
+                # Scoped to LAB MODE, because that is the half an address
+                # reaches here: the REMOTE MODE paragraph below it shows an
+                # address too, and it is the refusal's.
+                lab_mode = header[
+                    header.index("LAB MODE"):header.index("REMOTE MODE")
+                ]
+                kit_offers = "$POC_AT id" in runner
                 file_offers = bool(
-                    re.search(r"--lab-address \S+ id\b", header)
+                    re.search(r"python3 PoC\.py \S+ id\b", lab_mode)
                 )
                 self.assertIs(kit_offers, expected)
                 self.assertIs(file_offers, expected)
                 self.assertIs(kit_offers, file_offers)
+                # And the address itself, which is the other half of the same
+                # discipline and the half the flag's removal added: the
+                # runner prints the address exactly where the file takes it,
+                # with or without a command after it.
+                takes_address = field.takes_lab_address(port, field.poc_record(lab))
+                self.assertIs(takes_address, port is not None)
+                self.assertIs(
+                    'python3 \\"$LAB_ROOT/artifacts/PoC.py\\" $POC_AT' in runner,
+                    takes_address,
+                )
+                self.assertIs("python3 PoC.py 127.0.0.1:32768" in lab_mode,
+                              takes_address)
 
     def test_the_gate_no_longer_reads_the_validators_own_label(self) -> None:
         """Read off the source, because the behaviour above cannot tell a gate

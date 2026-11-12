@@ -355,9 +355,10 @@ Key files:
 - `validator/validator.py`: the executable PoC/validator for the generated adapter.
 - `artifacts/PoC.py` (or the profile-specific payload): the one inspectable PoC, in two modes.
   With no argument it runs exactly as automatic validation runs it, inside the lab's own network.
-  Given one address it is the single-instance script, which is proved per CVE and refuses, with
-  the recorded reason, for a lab where it was not. Its own header says which of the two this
-  lab has.
+  Given one address it is the single-instance script where that was proved for this CVE; where it
+  was not, the address runs the same lab program against that host for a lab that publishes a
+  service port, and is refused with the recorded reason for a lab that publishes none. The lab
+  decides which, never the address, and the file's own header says which one this lab has.
 - `artifacts/manual.sh`: the Linux runner with separate `setup`, `exploit`, `verify`, `address`, and
   `cleanup` actions.
 - `artifacts/PoC.ps1`: the same actions on Windows, run through WSL.
@@ -373,7 +374,8 @@ Key files:
 - `artifacts/LAB-POC.md`: manual reproduction instructions for both shells. `manual.sh` drives
   this lab's own builds and nothing outside them, and the section on `PoC.py` says what pointing
   it at an address of your own does and does not prove: whether its remote mode was proved for
-  this lab, and where it was refused, the recorded reason.
+  this lab, and where it was refused, the recorded reason and which of the file's two programs
+  an address reaches instead.
 - `artifacts/EVIDENCE.json`: structured evidence and provenance.
 - `artifacts/WALKTHROUGH.md`: manual reproduction steps.
 - `artifacts/REPORT.md`: the technical report, limitations, and conclusion.
