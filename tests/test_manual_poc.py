@@ -582,6 +582,109 @@ class OperatorSpecTests(unittest.TestCase):
             self.assertIn("plan.json is missing", str(raised.exception))
 
 
+class TheStepsOwnVerdictTests(unittest.TestCase):
+    """What `ok` means, which `cli` turns into the process's exit status.
+
+    `cli.main` ends with `return 0 if result.get("ok", True) else 2`, so this
+    key is the only thing that decides whether `cvelab manual` looks like a
+    success to a shell, a CI job or a person. It read `shipped`, which made a
+    proved impossibility -- the drafter judging the effect unobservable from
+    one instance, which is the answer for 62 of the 264 archived labs --
+    indistinguishable from a crash.
+
+    `core.run_lab` already draws this line for the same step run inline: it
+    sets `validated = real_source_proof` and records `manual_poc_field`
+    beside it, never ANDed in, because an artifact beside the lab's claim
+    must not downgrade a run that reproduced. This is that line, drawn in the
+    one place the command's own status comes from.
+    """
+
+    def _declined(self, lab_dir: Path, answer: dict[str, Any]) -> dict[str, Any]:
+        with mock.patch.object(field, "ai_is_configured", return_value=True), \
+             mock.patch.object(field, "draft_manual_poc_spec", return_value=answer), \
+             mock.patch.object(field, "prepare_compose") as compose:
+            result = field.run_manual_poc(lab_dir)
+        # Nothing was built: the answer comes back before any of that.
+        compose.assert_not_called()
+        return result
+
+    def test_a_proved_impossibility_is_a_result_and_not_a_failure(self) -> None:
+        """The drafter refusing to write a spec is the step's job done.
+
+        Most effects cannot be shown from one instance -- a client-side DOM
+        sink, an effect internal to a library -- and saying so is the answer,
+        not an error in the tool.
+        """
+        with _lab() as lab_dir:
+            result = self._declined(lab_dir, {
+                "reason": "the confirmed effect is client-side and no response carries it",
+            })
+        self.assertIs(result["ok"], True)
+        # And it still says there is no script, which is the other half: `ok`
+        # is about the step, `shipped` about the handover.
+        self.assertIs(result["shipped"], False)
+        self.assertIn("client-side", result["reason"])
+
+    def test_our_own_script_failing_is_still_a_failure(self) -> None:
+        """A spec existed, ran, and did not hold up. That is ours to fix.
+
+        The same for every other way of not shipping that gets this far: a
+        value only the operator has, a container that is not up, a service
+        that stopped. Each is something to go and fix, which is what a
+        non-zero exit is for.
+        """
+        outcomes = {
+            "the script did not tell the two builds apart": {
+                "shipped": False,
+                "reason": "the script did not tell the two builds apart",
+                "proof_checks": {"manual_poc_proven": False}, "runs": {},
+            },
+            "no running container for vulnerable": {
+                "shipped": False, "reason": "no running container for vulnerable",
+            },
+        }
+        for name, outcome in outcomes.items():
+            with self.subTest(outcome=name), _lab(spec=_spec()) as lab_dir:
+                with mock.patch.object(
+                    field, "prepare_compose",
+                    return_value=("docker", {}, ["docker", "compose"],
+                                  lab_dir.parent / "scratch"),
+                ), mock.patch.object(
+                    field, "_resolved_compose", return_value={}
+                ), mock.patch.object(field, "_bring_up"), mock.patch.object(
+                    field.subprocess, "run",
+                    return_value=subprocess.CompletedProcess(["docker"], 0, "", ""),
+                ), mock.patch.object(
+                    field, "prove_manual_poc", return_value=dict(outcome)
+                ):
+                    result = field.run_manual_poc(lab_dir, lab_dir / "spec.json", 8000)
+                self.assertIs(result["ok"], False)
+
+    def test_a_handover_is_a_result_too(self) -> None:
+        """The case that always worked, so the change is not a blanket zero."""
+        with _lab() as lab_dir, mock.patch.object(
+            field, "prepare_compose",
+            return_value=("docker", {}, ["docker", "compose"], lab_dir.parent / "s"),
+        ), mock.patch.object(field, "_resolved_compose", return_value={}), \
+             mock.patch.object(field, "_bring_up"), \
+             mock.patch.object(field.subprocess, "run",
+                               return_value=subprocess.CompletedProcess(["d"], 0, "", "")), \
+             mock.patch.object(field, "ai_is_configured", return_value=True), \
+             mock.patch.object(
+                 field, "draft_manual_poc_spec",
+                 return_value={"spec": field.validate_spec(_spec()),
+                               "container_port": 8000},
+             ), mock.patch.object(
+                 field, "prove_manual_poc",
+                 return_value={"shipped": True, "proof_checks": {}, "runs": {},
+                               "script": "#!/usr/bin/env python3\n"},
+             ):
+            (lab_dir.parent / "s").mkdir(exist_ok=True)
+            result = field.run_manual_poc(lab_dir)
+        self.assertIs(result["ok"], True)
+        self.assertIs(result["shipped"], True)
+
+
 class ContainerLookupTests(unittest.TestCase):
     def test_the_running_container_id_comes_from_compose(self) -> None:
         completed = subprocess.CompletedProcess(["docker"], 0, "abc123\n", "")
@@ -770,16 +873,26 @@ class OneArtifactTwoModesTests(unittest.TestCase):
         self.assertIn("does not report", done.stderr)
         self.assertEqual(done.stdout, "")
 
-    def test_the_three_refusals_read_differently(self) -> None:
-        """Refused, never asked for, and no record are three answers.
+    def test_every_answer_without_a_handover_reads_differently(self) -> None:
+        """Five answers, and none of them may be read as another.
 
         Rendering "not requested" as a refusal would attribute to the model a
-        judgement it was never asked to make.
+        judgement it was never asked to make. Rendering a script of CVELab's
+        own that did not hold up as a refusal attributes to the finding a
+        limit nobody measured about it -- 11 of the 264 archived labs, every
+        one of which ships a kit -- and rendering a lab that never reproduced
+        as either claims an attempt that was never made.
         """
         said = {
             standing: self.ran(self.artifact(record), "10.0.0.5:8080").stderr
             for standing, record in (
                 (field.POC_REFUSED, {"shipped": False, "reason": "the effect is internal"}),
+                (field.POC_NOT_PROVED,
+                 {"shipped": False,
+                  "reason": "the script did not tell the two builds apart",
+                  "proof_checks": {"manual_poc_proven": False}, "runs": {}}),
+                (field.POC_NOT_REPRODUCED,
+                 {"shipped": False, "reason": field.NOT_REPRODUCED_REASON}),
                 (field.POC_NOT_REQUESTED,
                  {"shipped": False, "reason": field.NOT_REQUESTED_REASON}),
                 (field.POC_NO_RECORD, {}),
@@ -788,9 +901,26 @@ class OneArtifactTwoModesTests(unittest.TestCase):
         self.assertIn("recorded why", said[field.POC_REFUSED])
         self.assertIn("never asked for", said[field.POC_NOT_REQUESTED])
         self.assertIn("kept no record", said[field.POC_NO_RECORD])
-        self.assertEqual(len(set(said.values())), 3)
+        self.assertIn("none was attempted", said[field.POC_NOT_REPRODUCED])
+        self.assertEqual(len(set(said.values())), 5)
         self.assertNotIn(
             field.NOT_REQUESTED_REASON, said[field.POC_NOT_REQUESTED]
+        )
+        # The one that was being told as a fact about the vulnerability. The
+        # reason stays, because it says which part of the attempt to look at;
+        # what may not stay is the sentence making it the finding's limit and
+        # handing it to the operator to repeat.
+        ours = said[field.POC_NOT_PROVED]
+        self.assertIn("did not tell the two builds apart", ours)
+        self.assertIn("CVELab's own attempt failing", ours)
+        self.assertIn("not a finding about the vulnerability", ours)
+        self.assertIn("differential below proved the effect", ours)
+        for forbidden in ("limit of what this lab shows", "recorded why"):
+            self.assertNotIn(forbidden, ours)
+        # And the lab that never reproduced claims no attempt at all.
+        self.assertNotIn("recorded why", said[field.POC_NOT_REPRODUCED])
+        self.assertNotIn(
+            field.NOT_REPRODUCED_REASON, said[field.POC_NOT_REPRODUCED]
         )
 
     def test_a_half_written_record_claims_nothing(self) -> None:
@@ -811,6 +941,73 @@ class OneArtifactTwoModesTests(unittest.TestCase):
                     "kept no record",
                     self.ran(self.artifact(record), "10.0.0.5:8080").stderr,
                 )
+
+    def test_proof_checks_is_what_tells_our_failure_from_the_drafters(self) -> None:
+        """One key separates them, and it is asked in the right order.
+
+        `prove_manual_poc` writes `proof_checks` after the script has been
+        emitted and run against the builds, so a record carrying them is a
+        record of a run of CVELab's and a record without them never got as
+        far as a script. Measured on all 264 archived labs: 62 refusals with
+        no checks, 11 failures with them, and no record contradicting it.
+
+        The order is the half that is easy to get wrong. 26 archived records
+        carry green checks and `shipped: true` with no `spec` -- legacy
+        records whose spec lived in a file this key never had -- and they are
+        successes read as no claim at all. Asking about `proof_checks` before
+        the claim would hand all 26 the note about a script that could not be
+        made to hold.
+        """
+        reason = "the script did not tell the two builds apart"
+        self.assertEqual(
+            field.poc_standing({"shipped": False, "reason": reason}),
+            field.POC_REFUSED,
+        )
+        for checks in ({}, {"manual_poc_proven": False}):
+            with self.subTest(checks=checks):
+                self.assertEqual(
+                    field.poc_standing(
+                        {"shipped": False, "reason": reason, "proof_checks": checks}
+                    ),
+                    field.POC_NOT_PROVED,
+                )
+        # A broken claim about our own run is no claim, like the shipped one.
+        for broken in (None, "yes", []):
+            with self.subTest(proof_checks=broken):
+                self.assertEqual(
+                    field.poc_standing(
+                        {"shipped": False, "reason": reason, "proof_checks": broken}
+                    ),
+                    field.POC_REFUSED,
+                )
+        # The archive's legacy success: green checks, no spec, and it must
+        # not be read as a failure of ours.
+        legacy = {
+            "shipped": True, "container_port": 8080,
+            "proof_checks": {"script_ran_on_both": True, "manual_poc_proven": True},
+            "runs": {}, "strategy": "direct_observation",
+        }
+        self.assertEqual(field.poc_standing(legacy), field.POC_NO_RECORD)
+        # And the two sentences CVELab writes itself are never the drafter's,
+        # with or without checks beside them.
+        self.assertEqual(
+            field.poc_standing(
+                {"shipped": False, "reason": field.NOT_REPRODUCED_REASON}
+            ),
+            field.POC_NOT_REPRODUCED,
+        )
+        self.assertEqual(
+            field.poc_standing(
+                {"shipped": False, "reason": field.NOT_REQUESTED_REASON,
+                 "proof_checks": {}}
+            ),
+            field.POC_NOT_REQUESTED,
+        )
+        # Every answer is one of the declared ones, which is what the two
+        # dicts in `deliverables` are keyed by.
+        self.assertIn(field.POC_NOT_PROVED, field.POC_STANDINGS)
+        self.assertIn(field.POC_NOT_REPRODUCED, field.POC_STANDINGS)
+        self.assertEqual(len(set(field.POC_STANDINGS)), len(field.POC_STANDINGS))
 
     def test_the_header_states_its_standing_either_way(self) -> None:
         proved = self.artifact(self.proved()).split('"""')[1]
@@ -849,24 +1046,38 @@ class OneArtifactTwoModesTests(unittest.TestCase):
         writes it again for every validated lab, from the record it reads
         back. The claim "the script CVELab proved is byte for byte the one the
         operator receives" rests on those two agreeing.
+
+        Both shapes the proof leaves behind, because the record saying a
+        script of ours did not hold up is the one whose rendering changed and
+        it goes through those same two writers: 11 of the 264 archived labs
+        carry it, and all 11 ship a kit.
         """
-        with _lab() as lab_dir:
-            outcome = {
+        outcomes = {
+            field.POC_SHIPPED: {
                 "shipped": True, "proof_checks": {}, "runs": {},
                 "script": "ignored: write_manual_poc re-emits it",
                 "lab_values": {"target_path": "/admin"},
-            }
-            field.write_manual_poc(
-                "CVE-2026-0001", lab_dir, self.PLAN,
-                field.validate_spec(self.SPEC), 8080, outcome,
-            )
-            written = (lab_dir / "artifacts" / field.POC_NAME).read_text()
-            rendered = field.emit_poc(
-                "CVE-2026-0001", self.PLAN,
-                (lab_dir / "validator" / "validator.py").read_text(),
-                field.poc_record(lab_dir),
-            )
-        self.assertEqual(written, rendered)
+            },
+            field.POC_NOT_PROVED: {
+                "shipped": False,
+                "reason": "the script did not tell the two builds apart",
+                "proof_checks": {"manual_poc_proven": False}, "runs": {},
+            },
+        }
+        for standing, outcome in outcomes.items():
+            with self.subTest(standing=standing), _lab() as lab_dir:
+                field.write_manual_poc(
+                    "CVE-2026-0001", lab_dir, self.PLAN,
+                    field.validate_spec(self.SPEC), 8080, dict(outcome),
+                )
+                written = (lab_dir / "artifacts" / field.POC_NAME).read_text()
+                held = field.poc_record(lab_dir)
+                self.assertEqual(field.poc_standing(held), standing)
+                rendered = field.emit_poc(
+                    "CVE-2026-0001", self.PLAN,
+                    (lab_dir / "validator" / "validator.py").read_text(), held,
+                )
+                self.assertEqual(written, rendered)
 
     def test_an_archived_labs_proved_spec_survives_a_re_render(self) -> None:
         """29 of the 45 archived records carry a spec that shipped.
@@ -1002,12 +1213,18 @@ class TheOneAddressArgumentTests(unittest.TestCase):
     def test_it_reaches_the_lab_program_with_the_address_and_the_command(self) -> None:
         """Every standing that has no proved remote mode to spend it on.
 
-        Three of the four, which is 262 of the 264 archived labs: the
-        argument falls through to the lab program where it reads it, and the
-        exit code is that program's own.
+        Five of the six, which is 262 of the 264 archived labs: the argument
+        falls through to the lab program where it reads it, and the exit code
+        is that program's own. Which of the five it is changes what the header
+        and the document say and changes nothing about the dispatch, so every
+        one of them is run here rather than the three that existed when the
+        refusals were one answer.
         """
         for record in ({}, {"shipped": False, "reason": "no"},
-                       {"shipped": False, "reason": field.NOT_REQUESTED_REASON}):
+                       {"shipped": False, "reason": field.NOT_REQUESTED_REASON},
+                       {"shipped": False, "reason": field.NOT_REPRODUCED_REASON},
+                       {"shipped": False, "reason": "the script did not finish",
+                        "proof_checks": {"script_ran_on_both": False}, "runs": {}}):
             with self.subTest(standing=field.poc_standing(record)):
                 done = self.ran(self.artifact(record), "127.0.0.1:32768", "id")
                 self.assertEqual(done.returncode, 0, done.stderr)
