@@ -1917,13 +1917,15 @@ class ThePromptTests(unittest.TestCase):
         With stdin on a pipe -- which is how an operator captures the transcript
         they paste into a report -- the per-line prompt is not written, so it
         does not repeat down the one line that gets pasted. What is evidence
-        stays whatever stdin is: the opening still explains that `cd` is
-        simulated, and `cd` is still tracked (the command the next line sends
-        carries the prefix), which the tracking test holds separately.
+        stays whatever stdin is: the opening still explains how `cd` works, and
+        `cd` is still tracked (the command the next line sends carries the
+        prefix), which the tracking test holds separately.
         """
         done = self.prompted("cd /srv\npwd\n")
         self.assertNotIn("[cd simulated]", done.stderr)
-        self.assertIn("is simulated, and simulated here", " ".join(done.stderr.split()))
+        self.assertIn(
+            "`cd` is tracked here, not run on the target", " ".join(done.stderr.split())
+        )
 
     def test_the_per_line_prompt_is_written_at_a_terminal(self) -> None:
         """Shown rather than asserted: driven through a pty, the prompt appears.
@@ -1973,7 +1975,13 @@ class ThePromptTests(unittest.TestCase):
             "no interactive programs",
             "no job control, no signals",
             "no line editing and no history",
-            "`cd` is simulated",
+            "`cd` is tracked here, not run on the target",
+            # Only stdout comes back -- a failing command and a silent one look
+            # the same here -- and how to tell them apart without rewriting the
+            # line. The honest answer to the ambiguity, said before it bites.
+            "only standard output comes back",
+            "add `2>&1`",
+            "`; echo $?`",
         ):
             with self.subTest(sentence=sentence):
                 self.assertIn(sentence, said)
@@ -2152,6 +2160,24 @@ class ThePromptTests(unittest.TestCase):
         self.assertNotIn("WHAT WAS SENT", here.stderr)
         self.assertNotIn("NOT-THIS-LAB", here.stderr)
         self.assertIn("the command did not run", here.stderr)
+
+    def test_asking_for_both_modes_names_the_conflict_not_a_command(self) -> None:
+        """Both mode flags is two modes, not a command on the line.
+
+        The session wins the dispatch and strips only its own flags, so
+        `--prompt --allow-prompt` survive and the old refusal told the operator
+        their command conflicts when there was no command. Both the full form and
+        the `--allow-shell`-only form (which reaches the prompt instead) now name
+        the real conflict.
+        """
+        for extra in (["--shell", "--allow-shell"], ["--allow-shell"]):
+            with self.subTest(extra=" ".join(extra)):
+                done = self.ran(
+                    self.artifact(), self.LOCAL, "--prompt", "--allow-prompt", *extra,
+                )
+                self.assertEqual(done.returncode, 2, done.stderr)
+                self.assertIn("two different modes", done.stderr)
+                self.assertNotIn("command on the command line", done.stderr)
 
     # --- the gate ---------------------------------------------------------
 

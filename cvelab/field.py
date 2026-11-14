@@ -2492,6 +2492,13 @@ PROMPT_NOT_ALLOWED = (
 PROMPT_IS_NOT_ONE_COMMAND = (
 @@ONE_COMMAND@@)
 
+#: Both modes refuse on it, and it is declared here because the prompt block is
+#: emitted first; the session reads the same name. A run that asks for both at
+#: once used to be told its command conflicts, which named the wrong thing --
+#: there is no command, there are two modes.
+MODES_ARE_EXCLUSIVE = (
+@@MODES@@)
+
 PROMPT_OPENING = (
 @@OPENING@@)
 
@@ -2664,7 +2671,44 @@ def _prompt_repl(address):
             words = line.split()
         joined = any(item in line for item in PROMPT_JOINED)
         if words and words[0] == "cd" and len(words) <= 2 and not joined:
-            cwd = _prompt_cd(cwd, words[1] if len(words) > 1 else "")
+            # `cd` is tracked here, not run on the target -- but a directory that
+            # is not there would make the tracked prefix dead: every later line
+            # would go out as `cd <gone> && ...`, short-circuit, and come back
+            # empty, silently, while the chrome kept showing the directory you
+            # never reached. So the move is checked on the target before it is
+            # tracked, with a token that prints only if the directory was
+            # entered, and a move that does not take is said and left untracked.
+            target = _prompt_cd(cwd, words[1] if len(words) > 1 else "")
+            token = os.urandom(8).hex()
+            probe = (("cd %s && " % shlex.quote(target)) if target else "") + (
+                "printf %s " + token)
+            done = _prompt_run(address, probe)
+            at = cwd or "the one the weakness runs in"
+            if token in done.stdout:
+                # The token prints only after the directory is entered, so it
+                # coming back -- however the target wraps its output, and whether
+                # or not it appends a canary -- is the move having taken.
+                cwd = target
+            elif done.returncode != 0 and foreign:
+                # No token and the probe did not come back clean, against a host
+                # that is not this lab: this is the route not being served there,
+                # not the directory. Said the way any line that does not run is.
+                _prompt_said(done, foreign)
+                sys.stderr.write(
+                    "[so cd was not tracked -- the directory is left at %s.]\\n" % at
+                )
+                sys.stderr.flush()
+            else:
+                # The probe ran and the token did not come back: the cd did not
+                # enter the directory. A fact about the target's filesystem --
+                # it is not there, or cannot be entered -- and not tracked, so
+                # later lines are not prefixed into a directory that is not there.
+                sys.stderr.write(
+                    "[cd did not take: %s is not a directory on the target, or it\\n"
+                    " cannot be entered there. The tracked directory is left at %s.]\\n"
+                    % (target or "that path", at)
+                )
+                sys.stderr.flush()
             continue
         sent = ("cd %s && " % shlex.quote(cwd) + line) if cwd else line
         try:
@@ -2693,6 +2737,12 @@ def _prompt_mode(argv):
     """
     _prompt_allowed(argv, PROMPT_NOT_ALLOWED)
     rest = [item for item in argv[1:] if item not in PROMPT_FLAGS]
+    # Asking for the session too is asking for two modes, not giving a command:
+    # `--shell` would have won the dispatch, so only its `--allow-shell` can
+    # reach here on its own, but either names the real conflict.
+    if any(item in ("--shell", "--allow-shell") for item in rest):
+        sys.stderr.write(MODES_ARE_EXCLUSIVE)
+        raise SystemExit(2)
     if not rest or rest[0].startswith("-"):
         sys.stderr.write(LAB_TARGET_IS_NOT_AN_ADDRESS)
         raise SystemExit(2)
@@ -3078,6 +3128,13 @@ def _shell_mode(argv):
     """
     _shell_allowed(argv)
     rest = [item for item in argv[1:] if item not in SHELL_FLAGS]
+    # Asking for the prompt too is asking for two modes, not giving a command:
+    # the session wins the dispatch, so `--prompt`/`--allow-prompt` survive here,
+    # and the old `len(rest) > 1` told the operator their command conflicts when
+    # there is no command. Name the real conflict instead.
+    if any(item in ("--prompt", "--allow-prompt") for item in rest):
+        sys.stderr.write(MODES_ARE_EXCLUSIVE)
+        raise SystemExit(2)
     if not rest or rest[0].startswith("-"):
         sys.stderr.write(LAB_TARGET_IS_NOT_AN_ADDRESS)
         raise SystemExit(2)
@@ -3230,6 +3287,17 @@ _PROMPT_IS_NOT_ONE_COMMAND = (
     "command and exits, and is what a demonstration in front of someone watching "
     "uses. --prompt asks for the commands a line at a time instead and runs each one "
     "through that same form. Drop whichever of the two you did not mean."
+)
+
+#: Said when both --prompt and --shell are asked for at once. The real conflict
+#: is two modes, not a command: --shell wins the dispatch, so its old
+#: command-on-the-line refusal fired here and named something that was not there.
+_MODES_ARE_EXCLUSIVE = (
+    "--prompt and --shell are two different modes, and this file runs one at a time. "
+    "--shell holds a shell open on the target and runs the lines you type in it, one "
+    "after another, keeping their state; --prompt runs one command per line and holds "
+    "nothing between lines. You asked for both -- there is no command here, there are "
+    "two modes. Drop whichever of the two you did not mean, with its --allow- flag."
 )
 
 
@@ -3398,16 +3466,23 @@ def _prompt_opening(plan: dict[str, Any] | None) -> str:
                 "nothing to type into it;",
                 "* no job control, no signals, and nothing here can stop a command "
                 "once it has been sent;",
+                "* only standard output comes back: a command that fails, one that "
+                "is denied permission, and one that printed nothing all look the same "
+                "here -- an empty block -- so to tell them apart add `2>&1` to a line "
+                "to bring its error output back, or `; echo $?` to see whether it "
+                "succeeded;",
                 "* no line editing and no history.",
             )
         )
         + "\n\n"
         + _filled(
-            "`cd` is simulated, and simulated here rather than on the target: this "
-            "prompt remembers the directory and prefixes `cd <dir> && ` to each "
-            "line, which needs a shell on the other end of the weakness. The prompt "
-            "shows `.` for whatever directory the weakness itself runs in, and `cd` "
-            "with no argument returns to it."
+            "`cd` is tracked here, not run on the target as a lasting change: this "
+            "prompt remembers the directory and prefixes `cd <dir> && ` to each line, "
+            "which needs a shell on the other end of the weakness. When you type one "
+            "it is checked against the target first, so a directory that is not there "
+            "or cannot be entered is said and not tracked, rather than silently "
+            "breaking every line after it. The prompt shows `.` for whatever directory "
+            "the weakness itself runs in, and `cd` with no argument returns to it."
         )
         + "\n\n"
         + _filled(
@@ -3686,6 +3761,7 @@ def _prompt_block(plan: dict[str, Any] | None, proved: bool = False) -> str:
             "@@ONE_COMMAND@@",
             _python_text(_filled(_PROMPT_IS_NOT_ONE_COMMAND, width=76)),
         )
+        .replace("@@MODES@@", _python_text(_filled(_MODES_ARE_EXCLUSIVE, width=76)))
         .replace("@@OPENING@@", _python_text(_prompt_opening(plan)))
         .replace("@@CHANNEL@@", "\n        env=_prompt_child_env()," if proved else "")
     )
