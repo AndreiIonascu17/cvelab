@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -611,6 +612,320 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
         self.assertIn("no remote mode", complained)
 
 
+class TheSessionHoldsStateTests(unittest.TestCase):
+    """`--shell`, measured against a target that really runs what it is sent.
+
+    The session rides the one-command form the prompt rides and is gated the
+    same way by `field.prompt_standing`, so the shapes held here are the ones
+    that would let it drift from the prompt or from what it claims: it is
+    offered on exactly the labs the prompt is and never without the prompt, it
+    refuses on the same flag discipline, the marker that tells the held shell's
+    answer from the product's echo is made at runtime and never in the file,
+    and -- the part that is its own, and the whole reason it was built rather
+    than a connect-back -- a shell is held open on the target whose state is
+    real and torn down when the session ends.
+
+    The prompt's stub echoes a canned line, which is all the prompt needs; the
+    session needs a target that really runs what it is sent, because a held
+    shell is a real process reading a real fifo. So these run against
+    `executing_stub`, whose command route runs the delivered command in a
+    `/bin/sh` on the test host -- which is where the held shell then lives, and
+    where teardown is checked to have removed it.
+    """
+
+    def plan(self, **extra: object) -> dict:
+        held = {
+            "cve": "CVE-2026-0001",
+            "lab_type": "SOURCE_REPRODUCTION",
+            "repository": "https://example.invalid/p.git",
+            "exploit_contract": contract(),
+            "fidelity": {"simulated_components": ["an adapter over the helper"]},
+        }
+        held.update(extra)
+        return held
+
+    def artifact(self, **extra: object) -> str:
+        return field.emit_poc(
+            "CVE-2026-0001", self.plan(**extra),
+            FIXTURE.read_text(encoding="utf-8"),
+            {"shipped": False, "reason": "nothing was proved against one instance"},
+        )
+
+    def ran(
+        self, text: str, *argv: str, typed: str = "", port: str = "", env: dict | None = None
+    ) -> tuple[str, str, int]:
+        environment = dict(os.environ)
+        for name in ("CVELAB_MANUAL_ACTION", "CVELAB_TARGET", "CVELAB_BOUND"):
+            environment.pop(name, None)
+        if port:
+            environment["CVELAB_FIXTURE_PORT"] = port
+        if env:
+            environment.update(env)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / field.POC_NAME
+            path.write_text(text, encoding="utf-8")
+            finished = subprocess.run(
+                [sys.executable, str(path), *argv], input=typed,
+                capture_output=True, text=True, timeout=120, env=environment,
+            )
+        return finished.stdout, finished.stderr, finished.returncode
+
+    def test_the_session_is_offered_wherever_the_prompt_is(self) -> None:
+        """Offered on exactly the labs the prompt is, and never without it.
+
+        All four shapes the prompt's own gate turns on -- a port and a validator
+        that reads the command -- because the session shares that gate, so fixing
+        either to a smaller set of labs than the other is how the two would come
+        apart. The session is checked to appear with the prompt's two flags and
+        with neither on its own.
+        """
+        able = FIXTURE.read_text(encoding="utf-8")
+        unable = "# CVELAB_MANUAL_ACTION CVELAB_TARGET exploit verify\n"
+        shapes = {
+            ("port", "implements"): (8080, able, True),
+            ("port", "refuses"): (8080, unable, False),
+            ("no port", "implements"): (None, able, False),
+            ("no port", "refuses"): (None, unable, False),
+        }
+        for (has_port, reads), (port, validator, expected) in shapes.items():
+            with self.subTest(port=has_port, validator=reads):
+                plan = self.plan(
+                    exploit_contract=contract(service_port=port) if port else None
+                )
+                self.assertIs(field.prompt_standing(plan, validator)[0], expected)
+                text = field.emit_poc("CVE-2026-0001", plan, validator, None)
+                self.assertIs("--shell" in text, expected)
+                self.assertIs("--allow-shell" in text, expected)
+                # Never one without the other: the session cannot reach a lab
+                # the prompt did not, because one function gates both.
+                self.assertIs("--shell" in text, "--prompt" in text)
+
+    def _shell_namespace(self) -> dict:
+        """The mode's own functions, exec'd from the emitted upper half.
+
+        So the bytes asserted on are the ones a delivery really puts on the
+        wire, built by the emitted `_shell_start`/`_shell_line`/`_shell_teardown`
+        -- not a restatement of how they are spelled. `_prompt_run` and
+        `_shell_marker` are the two seams a test replaces: one to capture the
+        command without running it, the other to make the markers known.
+        """
+        upper = self.artifact().split(field.POC_LAB_MODE_MARKER, 1)[0]
+        namespace: dict = {}
+        exec(compile(upper, field.POC_NAME, "exec"), namespace)  # noqa: S102
+        return namespace
+
+    def test_the_emission_is_pure(self) -> None:
+        """20 emissions are one text: the marker is made at runtime, not here, so
+        the two writers can still agree byte for byte."""
+        texts = {self.artifact() for _ in range(20)}
+        self.assertEqual(len(texts), 1)
+        self.assertIn("secrets.token_hex", texts.pop())
+
+    def test_no_delivery_line_carries_the_marker_join(self) -> None:
+        """The property the marker exists for, asserted over the actual bytes.
+
+        Every line the mode writes -- the holder from `_shell_start`, the typed
+        line from `_shell_line`, the teardown -- is captured, and the JOIN of
+        each marker pair is shown to be absent from all of them while each half
+        is present. A hex half holds nothing `shlex.quote` quotes, so the halves
+        are single-quoted by hand; if that regressed to `shlex.quote(a) +
+        shlex.quote(b)` the bare join would ride every line and this would fail.
+        A product that only reflects the line it was handed is then fed back
+        through `_shell_cut`, which finds no join and cuts to nothing -- so an
+        echo cannot forge a landing, which is the whole point.
+        """
+        namespace = self._shell_namespace()
+        pairs = {
+            "holder-start": ("1111aaaa", "2222bbbb"),
+            "holder-end": ("3333cccc", "4444dddd"),
+            "line-start": ("5555eeee", "6666ffff"),
+            "line-end": ("7777aaaa", "8888bbbb"),
+        }
+        halves = iter([pairs["holder-start"], pairs["holder-end"],
+                       pairs["line-start"], pairs["line-end"]])
+        namespace["_shell_marker"] = lambda: next(halves)
+        captured: list[str] = []
+
+        def answer(address: str, command: str):
+            # Reply just enough for each step to proceed to the next, so every
+            # wire line the mode builds is captured: the write (carries the line
+            # markers), the read (carries the end half), the holder and the
+            # teardown. The JOINS appear only in these replies, never in the
+            # commands -- which is exactly what is asserted below.
+            captured.append(command)
+            hs, he = ("".join(pairs["holder-start"]), "".join(pairs["holder-end"]))
+            ls, le = ("".join(pairs["line-start"]), "".join(pairs["line-end"]))
+            out = ""
+            if "CVELAB_HELD" in command:
+                out = f"x {hs}\nCVELAB_HELD 4321\n{he} y"
+            elif "CVELAB_SENT" in command:
+                out = "CVELAB_SENT\n"
+            elif "grep -q" in command:
+                out = f"p {ls}\nuid=0(root)\n{le} q"
+            return type("_D", (), {"returncode": 0, "stdout": out, "stderr": ""})()
+
+        namespace["_prompt_run"] = answer
+        standing, pgid, _ = namespace["_shell_start"]("10.0.0.9:8080", "deadbeef")
+        self.assertEqual((standing, pgid), ("held", "4321"))
+        namespace["_shell_line"]("10.0.0.9:8080", "deadbeef", "whoami", False)
+        namespace["_shell_teardown"]("10.0.0.9:8080", "deadbeef", pgid)
+
+        # Every captured wire line: no marker JOIN anywhere.
+        for command in captured:
+            for name, (first, second) in pairs.items():
+                self.assertNotIn(
+                    first + second, command,
+                    f"{name} join rode the wire in: {command}",
+                )
+            # And a pure reflection of each line cuts to nothing under every pair.
+            for first, second in pairs.values():
+                self.assertIsNone(
+                    namespace["_shell_cut"](command, first + second, first + second)
+                )
+        joined = "\n".join(captured)
+        for first, second in pairs.values():  # the halves are present somewhere
+            self.assertIn(first, joined)
+            self.assertIn(second, joined)
+        self.assertTrue(any("deadbeef" in c and "kill -KILL" in c for c in captured))
+
+    def test_the_cut_still_finds_genuinely_executed_output(self) -> None:
+        """The other half of the pin: a real response, where the held shell did
+        run the echoes, cuts to the command's own output between the joins."""
+        namespace = self._shell_namespace()
+        start, end = "aaaabbbbccccdddd", "eeeeffff00001111"
+        response = (
+            '{"body": "<pre>' + start + "\\nuid=0(root)\\n" + end + '</pre>"}\n'
+            "the following is the command's output:\n"
+            + start + "\nuid=0(root)\n" + end + "\nREPRODUCED\n"
+        )
+        self.assertEqual(namespace["_shell_cut"](response, start, end), "uid=0(root)")
+
+    def test_a_held_shell_is_one_process_whose_state_survives(self) -> None:
+        """One shell across lines, an export that lasts, a `cd` that is real.
+
+        The three claims the word "session" makes, against a target that really
+        runs the lines: the process id is the same on every line, a variable
+        exported on one line is read on a later one, and `cd` changes the
+        directory on the target rather than being tracked here -- which `pwd`
+        on the next line proves.
+        """
+        with executing_stub() as (address, _):
+            said, err, code = self.ran(
+                self.artifact(), address, "--shell", "--allow-shell",
+                typed=(
+                    "echo PID=$$\n"
+                    "export HELD=survives_the_line\n"
+                    "echo HELD=$HELD again_PID=$$\n"
+                    "cd /\n"
+                    "pwd; echo last_PID=$$\n"
+                    "exit\n"
+                ),
+                port=address.rsplit(":", 1)[1],
+            )
+        self.assertEqual(code, 0, err)
+        pids = re.findall(r"PID=(\d+)", said)
+        self.assertTrue(pids, said)
+        self.assertEqual(len(set(pids)), 1, "the shell was not one process: " + said)
+        self.assertIn("HELD=survives_the_line", said)
+        # `cd /` was real: pwd on the next line is the root, not the directory
+        # the first line ran in.
+        self.assertIn("/\n", said.split("last_PID=")[0][-4:] or said)
+        self.assertIn("torn down", err)
+        # The per-line prompt is chrome for a terminal: on this pipe it is
+        # withheld, the way the prompt mode's is, so the captured transcript is
+        # not one line of repeated `shell$`. The held and teardown lines, which
+        # are evidence, are still there.
+        self.assertNotIn("shell$", err)
+        self.assertIn("held: a detached shell is running", err)
+
+    def test_leaving_removes_the_files_and_kills_the_process(self) -> None:
+        """Teardown shown rather than asserted: the files and the held shell are
+        gone from the test host, where `executing_stub` ran them."""
+        with executing_stub() as (address, _):
+            _, err, code = self.ran(
+                self.artifact(), address, "--shell", "--allow-shell",
+                typed="echo up\nexit\n", port=address.rsplit(":", 1)[1],
+            )
+        self.assertEqual(code, 0, err)
+        found = re.search(r"/tmp/([0-9a-f]+)_in", err)
+        self.assertIsNotNone(found, err)
+        run = found.group(1)
+        self.assertFalse(Path(f"/tmp/{run}_in").exists())
+        self.assertFalse(Path(f"/tmp/{run}_out").exists())
+        live = subprocess.run(
+            ["pgrep", "-f", f"tail -n +1 -f /tmp/{run}_in"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(live.stdout.strip(), "", "a holder process was left running")
+
+    def test_a_session_without_its_flag_starts_nothing(self) -> None:
+        text = self.artifact()
+        _, complained, code = self.ran(text, "127.0.0.1:1", "--shell")
+        self.assertEqual(code, 2)
+        self.assertIn("--allow-shell", complained)
+        self.assertNotIn("held:", complained)
+
+    def test_a_session_and_a_command_on_the_line_are_different_jobs(self) -> None:
+        _, complained, code = self.ran(
+            self.artifact(), "127.0.0.1:1", "id", "--shell", "--allow-shell"
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("different jobs", complained)
+
+    def test_a_lab_that_declares_no_port_is_offered_no_session(self) -> None:
+        text = self.artifact(exploit_contract=None)
+        self.assertNotIn("--shell", text)
+        self.assertNotIn("--allow-shell", text)
+
+    def test_the_cause_is_named_when_the_shell_cannot_be_held(self) -> None:
+        """A failure the mode tells apart from the weakness not running.
+
+        Two kinds, both proved here. A target whose image cannot hold the shell
+        -- here a `/bin/sh` with no `tail` on its PATH -- is told from the
+        weakness by name, and nothing is left running. A route that does not
+        answer at all -- a port nothing serves -- is told as the delivery not
+        running, because that is a fact about the route and not about whether
+        a shell could be held.
+        """
+        with executing_stub(env={"PATH": "/nonexistent"}) as (address, _):
+            _, err, code = self.ran(
+                self.artifact(), address, "--shell", "--allow-shell",
+                typed="echo hi\nexit\n", port=address.rsplit(":", 1)[1],
+            )
+        self.assertEqual(code, 2)
+        self.assertIn("no `tail`", err)
+        self.assertIn("Nothing was left running", err)
+
+        _, dead, gone = self.ran(
+            self.artifact(), "127.0.0.1:1", "--shell", "--allow-shell",
+            typed="echo hi\nexit\n", port="1",
+        )
+        self.assertEqual(gone, 2)
+        self.assertIn("the delivery that would have started the shell did not run", dead)
+
+    def test_a_reflecting_product_is_not_reported_as_a_missing_tail(self) -> None:
+        """The holder command names the causes (`CVELAB_NO_TAIL` and the rest),
+        so a product that only reflects the line it was sent would, if the join
+        rode the wire, cut clean and hand back a cause it never ran. With the
+        halves quoted apart the cut finds no join, so a reflection is the honest
+        "the delivery did not run" and never a false fact about the target's
+        image.
+        """
+        namespace = self._shell_namespace()
+
+        class _Echo:
+            returncode = 0
+
+            def __init__(self, command: str) -> None:
+                self.stdout = command
+                self.stderr = ""
+
+        namespace["_prompt_run"] = lambda address, command: _Echo(command)
+        standing, detail, _ = namespace["_shell_start"]("10.0.0.9:8080", "deadbeef")
+        self.assertEqual(standing, "failed")
+        self.assertIsNone(detail)
+
+
 class TheGenerationContractSaysSoTests(unittest.TestCase):
     """What the three prompts are required to carry, in the words they use."""
 
@@ -1158,6 +1473,76 @@ class _Serving:
 
 def stub(seeded: bool) -> _Serving:
     return _Serving(seeded)
+
+
+class _Target(BaseHTTPRequestHandler):
+    """A product whose command route actually runs the command it is sent.
+
+    The prompt's `_Product` echoes a canned line, which is all the prompt needs.
+    The session needs a target that really runs what it is handed, because a
+    held shell is a real process reading a real fifo: the holder, the `tail`,
+    the `sh -i` and the two files all live on the test host, which is where the
+    session's own claims and its teardown are then measured. `env` lets a test
+    run the delivered command in a stripped environment -- a PATH without `tail`
+    -- to drive the mode's own "cannot be held" report.
+    """
+
+    env: dict | None = None
+
+    def log_message(self, *_: object) -> None:
+        pass
+
+    def _ok(self, body: str, status: int = 200, cookie: bool = False) -> None:
+        raw = body.encode("utf-8")
+        self.send_response(status)
+        if cookie:
+            self.send_header("Set-Cookie", "sid=lab-session; Path=/")
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(length)
+        self._ok("ok", cookie=True)
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path != "/run":
+            self._ok("not found", status=404)
+            return
+        command = (parse_qs(parsed.query).get("cmd") or [""])[0]
+        done = subprocess.run(
+            ["/bin/sh", "-c", command], capture_output=True, text=True,
+            timeout=30, env=(type(self).env or None),
+        )
+        # "shell-ran" is what the fixture's one-command form reads as the
+        # weakness having run, so the session's delivery gets a zero exit and
+        # its stdout back; the command's real output rides after it.
+        self._ok("shell-ran " + done.stdout)
+
+
+class _ServingTarget:
+    def __init__(self, env: dict | None) -> None:
+        self.env = env
+
+    def __enter__(self) -> tuple[str, list]:
+        handler = type("_BoundTarget", (_Target,), {"env": self.env})
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.server.server_address[:2]
+        return f"{host}:{port}", []
+
+    def __exit__(self, *_: object) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+
+def executing_stub(env: dict | None = None) -> _ServingTarget:
+    return _ServingTarget(env)
 
 
 def run_fixture(

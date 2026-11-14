@@ -36,6 +36,7 @@ from .core import (
 # to collide case-insensitively and declaring them in two modules is exactly
 # how that happened. The comment on that block is the whole account.
 from .field import (
+    _SHELL_CEILING,
     LAB_POC_GUIDE_NAME,
     LEGACY_MANUAL_POC_NAMES,
     POC_NAME,
@@ -435,6 +436,33 @@ mode here asks; without the flag nothing is sent. `{POC_NAME}` says all of this
 again at the prompt, before the first line, together with whose route answers
 the commands."""
 
+#: The session, said in the same document and gated the same way: whenever there
+#: is a prompt there is a session, because `field.prompt_standing` decides both
+#: and the session rides the prompt's own delivery. Still an invocation and not
+#: a third mode -- the same lab program, held open -- so "one script, two modes"
+#: stays true. The four costs the mode had to be built around are each named,
+#: because a reader deciding whether to run it against a client's host decides on
+#: those: it is a session and not a route; it writes two files and leaves a
+#: process on the target until teardown; it is a poll and not a stream; and while
+#: a line runs the product is held only for each short read, so a slow line does
+#: not take the target down, but a line past the ceiling is reported unfinished.
+_SHELL_IS_A_SESSION = f"""A session, and still not a route. The same delivery, run line after line into
+a shell held open on the target, so an export or a `cd` on one line is still
+there on the next -- real state, and on the target. It exists only because this
+lab's weakness carries it, so it proves what the weakness proves and nothing
+about reaching that host any other way. Holding it writes two files on the
+target and leaves a detached process running until you leave, so leaving tears
+that down -- the shell is killed and both files removed -- and the two paths are
+named before the first line so you can audit them. The shell is detached and the
+waiting is done at your end, so while a line runs the product is held only for
+each short read and keeps answering -- a line that takes ten seconds does not
+take the target down for ten seconds, which a single blocking request would --
+but after about {_SHELL_CEILING} seconds a line is reported unfinished, though it
+may still be running there. It asks for `--allow-shell` because holding a shell
+open is more than any other mode here does; without the flag nothing is started.
+`{POC_NAME}` says all of this again, with the two paths, before the first
+line."""
+
 #: Where the lines go, which the lab's own standing decides and not the
 #: address: `field.takes_lab_address` is the predicate, the same one the
 #: sections above are keyed on, so the document cannot describe one
@@ -502,12 +530,14 @@ instead of the Compose network. Where you point it is yours to answer for --
 only a host your engagement authorizes.""",
     (False, True): f"""`{POC_NAME}` takes no argument for
 lab mode, one address for remote mode, and that address with `--prompt
---allow-prompt` for a prompt that runs the lab program once per line. Where you
-point either is yours to answer for -- only a host your engagement authorizes.""",
+--allow-prompt` for a prompt that runs the lab program once per line, or with
+`--shell --allow-shell` for a session that holds it open. Where you point either
+is yours to answer for -- only a host your engagement authorizes.""",
     (True, True): f"""`{POC_NAME}` takes no argument
 for lab mode, one address, which runs that same lab program against a host
 instead of the Compose network, and that address with `--prompt --allow-prompt`
-for a prompt that runs it once per line. Where you point it is yours to answer
+for a prompt that runs it once per line, or `--shell --allow-shell` for a session
+that holds it open. Where you point it is yours to answer
 for -- only a host your engagement authorizes.""",
 }
 
@@ -1218,6 +1248,16 @@ python3 {POC_NAME} "$(bash manual.sh address vulnerable)" --prompt --allow-promp
 {_PROMPT_IS_NOT_A_SESSION}
 
 {_PROMPT_REACHES[lab_at_an_address]}
+
+## And a session?
+
+Yes -- the same lab program again, held open instead of run once per line.
+
+```bash
+python3 {POC_NAME} "$(bash manual.sh address vulnerable)" --shell --allow-shell
+```
+
+{_SHELL_IS_A_SESSION}
 
 '''
         elif reason:

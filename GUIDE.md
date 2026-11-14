@@ -1078,13 +1078,39 @@ anything about the address:
 | `python3 PoC.py <address>`, lab with a proved remote mode | one instance whose address you supply | yes: this is what `cvelab manual` proves |
 | `python3 PoC.py <address>`, lab with a published port and no proved remote mode | whatever is at that address, over this lab's own route | no, and the file says so in its output -- the route is a constant in the lab program, so a negative verdict is a finding about the route |
 | `python3 PoC.py <address>`, lab with neither | nothing; it prints the recorded reason and exits 2 | not applicable |
+| `python3 PoC.py <address> --prompt --allow-prompt`, lab with a published port and a validator that reads a command | the same lab program, run once per line against that address | no -- it is the lab program again, not a mode proved against an instance |
+| `python3 PoC.py <address> --shell --allow-shell`, same labs as the prompt | the same lab program, held open so state persists across the lines you type | no, and for the same reason |
 
-Either of the two that sends anything can be pointed at a server you did not
-build yourself, and only the first of them was proved against one. Most labs
-are the last row -- the effect is often not observable from outside the process
-at all. The second is the one to read carefully: a verdict from it is about
-whether this lab's route is served there, and "not affected" is a claim it
-cannot carry.
+Any of these that sends anything can be pointed at a server you did not build
+yourself, and only the proved remote mode -- the second row -- was proved against
+one. Most labs are the fourth row -- the effect is often not observable from
+outside the process at all. The rows that reach a host over this lab's own route
+-- the third, and the prompt and session below it -- are the ones to read
+carefully: a verdict from them is about whether this lab's route is served there,
+and "not affected" is a claim they cannot carry.
+
+The last two rows are the prompt and the session, not a third mode: each is the
+lab program again -- the same one-command form, reached at an address -- so "one
+script, two modes" still holds. They are offered only where the lab has what
+they need: a published port and a validator that reads a command as its second
+positional. That is a small set (in the archive, three labs of a few hundred,
+plus the generated demo), not the common case; a lab without it carries neither
+flag and says why. (This held session is `--shell`; it is unrelated to the SSH
+and SMB protocol sessions a spec can declare, above.) Both ask for their own
+`--allow-` flag because each does more than a single request: the prompt runs
+whatever you type for as long as you keep typing, and the session leaves a shell
+running on the target until you end it.
+
+The **prompt** runs one command per line and holds nothing between lines -- an
+export, a `cd`, an unlocked key is gone with the line that set it -- and each
+line is synchronous, so the product is busy until that command returns. The
+**session** holds a shell open on the target instead, so state is real and
+persists across lines; its costs, which it also prints before the first line, are
+three: it writes two files and leaves a process running until you leave, when it
+tears that down and names the paths; while a line runs the product stays up,
+because the waiting is polled from your end and not on the target; and a line
+that outlasts the ceiling (about 12 seconds) is reported unfinished, though it may
+still be running there.
 
 `LAB-POC.md` is written for every validated lab and says which case this lab
 is, under "Can this be pointed at a live instance?":

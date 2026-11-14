@@ -1911,10 +1911,49 @@ class ThePromptTests(unittest.TestCase):
             ["ran cd /srv && pwd", "ran pwd"],
         )
 
-    def test_the_prompt_says_the_directory_is_simulated(self) -> None:
-        done = self.prompted("cd /srv\n")
-        self.assertIn("[cd simulated] .$", done.stderr)
-        self.assertIn("[cd simulated] /srv$", done.stderr)
+    def test_the_per_line_prompt_is_withheld_on_a_pipe(self) -> None:
+        """Chrome a terminal needs and a transcript does not.
+
+        With stdin on a pipe -- which is how an operator captures the transcript
+        they paste into a report -- the per-line prompt is not written, so it
+        does not repeat down the one line that gets pasted. What is evidence
+        stays whatever stdin is: the opening still explains that `cd` is
+        simulated, and `cd` is still tracked (the command the next line sends
+        carries the prefix), which the tracking test holds separately.
+        """
+        done = self.prompted("cd /srv\npwd\n")
+        self.assertNotIn("[cd simulated]", done.stderr)
+        self.assertIn("is simulated, and simulated here", " ".join(done.stderr.split()))
+
+    def test_the_per_line_prompt_is_written_at_a_terminal(self) -> None:
+        """Shown rather than asserted: driven through a pty, the prompt appears.
+
+        The same input a pipe gets no prompt for gets one per line here, with
+        the simulated directory it tracks -- `.` before `cd /srv`, `/srv` after.
+        """
+        out, err = self._prompted_through_a_tty("cd /srv\nexit\n")
+        self.assertIn("[cd simulated] .$", err)
+        self.assertIn("[cd simulated] /srv$", err)
+
+    def _prompted_through_a_tty(self, typed: str) -> tuple[str, str]:
+        pty = __import__("pty")
+        text = self.artifact()
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / field.POC_NAME
+            path.write_text(text, encoding="utf-8")
+            parent, child = pty.openpty()
+            proc = subprocess.Popen(
+                [sys.executable, str(path), self.LOCAL, "--prompt", "--allow-prompt"],
+                stdin=child, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env={"PATH": os.environ["PATH"]},
+            )
+            os.close(child)
+            os.write(parent, typed.encode())
+            try:
+                out, err = proc.communicate(timeout=120)
+            finally:
+                os.close(parent)
+        return out, err
 
     def test_an_empty_line_sends_nothing_and_exit_leaves(self) -> None:
         for typed in ("exit\n", "quit\n", "\n\n\n", ""):
@@ -2080,9 +2119,15 @@ class ThePromptTests(unittest.TestCase):
         line it sends -- the route is a constant in the lab program and that
         host does not serve it -- and "the command did not run" is the line
         an operator reads as "no command execution here". So the statement is
-        printed once before the first line, the marker says NOT-THIS-LAB in
-        front of every line, and every line that does not run says it again.
-        Nothing is refused: where this is pointed is the operator's to decide.
+        printed once before the first line, the `NOT-THIS-LAB <addr>` marker is
+        written in front of every line, and every line that does not run says it
+        again. Nothing is refused: where this is pointed is the operator's to
+        decide.
+
+        The marker is evidence, not the prompt chrome it used to ride: on this
+        pipe -- which is how a transcript is captured for a report -- the prompt
+        is withheld but the marker is still written, once per line, on its own
+        line. At a terminal it rides the prompt instead, so it is not doubled.
         """
         done = self.prompted("boom\nid\n", where="10.0.0.5:8080")
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -2093,7 +2138,10 @@ class ThePromptTests(unittest.TestCase):
             "WHAT WAS SENT, AND WHAT A NEGATIVE VERDICT DOES NOT MEAN", said
         )
         self.assertIn('"Not affected" is a claim this run cannot carry', said)
+        # The marker is on its own line, per line, even on this pipe; the prompt
+        # chrome is not (the simulated-cwd prompt is withheld with stdin piped).
         self.assertEqual(done.stderr.count("NOT-THIS-LAB 10.0.0.5:8080"), 3)
+        self.assertNotIn("[cd simulated]", done.stderr)
         self.assertIn("the command did not run", done.stderr)
         self.assertIn(
             "this address is not this lab's, so a line that does not run is",
