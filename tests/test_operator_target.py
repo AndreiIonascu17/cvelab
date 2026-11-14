@@ -576,10 +576,13 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
                 self.artifact(), address, "--prompt", "--allow-prompt",
                 typed="cd /srv\nls\n", port=address.rsplit(":", 1)[1],
             )
-        self.assertEqual(
-            [query.get("cmd") for path, query in asked if path == "/run"],
-            [["cd /srv && ls"]],
-        )
+        cmds = [query.get("cmd") for path, query in asked if path == "/run"]
+        # `cd /srv` now probes the target before tracking -- `cd /srv && printf
+        # <token>` -- and the stub echoes the token back, so the move takes; the
+        # typed `ls` then rides the tracked prefix.
+        self.assertEqual(len(cmds), 2, cmds)
+        self.assertTrue(cmds[0][0].startswith("cd /srv && printf "), cmds[0])
+        self.assertEqual(cmds[1], ["cd /srv && ls"])
 
     def test_the_no_argument_path_is_unchanged_with_the_prompt_in_the_file(self) -> None:
         """The path every proof rests on, measured with the mode present."""
@@ -610,6 +613,43 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
         _, complained, code = self.ran(text, "--prompt", "--allow-prompt")
         self.assertEqual(code, 2)
         self.assertIn("no remote mode", complained)
+
+    def test_a_cd_that_is_not_there_is_caught_and_not_tracked(self) -> None:
+        """A cd to a directory the target does not have is said, not tracked.
+
+        Against a product that answers a failing command with an empty block --
+        `executing_stub` runs the line and hands back whatever it printed, which
+        is nothing when the directory is not there -- the old code advanced the
+        tracked cwd blindly and every later line went out `cd <gone> && ...` and
+        came back empty, silently. Now a cd is probed first: `cd /tmp` takes, so
+        `pwd` reads /tmp; `cd /nowhere...` does not, so it is said and the tracked
+        directory is left at /tmp, which the `pwd` after it proves by still
+        reading /tmp rather than an empty block.
+        """
+        with executing_stub() as (address, _):
+            said, err, code = self.ran(
+                self.artifact(), address, "--prompt", "--allow-prompt",
+                typed="cd /tmp\npwd\ncd /nowhere-zzz-404\npwd\nexit\n",
+                port=address.rsplit(":", 1)[1],
+            )
+        self.assertEqual(code, 0, err)
+        self.assertGreaterEqual(said.count("/tmp"), 2, said)
+        self.assertIn("cd did not take", err)
+        self.assertIn("/nowhere-zzz-404 is not a directory on the target", err)
+
+    def test_asking_for_both_the_prompt_and_the_session_names_the_conflict(self) -> None:
+        """The mirror of the session's own check, reached when --shell is absent.
+
+        `--allow-shell` without `--shell` does not win the dispatch, so it lands
+        here in the prompt; the real conflict is two modes, not a command, and
+        the refusal says so rather than talking about a command on the line.
+        """
+        _, complained, code = self.ran(
+            self.artifact(), "127.0.0.1:1", "--prompt", "--allow-prompt", "--allow-shell",
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("two different modes", complained)
+        self.assertNotIn("command on the command line", complained)
 
 
 class TheSessionHoldsStateTests(unittest.TestCase):
@@ -871,6 +911,22 @@ class TheSessionHoldsStateTests(unittest.TestCase):
         )
         self.assertEqual(code, 2)
         self.assertIn("different jobs", complained)
+
+    def test_asking_for_both_the_session_and_the_prompt_names_the_conflict(self) -> None:
+        """Both mode flags is two modes, not a command on the line.
+
+        The session wins the dispatch, so `--prompt --allow-prompt` survive in
+        what is left; the old `len(rest) > 1` told the operator their command
+        conflicts when there was no command. The refusal now names the real
+        thing -- two modes -- and not a command on the line.
+        """
+        _, complained, code = self.ran(
+            self.artifact(), "127.0.0.1:1",
+            "--shell", "--allow-shell", "--prompt", "--allow-prompt",
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("two different modes", complained)
+        self.assertNotIn("different jobs", complained)
 
     def test_a_lab_that_declares_no_port_is_offered_no_session(self) -> None:
         text = self.artifact(exploit_contract=None)
