@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1.post1] - 2026-11-15
+
+No feature changes. Four defects in what the emitter writes, each measured
+before it was touched, and two of the tests checked against the unfixed code.
+
+### Fixed (a model's text, in places it should not reach)
+
+- A lab value no longer runs in the line `manual.sh` prints.
+  `_remote_arguments` put the input names and the values a record holds into
+  an `echo "  python3 ... --input name=value"`, and double quotes do not stop
+  a shell. Measured in a real bash: `$(id -un)` ran and printed the operator's
+  own username where the value should have been, a backtick did the same, and
+  `x" ; id -un ; echo "y` left the echo entirely and ran `id` as its own
+  command. Four characters are escaped now, the backslash first. The guide
+  prints the same text as a command to paste, where the escaped form is also
+  the correct one.
+
+- Three double quotes in a field CVELab did not write no longer cost the lab
+  its `PoC.py`. The header is a raw docstring and the plan is a model's prose;
+  the effect and the refusal reason were quoted, the facts block was not, and
+  it inserts the repository, the package names and versions, the fix commit,
+  the lab type and the scenario. Escaped once at the boundary, so a field
+  added later is covered without anyone remembering to.
+
+- A `cd` in the prompt is probed with two halves, so a product that reflects
+  the line it is handed cannot forge the move. With one token the probe's own
+  text carried the thing being looked for; the move read as having taken, and
+  every later line went out prefixed into a directory nothing had entered.
+  Three tests had that behaviour written into them as the expected one.
+
+- Re-rendering a lab whose `validator/` is not beside it no longer raises
+  `FileNotFoundError`. `validator/` is not among the documents that travel, so
+  a lab put back together from a kit has none; the read goes through the
+  fallback that takes the same bytes out of the lab's own `PoC.py`.
+
+### Added
+
+- A test that no `@@NAME@@` template placeholder survives into the artifact.
+  A missed `.replace` shipped one to an operator, with nothing looking for it.
+
+### Verified
+
+Every emitted artifact for the 110 archived labs that hold a plan and a
+validator is identical before and after the header change, to the byte: the
+escaping reaches only the case that was already broken.
+
 ## [0.7.1] - 2026-11-15
 
 ### Fixed (a shipped Compose file is topology, not data)
@@ -1515,7 +1561,8 @@ Unreleased and shipped in it; the list from the earlier, unpublished 0.6.0
 - Import ordering and a small number of lint findings were normalized across
   the package. No behavior changed.
 
-[Unreleased]: https://github.com/AndreiIonascu17/cvelab/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/AndreiIonascu17/cvelab/compare/v0.7.1.post1...HEAD
+[0.7.1.post1]: https://github.com/AndreiIonascu17/cvelab/compare/v0.7.1...v0.7.1.post1
 [0.7.1]: https://github.com/AndreiIonascu17/cvelab/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.8...v0.7.0
 [0.6.8]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.7...v0.6.8
