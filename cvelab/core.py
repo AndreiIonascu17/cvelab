@@ -950,7 +950,11 @@ def write_lab_file(path: Path, content: str) -> None:
             )
     path.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-    with os.fdopen(os.open(path, flags, 0o644), "w", encoding="utf-8", newline="\n") as handle:
+    # 0o600, not 0o644. The two files this writes are compose overrides read by
+    # `manual.sh` on the operator's own machine; nothing COPYs `artifacts/` into
+    # an image, so no container user has to read them, and a tool that writes
+    # exploit material should not leave it readable by every account on the box.
+    with os.fdopen(os.open(path, flags, 0o600), "w", encoding="utf-8", newline="\n") as handle:
         handle.write(redact(content))
 
 

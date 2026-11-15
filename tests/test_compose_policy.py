@@ -818,6 +818,23 @@ class PublishedPortTests(unittest.TestCase):
         This is the override as it was: correct `ports`, no network. If a
         Docker release ever starts publishing for an internal-only service,
         or refusing instead of discarding, this is the test that says so.
+
+        WHAT `port` IS READ FOR, AND WHY NOT THE WHOLE LINE
+
+        It pinned the exact string `:0` and fired on a release that printed
+        `invalid IP:0` for the same discarded publication -- the behaviour had
+        not changed, only the words Docker uses for "there is no address
+        here". So only the port side is read now, which is where the meaning
+        is. 0 is the absence of a publication: a release that started
+        publishing for an internal-only service would print the host port the
+        kernel assigned there, and this fails on that -- the canary's first
+        half is intact. A release that refused instead of discarding fails it
+        too, from the other direction: `up` above would not have returned 0,
+        or `port` prints no address at all and an empty port side does not
+        read 0 either. What is given up is only the host side, which has
+        already drifted once and says nothing the `ps` line below does not say
+        better: that is where "nothing is published" is read, in Docker's own
+        mapping column, whatever `port` chooses to call it.
         """
         command = self.started(
             {"services": {"vulnerable": {"ports": [f"{policy.MANUAL_BIND}::8080"]}}}
@@ -826,7 +843,8 @@ class PublishedPortTests(unittest.TestCase):
             self.resolved(command)["services"]["vulnerable"]["ports"],
             [{"mode": "ingress", "host_ip": "127.0.0.1", "target": 8080, "protocol": "tcp"}],
         )
-        self.assertEqual(self.ran(command, "port", "vulnerable", "8080").stdout.strip(), ":0")
+        published = self.ran(command, "port", "vulnerable", "8080").stdout.strip()
+        self.assertEqual(published.rsplit(":", 1)[-1], "0", published)
         self.assertNotIn("->", self.ran(command, "ps").stdout)
 
 
