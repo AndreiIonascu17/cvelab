@@ -2133,6 +2133,71 @@ class ThePromptTests(unittest.TestCase):
 
     # --- the directory it tracks ------------------------------------------
 
+    def test_three_quotes_in_a_field_cvelab_did_not_write_cannot_end_the_docstring(
+        self
+    ) -> None:
+        """The header is a docstring, and the plan is a model's prose.
+
+        The effect and the refusal reason were quoted; the facts block was
+        not, and it inserts the repository, the package names and versions,
+        the fix commit, the lab type and the scenario. Three double quotes in
+        any of them ended the docstring early -- `compile()` caught it, so
+        nothing broken was written, but the lab got no PoC.py at all.
+        Measured on a repository field: emit_poc raised
+        `unterminated string literal`.
+
+        Escaped at the boundary rather than field by field, so a field added
+        later is covered without anyone remembering to. Asserted per field,
+        because the point is that none of them is the one that was missed.
+        """
+        for field_name, value in (
+            ("repository", 'https://example.invalid/p.git"""import os;os.system("id")#'),
+            ("lab_type", 'SOURCE"""'),
+            ("scenario", 'default"""'),
+        ):
+            with self.subTest(field=field_name):
+                plan = dict(self.PLAN)
+                plan[field_name] = value
+                text = field.emit_poc(
+                    "CVE-2026-0001", plan, self.LAB, dict(self.REFUSED)
+                )
+                # It emitted at all, and the three quotes are three single
+                # ones, so what the model wrote is prose and not code.
+                self.assertNotIn('"""import os', text)
+                self.assertNotIn('"""', text.partition('r"""')[2].partition('"""\n')[0])
+                compile(  # noqa: S102
+                    text.partition(field.POC_LAB_MODE_MARKER)[0], field.POC_NAME, "exec"
+                )
+
+        # And the revisions and releases, which are nested rather than flat.
+        plan = dict(self.PLAN)
+        plan["revisions"] = {"vulnerable": "a" * 40, "patched": 'b"""import os'}
+        text = field.emit_poc("CVE-2026-0001", plan, self.LAB, dict(self.REFUSED))
+        self.assertNotIn('"""import os', text)
+        compile(  # noqa: S102
+            text.partition(field.POC_LAB_MODE_MARKER)[0], field.POC_NAME, "exec"
+        )
+
+    def test_no_template_placeholder_survives_into_the_artifact(self) -> None:
+        """What a missed `.replace` leaves behind, looked for on the artifact.
+
+        The templates are rendered by name substitution, so a placeholder
+        whose replacement is forgotten ships as `@@NAME@@` in the file an
+        operator reads -- and the existing check for this looks for `__` on
+        the kit rather than for these on PoC.py. Every standing is emitted,
+        because which placeholders are reached depends on which branches the
+        record takes.
+        """
+        shapes = {
+            "refused": dict(self.REFUSED),
+            "no record": {},
+        }
+        for label, record in shapes.items():
+            with self.subTest(standing=label):
+                text = field.emit_poc("CVE-2026-0001", self.PLAN, self.LAB, record)
+                left = sorted(set(re.findall(r"@@[A-Z_]+@@", text)))
+                self.assertEqual(left, [], f"{label}: {left}")
+
     def test_the_directory_it_tracks_is_arithmetic_on_this_side(self) -> None:
         """The chain, read off the emitted function rather than off a target.
 
