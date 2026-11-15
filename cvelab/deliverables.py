@@ -47,6 +47,7 @@ from .field import (
     POC_REFUSED,
     POC_SHIPPED,
     _executes,
+    _lab_validator,
     emit_poc,
     poc_record,
     poc_standing,
@@ -1587,7 +1588,13 @@ def create_deliverables(
     # built with no model configured never reaches the other -- and it is also
     # what re-renders an archived lab, which is why the record is read back
     # rather than taken from this run's report alone.
-    validator = (lab_dir / "validator" / "validator.py").read_text(encoding="utf-8")
+    # Through field's reader rather than straight off the path: a lab
+    # re-rendered from a kit has no validator/ -- it is not among the
+    # documents that travel -- and _lab_validator falls back to the lab mode
+    # the lab's own PoC.py already carries, which is the same bytes. Read
+    # directly, this line raised FileNotFoundError on exactly the labs this
+    # pass exists to re-render.
+    validator = _lab_validator(lab_dir)
     record = poc_record(lab_dir, report)
     poc_path = artifacts / POC_NAME
     write_text(poc_path, emit_poc(cve, plan, validator, record))

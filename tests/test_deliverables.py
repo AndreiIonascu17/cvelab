@@ -1087,6 +1087,31 @@ class TheGateReadsTheComputedVerdictTests(unittest.TestCase):
     #: none of these and reported success.
     KIT = ("PoC.py", "manual.sh", LAB_POC_GUIDE_NAME, "REPORT.md", "WALKTHROUGH.md", "EVIDENCE.json")
 
+    def test_a_lab_re_rendered_without_its_validator_directory_still_ships(self) -> None:
+        """The pass that re-renders an archive is the one that meets this.
+
+        `validator/` is not among the documents that travel, so a lab put back
+        together from a kit has none -- and this pass read the file straight
+        off that path, which raised FileNotFoundError on exactly those labs.
+        It reads through `field._lab_validator` now, which falls back to the
+        lab mode the lab's own PoC.py already carries: the same bytes, since
+        that half is a copy of the validator.
+
+        Asserted by rendering once with the directory, taking the artifact
+        away from the lab, deleting the directory and rendering again: the
+        artifact that comes back is the one that went in.
+        """
+        lab = self.lab()
+        create_deliverables(self.CVE, lab, self.result())
+        first = (lab / "artifacts" / "PoC.py").read_text(encoding="utf-8")
+        self.assertIn(field.POC_LAB_MODE_MARKER, first)
+
+        shutil.rmtree(lab / "validator")
+        create_deliverables(self.CVE, lab, self.result())
+        self.assertEqual(
+            (lab / "artifacts" / "PoC.py").read_text(encoding="utf-8"), first
+        )
+
     def test_a_validated_lab_that_labelled_itself_otherwise_still_ships(self) -> None:
         for label in self.LABELS:
             with self.subTest(proof_quality=label):

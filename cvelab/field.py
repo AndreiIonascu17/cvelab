@@ -4757,11 +4757,19 @@ def _poc_header(
         body = _remote_mode_note(
             cve, spec, plan, int(record.get("container_port") or 0), filename
         )
+    # One guard at the boundary rather than one per field. The pieces above
+    # carry text CVELab did not write -- the drafter's effect and reason are
+    # quoted already, but the facts block alone inserts the repository, the
+    # package names and versions, the fix commit, the lab type and the
+    # scenario, and `modes` and `body` insert more. Three double quotes in any
+    # of them ends this docstring early: `compile()` in emit_poc catches it, so
+    # nothing broken is written, but the lab gets no PoC.py at all -- measured
+    # on a repository field holding `"""`. Escaping here covers every field
+    # that is here now and every one added later, and _quotable is idempotent,
+    # so the pieces that already pass through it are unharmed.
     return (
-        'r"""' + title + "\n\n"
-        + _poc_facts(cve, spec, plan)
-        + modes
-        + body
+        'r"""'
+        + _quotable(title + "\n\n" + _poc_facts(cve, spec, plan) + modes + body)
         + '"""\n'
     )
 
