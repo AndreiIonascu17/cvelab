@@ -43,6 +43,7 @@ Everything here is best effort and never raises, as in `releases._get` and
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -502,13 +503,11 @@ def declarations(root: Path) -> list[tuple[str, str, str]]:
     found: list[tuple[str, str, str]] = []
     seen_languages: set[str] = set()
     directories = [root]
-    try:
+    with contextlib.suppress(OSError):
         directories += sorted(
             child for child in root.iterdir()
             if child.is_dir() and not child.name.startswith(".")
         )[:_MAX_SUBDIRECTORIES]
-    except OSError:
-        pass
     for directory in directories:
         for name, reader in _DECLARATIONS:
             text = _read(directory / name)
@@ -547,7 +546,10 @@ def _tags_for(language: str, version: str) -> list[str]:
         width = max(len(key), len(wanted))
         padded_key = key + (0,) * (width - len(key))
         padded_wanted = wanted + (0,) * (width - len(wanted))
-        return (sum(abs(a - b) for a, b in zip(padded_key, padded_wanted)), *padded_key)
+        return (
+            sum(abs(a - b) for a, b in zip(padded_key, padded_wanted, strict=True)),
+            *padded_key,
+        )
     return [tag for _key, tag in sorted(table, key=distance)][:3]
 
 

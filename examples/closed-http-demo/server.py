@@ -18,7 +18,6 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-
 vulnerable = os.environ.get("VULNERABLE") == "1"
 created = False
 
