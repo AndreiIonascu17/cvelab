@@ -2571,7 +2571,45 @@ def _prompt_run(address, command):
     )
 
 
-def _prompt_said(done, foreign=False):
+def _prompt_ran_one(address):
+    """Whether that route answers and runs a command through it right now.
+
+    The question the exit code cannot answer. A non-zero exit on this form is
+    the lab program not seeing ITS canary come back, and a line the target's
+    own shell refuses outright -- a syntax error, a first word that reads as a
+    flag -- kills the whole command including that canary. So the same exit
+    code covers a route that never answered and a route that answered, ran the
+    weakness, and was handed a line its shell would not take. One delivery of
+    this file's own making tells them apart, and it is sent only after a line
+    the lab program reported as not run.
+
+    The token is two halves and the probe is `printf %s%s <h1> <h2>`: the
+    halves sit apart in the command and only running the printf puts them next
+    to each other, so the join coming back is a command of ours having RUN.
+    That is what the lab's own canary does with its quoted halves, and it is
+    why a product that merely reflects the line it was sent is not read here
+    as a weakness that runs. Read out of the child's stdout, where the lab
+    program is asked to put what the command printed, and never out of its
+    exit code -- the thing in question.
+
+    Three answers and not two: it ran, it did not, and the probe could not be
+    asked. The third is this file failing to run itself again -- no fork, no
+    file descriptor -- and nothing left this machine, so there is no
+    measurement of the route to report. Returning False for it would print
+    "nothing here shows that route running a command" as a fact about the
+    target when the fact is about this host, which is the exact conflation
+    this whole path exists to undo; it is not reintroduced one layer down.
+    The reason travels with the answer because the caller is what prints.
+    """
+    first, second = os.urandom(8).hex(), os.urandom(8).hex()
+    try:
+        done = _prompt_run(address, "printf %s%s " + first + " " + second)
+    except OSError as error:
+        return None, str(error)
+    return (first + second) in done.stdout, ""
+
+
+def _prompt_said(done, foreign=False, address=None):
     """What the lab program said, printed as output only when it was output.
 
     `foreign` is where the honesty statement lands for this mode. A prompt
@@ -2580,25 +2618,87 @@ def _prompt_said(done, foreign=False):
     it -- and "the command did not run" is the line an operator reads as "no
     command execution here". So it is said again under it, every time, and the
     child's own stderr above carries the block in full.
+
+    `address` is what makes a line the target refused tellable from a route
+    that did not answer: given one, `_prompt_ran_one` goes to that address
+    after a line the lab program reported as not run, and a probe that comes
+    back means the route answered and the weakness ran a command just now --
+    so the exit code and the BLOCKED under it are about the line, and reading
+    them as "the weakness does not reproduce here" is backwards. Given none,
+    the reading is the unreachable one and nothing is sent, which is what the
+    session's own deliveries want: those are commands this file wrote, an
+    operator's line only ever travels inside one as quoted data, and a shell
+    that refuses them is not a thing the operator can type their way into.
+
+    No branch tells the operator that what is above is not the target's. It is
+    the lab program's whole answer, and whatever the target said to it is
+    inside that answer -- which on exactly this path is where the target's
+    stderr arrives, carried in the failure the product reports.
+
+    The probe's three answers get three readings, and the third is the one
+    worth the branch: a probe that could not be sent measured nothing, so it
+    is said to have measured nothing rather than counted as the route coming
+    back silent.
     """
     if done.returncode != 0:
         # Not output, and not printed where output goes: the lab program
-        # exited non-zero, which on this form means the command did not run.
-        # Its own stdout says why -- BLOCKED, or the observation it made --
-        # and reading that as the command's answer is the one mistake a
-        # prompt makes easy.
+        # exited non-zero, which on this form means it did not see its canary
+        # come back, so what it was given did not run as the command it was.
+        # Its own stdout says what it saw -- BLOCKED, or the observation it
+        # made -- and reading that as the command's answer is the one mistake
+        # a prompt makes easy.
         sys.stderr.write(done.stderr)
         sys.stderr.write(done.stdout)
+        ran, unasked = _prompt_ran_one(address) if address is not None else (None, "")
+        if ran:
+            sys.stderr.write(
+                "[your line did not run -- and the weakness did. A probe of this\\n"
+                " file's own went to the same address straight after, and its two\\n"
+                " halves came back joined, so that route answers and runs commands\\n"
+                " through it right now. So the lab program's exit %d, and the BLOCKED\\n"
+                " or NOT_OBSERVED above it, are its own canary not coming back with\\n"
+                " YOUR line -- which is what a line the target's shell will not take\\n"
+                " looks like, and what a line that takes the canary down with it (an\\n"
+                " `exit`, a redirect of the whole command's output, a kill) looks like\\n"
+                " too. It is not this weakness failing to reproduce. What is above is\\n"
+                " the lab program's answer with the target's own answer inside it --\\n"
+                " the complaint its shell made about the line, where it made one --\\n"
+                " so read that, fix the line and send it again.]\\n" % done.returncode
+            )
+            sys.stderr.flush()
+            return
         sys.stderr.write(
-            "[the command did not run: the lab program exited %d. What is above is\\n"
-            "that program saying so, not output from the target.]\\n" % done.returncode
+            "[the command did not run: the lab program exited %d, which on this form\\n"
+            " means it did not see its canary come back. What is above is that\\n"
+            " program's whole answer -- its own report, and whatever the target said\\n"
+            " to it.]\\n" % done.returncode
         )
+        if ran is False:
+            sys.stderr.write(
+                "[and a probe of this file's own went to the same address after it and\\n"
+                " did not come back joined either, so nothing here shows that route\\n"
+                " running a command just now. That is a fact about the route -- not\\n"
+                " served, not answering, or answering without running what it is\\n"
+                " sent -- and not about the line you typed.]\\n"
+            )
+        elif unasked:
+            # Nothing left this machine, so nothing was learned about the
+            # route. Said as that, because the sentence above it is a claim
+            # about the target and this is a claim about here.
+            sys.stderr.write(
+                "[and the probe that would have told you whether that route still runs\\n"
+                " commands could not be sent at all: this file could not be run again\\n"
+                " (%s). So nothing above has been measured against the route either\\n"
+                " way -- that is a fact about this machine, not about the target.]\\n"
+                % unasked
+            )
         if foreign:
             sys.stderr.write(
                 "[and this address is not this lab's, so a line that does not run is\\n"
                 " what a host that does not serve this lab's route looks like. It is\\n"
                 " not evidence that this host cannot be made to run commands.]\\n"
             )
+        sys.stderr.flush()
         return
     printed = done.stdout
     first, newline, rest = printed.partition("\\n")
@@ -2712,7 +2812,10 @@ def _prompt_repl(address):
             continue
         sent = ("cd %s && " % shlex.quote(cwd) + line) if cwd else line
         try:
-            _prompt_said(_prompt_run(address, sent), foreign)
+            # The address goes with it: a line the lab program reports as not
+            # run is probed from there, so the operator is told whether the
+            # route failed to answer or their own line was refused.
+            _prompt_said(_prompt_run(address, sent), foreign, address)
         except KeyboardInterrupt:
             sys.stderr.write(
                 "\\n[stopped waiting. The command may still be running on the target:\\n"
@@ -3470,7 +3573,11 @@ def _prompt_opening(plan: dict[str, Any] | None) -> str:
                 "is denied permission, and one that printed nothing all look the same "
                 "here -- an empty block -- so to tell them apart add `2>&1` to a line "
                 "to bring its error output back, or `; echo $?` to see whether it "
-                "succeeded;",
+                "succeeded. One line escapes that: one the target's own shell will "
+                "not take at all kills the whole command the weakness runs, so the "
+                "product reports a failure instead of an output and the shell's own "
+                "complaint -- its stderr -- comes back inside that report, which this "
+                "prints under the line saying your line did not run;",
                 "* no line editing and no history.",
             )
         )
@@ -3491,7 +3598,10 @@ def _prompt_opening(plan: dict[str, Any] | None) -> str:
             "the lab program's own connection timeout, after which the line comes back "
             "as not run. That is the plain shape of a one-command form; the session "
             "mode does its waiting at your end instead, to keep the product answering "
-            "while a line runs."
+            "while a line runs. A line that comes back as not run costs one request "
+            "more: a probe of this file's own goes to the same address straight after "
+            "it, so a route that did not answer is told from a line the target "
+            "answered and would not take."
         )
         + "\n\nWHERE YOU ACTUALLY ARE\n\n"
         + _prompt_where_you_are(plan)
@@ -4447,7 +4557,14 @@ def _lab_mode_note(
                     "rather than on the target. It asks for --allow-prompt because "
                     "it runs whatever you type for as long as you keep typing, "
                     "which is more than any other mode here asks; without the flag "
-                    "nothing is sent. The prompt says all of this again before the "
+                    "nothing is sent. One line costs more than one request: a line "
+                    "the lab program reports as not run is followed by a probe of "
+                    "this file's own to that same address, which is how a route that "
+                    "never answered is told from a line the target answered and its "
+                    "own shell refused. That is the only request this mode sends that "
+                    "is not a line you typed, it is sent only after a line that did "
+                    "not run, and it goes wherever the address points -- this lab's "
+                    "build or not. The prompt says all of this again before the "
                     "first line, together with the sentences below."
                 )
                 + (
