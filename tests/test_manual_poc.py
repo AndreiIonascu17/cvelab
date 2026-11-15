@@ -41,6 +41,16 @@ from cvelab import (
     upload,
 )
 
+#: A few tests below are measurements taken against a POSIX host rather than
+#: assertions about the artifact's text: a stub with a real `/bin/sh` behind
+#: the weakness, and one run driven through a pty. A lab's target is a Linux
+#: container, so the test host stands in for it -- there is no Windows
+#: reading of "the target's own shell refused this line" to check, and the
+#: Windows jobs reached these as a missing `/bin/sh` and a missing `termios`.
+#: `os.name` rather than a probe for the binary, because what Windows is
+#: without here is the whole shape and not one file.
+POSIX = os.name != "nt"
+
 
 def _spec(**extra: Any) -> dict[str, Any]:
     spec = {
@@ -1946,7 +1956,12 @@ class ThePromptTests(unittest.TestCase):
     def shelled(
         self, typed: str, dead: bool = False
     ) -> subprocess.CompletedProcess:
-        """A line typed at a prompt over something that really runs lines."""
+        """A line typed at a prompt over something that really runs lines.
+
+        `SHELL` puts a real `/bin/sh` behind the weakness, which is what makes
+        the three answers three rather than three cases this test wrote down.
+        Every test that calls this is guarded on POSIX for that reason.
+        """
         return self.prompted(
             typed, validator=self.SHELL,
             environment={"CVELAB_STUB_DEAD": "1"} if dead else None,
@@ -1972,6 +1987,7 @@ class ThePromptTests(unittest.TestCase):
         """
         return cls.flat(text.split("`quit` leaves.", 1)[-1])
 
+    @unittest.skipUnless(POSIX, "a real /bin/sh behind the stub")
     def test_a_route_that_did_not_answer_a_line_the_target_refused_and_a_silent_line_are_three(
         self
     ) -> None:
@@ -2016,6 +2032,7 @@ class ThePromptTests(unittest.TestCase):
             self.reported(dead.stderr),
         )
 
+    @unittest.skipUnless(POSIX, "a real /bin/sh behind the stub")
     def test_the_targets_own_answer_is_never_called_something_other_than_the_targets(
         self
     ) -> None:
@@ -2045,6 +2062,7 @@ class ThePromptTests(unittest.TestCase):
         # above has the target's own answer in it.
         self.assertIn("the target's own answer inside it", said)
 
+    @unittest.skipUnless(POSIX, "a real /bin/sh behind the stub")
     def test_a_line_the_target_refused_is_not_reported_as_a_weakness_that_did_not_reproduce(
         self
     ) -> None:
@@ -2095,12 +2113,19 @@ class ThePromptTests(unittest.TestCase):
         does come back, inside the failure the product reports. The banner
         says both, and the run that proves the exception is run here, so the
         sentence cannot drift from what the artifact does.
+
+        The guard is in the middle rather than on the method, so the four
+        sentences are still read on a host with no `/bin/sh`: only the run
+        that measures them needs one, and this is reported as skipped there
+        because the pairing -- which is what the test is for -- was not.
         """
         said = self.flat(self.prompted("", validator=self.SHELL).stderr)
         self.assertIn("only standard output comes back", said)
         self.assertIn("add `2>&1`", said)
         self.assertIn("will not take at all", said)
         self.assertIn("comes back inside that report", said)
+        if not POSIX:
+            self.skipTest("a real /bin/sh behind the stub")
         refused = self.shelled('echo "unterminated\n')
         # The exception, measured: that is the target's own stderr, on the
         # screen, carried inside the failure the product reported.
@@ -2147,11 +2172,17 @@ class ThePromptTests(unittest.TestCase):
             "`cd` is tracked here, not run on the target", " ".join(done.stderr.split())
         )
 
+    @unittest.skipUnless(POSIX, "the subject is a terminal, and a pty is POSIX")
     def test_the_per_line_prompt_is_written_at_a_terminal(self) -> None:
         """Shown rather than asserted: driven through a pty, the prompt appears.
 
         The same input a pipe gets no prompt for gets one per line here, with
         the simulated directory it tracks -- `.` before `cd /srv`, `/srv` after.
+
+        The subject IS the terminal, so there is nothing here to port: a pty
+        is how you get one, `pty` imports `termios`, and neither exists on
+        Windows. The pipe half of the pair is `..._withheld_on_a_pipe` above,
+        which runs everywhere.
         """
         out, err = self._prompted_through_a_tty("cd /srv\nexit\n")
         self.assertIn("[cd simulated] .$", err)

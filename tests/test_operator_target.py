@@ -61,6 +61,19 @@ PACKAGE = Path(__file__).resolve().parent.parent / "cvelab"
 SOURCEGEN = (PACKAGE / "sourcegen.py").read_text(encoding="utf-8")
 DELIVERABLES = (PACKAGE / "deliverables.py").read_text(encoding="utf-8")
 
+#: What the guarded tests below take from the host they run on. Both stubs
+#: answer their command route by running the line in a real `/bin/sh`; the
+#: session's held shell is a fifo, a `tail -f` and a detached `sh -i` living
+#: on that same host; and `manual.sh` is read by `bash`, once with `-n` and
+#: once for real with a `chmod +x` stub ahead of it on a colon-separated
+#: PATH. A lab's target is a Linux container and its kit is a shell script,
+#: so the test host stands in for both; the tests that only read what was
+#: written need none of this and are left unguarded. `os.name` rather than a
+#: probe for each binary, because what Windows is without here is the whole
+#: shape and not one file -- its `bash` answered, with an exit of 1 and
+#: nothing on stderr.
+POSIX = os.name != "nt"
+
 
 def contract(**extra: object) -> dict:
     """A declared contract that passes every check, so one field can be removed."""
@@ -616,6 +629,7 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("no remote mode", complained)
 
+    @unittest.skipUnless(POSIX, "a real /bin/sh and real directories on the target")
     def test_a_cd_that_is_not_there_is_caught_and_not_tracked(self) -> None:
         """A cd to a directory the target does not have is said, not tracked.
 
@@ -668,6 +682,7 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
         exec(compile(upper, field.POC_NAME, "exec"), namespace)  # noqa: S102
         return namespace
 
+    @unittest.skipUnless(POSIX, "the join is read off a real /bin/sh")
     def test_no_probe_delivery_carries_the_joined_token(self) -> None:
         """The property the two-half probe exists for, over the actual bytes.
 
@@ -708,6 +723,7 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
         self.assertIn(join[:half], sent)
         self.assertIn(join[half:], sent)
 
+    @unittest.skipUnless(POSIX, "the join is read off a real /bin/sh")
     def test_only_a_product_that_really_runs_the_probe_reads_as_running_it(self) -> None:
         """The other half of the pin, and the stream it is read from.
 
@@ -774,6 +790,7 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
         self.assertNotIn("nothing here shows that route running a command", said)
         self.assertNotIn("the weakness did", said)
 
+    @unittest.skipUnless(POSIX, "a real /bin/sh behind the stub")
     def test_a_refused_line_a_dead_route_and_a_line_that_ran_are_three(self) -> None:
         """The three answers, at the socket, against a shell behind the weakness.
 
@@ -821,6 +838,7 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
         self.assertIn("nothing here shows that route running a command", flat["dead"])
         self.assertEqual((refused_out, dead_out), ("", ""))
 
+    @unittest.skipUnless(POSIX, "a real /bin/sh behind the stub")
     def test_the_probe_is_one_more_delivery_and_only_after_a_line_that_did_not_run(
         self
     ) -> None:
@@ -1044,6 +1062,7 @@ class TheSessionHoldsStateTests(unittest.TestCase):
         )
         self.assertEqual(namespace["_shell_cut"](response, start, end), "uid=0(root)")
 
+    @unittest.skipUnless(POSIX, "a held shell: a fifo, a `tail -f` and an `sh -i`")
     def test_a_held_shell_is_one_process_whose_state_survives(self) -> None:
         """One shell across lines, an export that lasts, a `cd` that is real.
 
@@ -1082,6 +1101,7 @@ class TheSessionHoldsStateTests(unittest.TestCase):
         self.assertNotIn("shell$", err)
         self.assertIn("held: a detached shell is running", err)
 
+    @unittest.skipUnless(POSIX, "a held shell torn down on the test host, read by pgrep")
     def test_leaving_removes_the_files_and_kills_the_process(self) -> None:
         """Teardown shown rather than asserted: the files and the held shell are
         gone from the test host, where `executing_stub` ran them."""
@@ -1137,6 +1157,7 @@ class TheSessionHoldsStateTests(unittest.TestCase):
         self.assertNotIn("--shell", text)
         self.assertNotIn("--allow-shell", text)
 
+    @unittest.skipUnless(POSIX, "a real /bin/sh, and a PATH without `tail` in it")
     def test_the_cause_is_named_when_the_shell_cannot_be_held(self) -> None:
         """A failure the mode tells apart from the weakness not running.
 
@@ -1395,8 +1416,17 @@ class TheRunnerPublishesOnePortTests(unittest.TestCase):
                     with self.subTest(file=name):
                         self.assertNotIn("__", text.replace("__pycache__", ""))
 
+    @unittest.skipUnless(POSIX, "`bash -n`, and there is no bash to run it")
     def test_the_runner_and_the_wrapper_are_valid(self) -> None:
-        """`bash -n` on the shell and the new action in the PowerShell set."""
+        """`bash -n` on the shell and the new action in the PowerShell set.
+
+        The syntax check is the test, and it needs a POSIX shell: on the
+        Windows runner it came back as an exit of 1 with nothing on stderr,
+        which is a `bash` that is not one and not a runner that is invalid.
+        The PowerShell line that rides along is text and is read on the Linux
+        jobs; the guard is on the method rather than around the `bash` call so
+        that nothing here can pass without the check it exists for.
+        """
         for port in (8080, None):
             kit = written_kit(port=port, seeds=True, record=PROVED)
             with tempfile.TemporaryDirectory() as temporary:
@@ -1412,12 +1442,19 @@ class TheRunnerPublishesOnePortTests(unittest.TestCase):
                 kit["PoC.ps1"],
             )
 
+    @unittest.skipUnless(POSIX, "`bash manual.sh`, against an executable shell stub")
     def test_the_address_action_asks_docker_and_reports_a_lab_without_one(self) -> None:
         """Run for real, against a `docker` that is a shell script.
 
         No container is built or started: the stub answers `compose port`
         with an address and everything else with nothing, which is all this
         branch reads.
+
+        Running it is the point, and what runs it is bash with a `chmod +x`
+        shim ahead of it on a colon-separated PATH. On Windows the lab with a
+        port read back no address at all, and the lab without one passed for
+        the wrong reason -- the runner failed, which is also how "no address"
+        is spelled -- so the guard is on the method and not on one case.
         """
         for port, published, expected in (
             (8080, "127.0.0.1:49159", "127.0.0.1:49159"),
