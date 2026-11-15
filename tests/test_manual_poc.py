@@ -2133,18 +2133,54 @@ class ThePromptTests(unittest.TestCase):
 
     # --- the directory it tracks ------------------------------------------
 
-    def test_cd_is_tracked_here_and_prefixed_to_every_line(self) -> None:
-        done = self.prompted('cd /srv\npwd\ncd app\npwd\ncd "/a b"\npwd\ncd\npwd\n')
-        self.assertEqual(done.returncode, 0, done.stderr)
+    def test_the_directory_it_tracks_is_arithmetic_on_this_side(self) -> None:
+        """The chain, read off the emitted function rather than off a target.
+
+        This was one test that typed four `cd` lines at the reflecting
+        fixture and read the chain out of the prefixes it echoed back. The
+        chain was only visible there because each move was tracked, and each
+        move was tracked because the probe's single token came back in the
+        echo of the probe's own command -- so the arithmetic was asserted
+        through the forgery the two-half probe closes.
+
+        The arithmetic needs no target at all: it is posixpath, on this side,
+        and it is asserted on the emitted copy of the function rather than on
+        the module's, because the emitted copy is what an operator runs.
+        Whether a tracked directory is prefixed onto the next line is a
+        different property, held where a `cd` can really take -- behind the
+        real /bin/sh in `..._prefixes_a_cd_that_took`.
+        """
+        namespace: dict = {}
+        upper = self.artifact().partition(field.POC_LAB_MODE_MARKER)[0]
+        exec(compile(upper, field.POC_NAME, "exec"), namespace)  # noqa: S102
+        cd = namespace["_prompt_cd"]
+        self.assertEqual(cd("", "/srv"), "/srv")
+        self.assertEqual(cd("/srv", "app"), "/srv/app")
+        self.assertEqual(cd("/srv", "/a b"), "/a b")
+        self.assertEqual(cd("/srv/app", ".."), "/srv")
+        # No argument returns to the directory the weakness itself runs in,
+        # which this side does not name and must not invent.
+        self.assertEqual(cd("/srv", ""), "")
+
+    @unittest.skipUnless(POSIX, "a real /bin/sh behind the stub, so a cd can take")
+    def test_it_prefixes_a_cd_that_took(self) -> None:
+        """And prefixes nothing when the target did not confirm the move.
+
+        Behind a real shell `cd /tmp` takes, so `pwd` comes back /tmp -- the
+        prefix having ridden. Against the reflecting fixture the same two
+        lines leave the directory untracked, and the `pwd` goes out bare:
+        the forgery is refused and the honest consequence is this.
+        """
+        took = self.prompted("cd /tmp\npwd\n", validator=self.SHELL)
+        self.assertEqual(took.returncode, 0, took.stderr)
+        self.assertIn("/tmp", took.stdout)
+
+        reflected = self.prompted("cd /tmp\npwd\n")
         self.assertEqual(
-            [line.partition(" against ")[0] for line in done.stdout.splitlines()],
-            [
-                "ran cd /srv && pwd",
-                "ran cd /srv/app && pwd",
-                "ran cd '/a b' && pwd",
-                "ran pwd",
-            ],
+            [line.partition(" against ")[0] for line in reflected.stdout.splitlines()],
+            ["ran pwd"],
         )
+        self.assertIn("cd did not take", reflected.stderr)
 
     def test_a_line_that_joins_commands_is_sent_as_it_was_typed(self) -> None:
         """Its `cd` is real and lasts exactly as long as that one command,
@@ -2163,8 +2199,9 @@ class ThePromptTests(unittest.TestCase):
         they paste into a report -- the per-line prompt is not written, so it
         does not repeat down the one line that gets pasted. What is evidence
         stays whatever stdin is: the opening still explains how `cd` works, and
-        `cd` is still tracked (the command the next line sends carries the
-        prefix), which the tracking test holds separately.
+        a `cd` the target confirms is still tracked, which
+        `..._prefixes_a_cd_that_took` holds separately -- behind a real shell,
+        because this fixture only reflects what it is sent.
         """
         done = self.prompted("cd /srv\npwd\n")
         self.assertNotIn("[cd simulated]", done.stderr)
@@ -2177,20 +2214,29 @@ class ThePromptTests(unittest.TestCase):
         """Shown rather than asserted: driven through a pty, the prompt appears.
 
         The same input a pipe gets no prompt for gets one per line here, with
-        the simulated directory it tracks -- `.` before `cd /srv`, `/srv` after.
+        the simulated directory it tracks -- `.` before `cd /tmp`, `/tmp` after.
 
         The subject IS the terminal, so there is nothing here to port: a pty
         is how you get one, `pty` imports `termios`, and neither exists on
         Windows. The pipe half of the pair is `..._withheld_on_a_pipe` above,
         which runs everywhere.
         """
-        out, err = self._prompted_through_a_tty("cd /srv\nexit\n")
+        # Behind a real /bin/sh, so the cd is a cd that took. It used to be
+        # `/srv` against the reflecting fixture, which tracked the move
+        # because the probe's token came back in the echo of its own command
+        # -- the forgery the two-half probe closes. A chrome showing a
+        # directory nothing entered is not what this test is for.
+        out, err = self._prompted_through_a_tty(
+            "cd /tmp\nexit\n", validator=self.SHELL
+        )
         self.assertIn("[cd simulated] .$", err)
-        self.assertIn("[cd simulated] /srv$", err)
+        self.assertIn("[cd simulated] /tmp$", err)
 
-    def _prompted_through_a_tty(self, typed: str) -> tuple[str, str]:
+    def _prompted_through_a_tty(
+        self, typed: str, validator: str | None = None
+    ) -> tuple[str, str]:
         pty = __import__("pty")
-        text = self.artifact()
+        text = self.artifact(validator=validator)
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / field.POC_NAME
             path.write_text(text, encoding="utf-8")

@@ -585,19 +585,34 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
         )
         self.assertEqual(said.count("REPRODUCED"), 2)
 
-    def test_the_directory_it_tracks_rides_on_the_command_itself(self) -> None:
+    def test_a_reflecting_product_does_not_get_the_move_tracked(self) -> None:
+        """On the wire, against a product that echoes what it is handed.
+
+        This test used to assert the opposite, and said so: the stub returns
+        the command it was sent, the probe's single token came back inside
+        that echo, the move was tracked, and the typed `ls` rode a prefix
+        into a directory nothing had entered. The comment recorded the echo
+        as the mechanism by which the move took -- the forgery written down
+        as the expected behaviour.
+
+        The probe is two halves now, so only running it joins them. The
+        stub cannot, so the move is not tracked and the next line goes out
+        bare. Both halves still ride the wire, apart, which is what makes the
+        probe a probe rather than a constant the product could learn.
+        """
         with stub(seeded=False) as (address, asked):
             self.ran(
                 self.artifact(), address, "--prompt", "--allow-prompt",
                 typed="cd /srv\nls\n", port=address.rsplit(":", 1)[1],
             )
         cmds = [query.get("cmd") for path, query in asked if path == "/run"]
-        # `cd /srv` now probes the target before tracking -- `cd /srv && printf
-        # <token>` -- and the stub echoes the token back, so the move takes; the
-        # typed `ls` then rides the tracked prefix.
         self.assertEqual(len(cmds), 2, cmds)
-        self.assertTrue(cmds[0][0].startswith("cd /srv && printf "), cmds[0])
-        self.assertEqual(cmds[1], ["cd /srv && ls"])
+        probe = cmds[0][0]
+        self.assertTrue(probe.startswith("cd /srv && printf %s%s "), probe)
+        halves = probe.split("printf %s%s ", 1)[1].split()
+        self.assertEqual(len(halves), 2, probe)
+        self.assertNotIn("".join(halves), probe, f"the join rode the wire in: {probe}")
+        self.assertEqual(cmds[1], ["ls"])
 
     def test_the_no_argument_path_is_unchanged_with_the_prompt_in_the_file(self) -> None:
         """The path every proof rests on, measured with the mode present."""
@@ -722,6 +737,59 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
         half = len(join) // 2
         self.assertIn(join[:half], sent)
         self.assertIn(join[half:], sent)
+
+    @unittest.skipUnless(POSIX, "the join is read off a real /bin/sh")
+    def test_a_reflecting_target_does_not_move_the_tracked_directory(self) -> None:
+        """The cd probe is held to the property its neighbour is held to.
+
+        It carried one token and looked for it in the answer, so the thing
+        being looked for rode out in the probe's own text: a product that
+        reflects the line it is handed rather than running it returned the
+        token, the move read as having taken, and every later line went out
+        prefixed into a directory nothing had entered -- the exact failure
+        `_prompt_ran_one` is written in halves to avoid, and the failure the
+        original cd check was added to fix, reintroduced one layer down.
+
+        It was safe before this only by accident. The lab program joins its
+        own canary on with `;`, which keeps the shell's exit at 0, so the
+        wrapper never threw and the command text never reached the response.
+        That is a property of the lab's wrapper, not of this check, and the
+        check is the thing being asserted here.
+
+        Both halves of the pin: the join is read off a real shell rather than
+        from this test's idea of how the probe is spelled, and the line after
+        the refused cd is asserted to go out unprefixed.
+        """
+        namespace = self._prompt_namespace()
+        captured: list[str] = []
+
+        def answer(address: str, command: str):
+            captured.append(command)
+            return type("_D", (), {"returncode": 0, "stdout": command, "stderr": ""})()
+
+        namespace["_prompt_run"] = answer
+        complained = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO("cd /tmp\npwd\nexit\n")), \
+                contextlib.redirect_stderr(complained), \
+                contextlib.redirect_stdout(io.StringIO()):
+            namespace["_prompt_repl"]("10.0.0.9:8080")
+
+        self.assertGreaterEqual(len(captured), 2, captured)
+        probe = captured[0]
+        # From the shell, not from the spelling: running the probe is what
+        # puts the halves together.
+        join = subprocess.run(
+            ["/bin/sh", "-c", probe], capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+        self.assertNotIn(join, probe, f"the join rode the wire in: {probe}")
+        self.assertGreaterEqual(len(join), 32, join)
+        half = len(join) // 2
+        self.assertIn(join[:half], probe)
+        self.assertIn(join[half:], probe)
+        # And the consequence: the move was not tracked, so the next line is
+        # not prefixed into a directory nothing entered.
+        self.assertIn("cd did not take", complained.getvalue())
+        self.assertEqual(captured[1], "pwd", captured)
 
     @unittest.skipUnless(POSIX, "the join is read off a real /bin/sh")
     def test_only_a_product_that_really_runs_the_probe_reads_as_running_it(self) -> None:
