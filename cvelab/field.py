@@ -2779,13 +2779,24 @@ def _prompt_repl(address):
             # tracked, with a token that prints only if the directory was
             # entered, and a move that does not take is said and left untracked.
             target = _prompt_cd(cwd, words[1] if len(words) > 1 else "")
-            token = os.urandom(8).hex()
+            # Two halves and `printf %s%s`, for the reason _prompt_ran_one is
+            # written that way: with one token the probe's own text carries
+            # the thing being looked for, so a target that reflects the line
+            # it was sent rather than running it hands the token straight
+            # back and the move is tracked into a directory nothing entered.
+            # The halves sit apart in the command and only the printf puts
+            # them next to each other, so the join coming back is this probe
+            # having RUN. Safe before this only by accident: the lab
+            # program's canary is joined on with `;`, which keeps the shell's
+            # exit at 0, so the command text never reached the response --
+            # a property of the lab's wrapper, not of this check.
+            first, second = os.urandom(8).hex(), os.urandom(8).hex()
             probe = (("cd %s && " % shlex.quote(target)) if target else "") + (
-                "printf %s " + token)
+                "printf %s%s " + first + " " + second)
             done = _prompt_run(address, probe)
             at = cwd or "the one the weakness runs in"
-            if token in done.stdout:
-                # The token prints only after the directory is entered, so it
+            if (first + second) in done.stdout:
+                # The join prints only after the directory is entered, so it
                 # coming back -- however the target wraps its output, and whether
                 # or not it appends a canary -- is the move having taken.
                 cwd = target
