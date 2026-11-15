@@ -1472,6 +1472,37 @@ class TheDocumentSaysWhetherThereIsAPromptTests(unittest.TestCase):
                     # question nobody holding this lab would ask.
                     self.assertNotIn(self.flat(reason), self.flat(guide))
 
+    def test_what_a_line_that_does_not_run_costs_is_named_before_it_is_paid(
+        self
+    ) -> None:
+        """The probe's cost, where the reader decides whether to run the mode.
+
+        A line the lab program reports as not run is followed by a probe of
+        the artifact's own to the same address -- a request the operator did
+        not type, going wherever the address points. The session's own costs
+        are each named in this document and in the artifact's header for
+        exactly this reason: a reader deciding whether to point a mode at a
+        client's host decides on what it sends. The prompt's banner says it
+        too, but the banner is printed after `--allow-prompt` has already been
+        given, so the two surfaces read beforehand are the ones held here.
+        """
+        for name, shape in self.SHAPES.items():
+            with self.subTest(shape=name):
+                guide, poc, plan, validator = self.deliver(*shape)
+                if not prompt_standing(plan, validator)[0]:
+                    continue
+                surfaces = {
+                    "LAB-POC.md": self.flat(self.section(guide)),
+                    "header": self.flat(poc.split('"""')[1]),
+                }
+                for surface, text in surfaces.items():
+                    with self.subTest(surface=surface):
+                        # That there is an extra delivery, when it is sent,
+                        # and that it goes to the address the operator gave.
+                        self.assertIn("costs more than one request", text)
+                        self.assertIn("only after a line that did not run", text)
+                        self.assertIn("wherever the address points", text)
+
     def test_the_closing_line_names_every_invocation_the_file_takes(self) -> None:
         """The line a reader quotes, which counted two where there are three.
 

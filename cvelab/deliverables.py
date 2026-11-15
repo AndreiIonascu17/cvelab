@@ -425,6 +425,13 @@ into a report."""
 #: program again, once per line -- `field._lab_mode_note`'s docstring is the
 #: account -- so the sentences in this document that say the file holds two
 #: modes stay true and stay as they are.
+#:
+#: The mode's own cost is named here for the same reason the session's four
+#: are: a line the lab program reports as not run is followed by one more
+#: delivery, a probe of the artifact's own, to whatever address the operator
+#: gave -- the only request the mode sends that is not a line they typed. The
+#: prompt prints it again before the first line, but by then --allow-prompt
+#: has been given, and this document is what is read before that.
 _PROMPT_IS_NOT_A_SESSION = f"""One command per line, and not a session. Every line you type is one more run
 of the lab program's one-command form -- one address and one command, through
 the weakness this lab's differential proved, its output printed -- so nothing
@@ -432,9 +439,15 @@ is held open between lines: no persistent environment, no interactive
 programs, no job control and no signals, and `cd` is tracked by the prompt
 rather than on the target. It asks for `--allow-prompt` because it runs
 whatever you type for as long as you keep typing, which is more than any other
-mode here asks; without the flag nothing is sent. `{POC_NAME}` says all of this
-again at the prompt, before the first line, together with whose route answers
-the commands."""
+mode here asks; without the flag nothing is sent. One line costs more than one
+request: a line the lab program reports as not run is followed by a probe of
+`{POC_NAME}`'s own to that same address, which is how a route that never
+answered is told from a line the target answered and its own shell refused.
+That is the only request this mode sends that is not a line you typed, it is
+sent only after a line that did not run, and it goes wherever the address
+points -- this lab's build or not. `{POC_NAME}` says all of this again at the
+prompt, before the first line, together with whose route answers the
+commands."""
 
 #: The session, said in the same document and gated the same way: whenever there
 #: is a prompt there is a session, because `field.prompt_standing` decides both

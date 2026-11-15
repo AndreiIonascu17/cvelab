@@ -39,6 +39,8 @@ possible, and the refusals for an answer that declares neither.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -650,6 +652,208 @@ class ThePromptDrivesTheSecondEntryPointTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("two different modes", complained)
         self.assertNotIn("command on the command line", complained)
+
+    # --- the probe that tells a refused line from a dead route -------------
+
+    def _prompt_namespace(self) -> dict:
+        """The mode's own functions, exec'd from the emitted upper half.
+
+        The session's tests do the same for the same reason: what is asserted
+        on is the bytes a delivery really builds, not a restatement of how the
+        delivery is spelled. `_prompt_run` is the one seam replaced, so the
+        probe's command can be captured without sending it anywhere.
+        """
+        upper = self.artifact().split(field.POC_LAB_MODE_MARKER, 1)[0]
+        namespace: dict = {}
+        exec(compile(upper, field.POC_NAME, "exec"), namespace)  # noqa: S102
+        return namespace
+
+    def test_no_probe_delivery_carries_the_joined_token(self) -> None:
+        """The property the two-half probe exists for, over the actual bytes.
+
+        The join is never derived from how the probe is spelled: the captured
+        command is run in a real `/bin/sh`, and what the shell PRINTS is the
+        join by construction. So the three things asserted are measured
+        against the shell's own answer -- the join is absent from the command
+        that was sent, both halves are present in it, and a product that only
+        reflects that command back is not read as having run it.
+
+        The trap this is here for: a hex half holds nothing `shlex.quote`
+        quotes, so a scheme that quoted the halves apart with it would put the
+        bare join on the wire and every reflecting product would read as a
+        weakness that runs. The session's marker had exactly that bug once.
+        """
+        namespace = self._prompt_namespace()
+        captured: list[str] = []
+
+        def answer(address: str, command: str):
+            captured.append(command)
+            return type("_D", (), {"returncode": 0, "stdout": command, "stderr": ""})()
+
+        namespace["_prompt_run"] = answer
+        # A pure reflection of the command: not read as the probe having run.
+        self.assertEqual(
+            namespace["_prompt_ran_one"]("10.0.0.9:8080"), (False, ""),
+        )
+        self.assertEqual(len(captured), 1, captured)
+        sent = captured[0]
+        # The join, from the shell rather than from this test's idea of the
+        # spelling: running the probe is what puts the halves together.
+        join = subprocess.run(
+            ["/bin/sh", "-c", sent], capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+        self.assertGreaterEqual(len(join), 16, join)
+        self.assertNotIn(join, sent, f"the join rode the wire in: {sent}")
+        half = len(join) // 2
+        self.assertIn(join[:half], sent)
+        self.assertIn(join[half:], sent)
+
+    def test_only_a_product_that_really_runs_the_probe_reads_as_running_it(self) -> None:
+        """The other half of the pin, and the stream it is read from.
+
+        A response carrying the join -- which only running the probe produces
+        -- reads as the route running commands, and it reads that way even
+        when the delivery exits non-zero, because the exit code is the thing
+        in question and the answer is taken from stdout. A join on stderr is
+        not an answer: the lab program is asked to put what the command
+        printed on stdout, so that is where a landing is read from.
+        """
+        namespace = self._prompt_namespace()
+        shell = ["/bin/sh", "-c"]
+
+        def answering(code: int, where: str):
+            def answer(address: str, command: str):
+                out = subprocess.run(
+                    shell + [command], capture_output=True, text=True, timeout=30,
+                ).stdout
+                return type("_D", (), {
+                    "returncode": code,
+                    "stdout": out if where == "stdout" else "",
+                    "stderr": out if where == "stderr" else "",
+                })()
+            return answer
+
+        for code in (0, 1):
+            with self.subTest(exit=code):
+                namespace["_prompt_run"] = answering(code, "stdout")
+                self.assertEqual(
+                    namespace["_prompt_ran_one"]("10.0.0.9:8080"), (True, ""),
+                )
+        namespace["_prompt_run"] = answering(0, "stderr")
+        self.assertEqual(namespace["_prompt_ran_one"]("10.0.0.9:8080"), (False, ""))
+
+    def test_a_probe_that_could_not_be_sent_is_not_a_fact_about_the_route(self) -> None:
+        """This machine failing is never printed as the target answering.
+
+        The probe runs this file again, so it can fail the way the typed
+        line's own run can: no fork, no descriptor, nothing leaves. Counting
+        that as the route coming back silent would put "nothing here shows
+        that route running a command" on the screen as a claim about the
+        target, measured by a request that was never made -- our own failure
+        dressed as the weakness's limit, which is the whole defect this path
+        exists to undo. So it is a third answer, and it is said as one.
+        """
+        namespace = self._prompt_namespace()
+
+        def refuse(address: str, command: str):
+            raise OSError(12, "Cannot allocate memory")
+
+        namespace["_prompt_run"] = refuse
+        ran, why = namespace["_prompt_ran_one"]("10.0.0.9:8080")
+        self.assertIsNone(ran)
+        self.assertIn("Cannot allocate memory", why)
+
+        # And what the caller prints for it: nothing claimed about the route.
+        failed = type("_D", (), {"returncode": 1, "stdout": "BLOCKED\n", "stderr": ""})()
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            namespace["_prompt_said"](failed, False, "10.0.0.9:8080")
+        said = " ".join(captured.getvalue().split())
+        self.assertIn("could not be sent at all", said)
+        self.assertIn("a fact about this machine, not about the target", said)
+        self.assertNotIn("nothing here shows that route running a command", said)
+        self.assertNotIn("the weakness did", said)
+
+    def test_a_refused_line_a_dead_route_and_a_line_that_ran_are_three(self) -> None:
+        """The three answers, at the socket, against a shell behind the weakness.
+
+        `refusing_stub` is the product shape the defect was found on: its
+        command route runs the line in a real `/bin/sh`, and when the shell
+        refuses the line outright the route answers with its own render error
+        carrying the shell's complaint -- no `shell-ran`, so the lab program's
+        verdict is NOT_OBSERVED and it exits non-zero. A route that never
+        answered exits non-zero too, and telling the two apart is the whole
+        repair. Measured here rather than only against a validator stub
+        because this is the layer with a real socket and a real session on it.
+        """
+        line = 'echo "unterminated'
+        with refusing_stub() as (address, asked):
+            refused_out, refused, code = self.ran(
+                self.artifact(), address, "--prompt", "--allow-prompt",
+                typed=line + "\nexit\n", port=address.rsplit(":", 1)[1],
+            )
+            self.assertEqual(code, 0, refused)
+            ran_out, ran_err, ran_code = self.ran(
+                self.artifact(), address, "--prompt", "--allow-prompt",
+                typed="echo landed\nexit\n", port=address.rsplit(":", 1)[1],
+            )
+        dead_out, dead, dead_code = self.ran(
+            self.artifact(), "127.0.0.1:9", "--prompt", "--allow-prompt",
+            typed="id\nexit\n", port="9",
+        )
+        self.assertEqual((ran_code, dead_code), (0, 0), ran_err + dead)
+        flat = {
+            "refused": " ".join(refused.split()),
+            "dead": " ".join(dead.split()),
+        }
+
+        # The line that ran: its output where output goes, and no report.
+        self.assertIn("landed", ran_out)
+        # The refused line: the target's own complaint is on the screen, and
+        # it is not disowned -- the weakness ran, and that is said.
+        self.assertIn("/bin/sh:", flat["refused"])
+        self.assertIn("the weakness did", flat["refused"])
+        self.assertNotIn("not output from the target", flat["refused"])
+        # The dead route keeps the reading it always had, and is told nothing
+        # about a weakness running anywhere.
+        self.assertNotIn("the weakness did", flat["dead"])
+        self.assertIn("the command did not run", flat["dead"])
+        self.assertIn("nothing here shows that route running a command", flat["dead"])
+        self.assertEqual((refused_out, dead_out), ("", ""))
+
+    def test_the_probe_is_one_more_delivery_and_only_after_a_line_that_did_not_run(
+        self
+    ) -> None:
+        """What the probe costs, counted at the product it is sent to.
+
+        The cost the artifact's header and LAB-POC.md both name: a line that
+        comes back as not run is followed by one more delivery of the
+        one-command form to that same address, and a line that ran is followed
+        by none. Counted as deliveries -- one `/run` each -- because that is
+        the unit an operator can count whatever a validator's form does to
+        reach the route, and because the claim is "only after a line that did
+        not run", which a count is the only way to hold.
+        """
+        with refusing_stub() as (address, asked):
+            port = address.rsplit(":", 1)[1]
+            del asked[:]
+            self.ran(
+                self.artifact(), address, "--prompt", "--allow-prompt",
+                typed="echo landed\nexit\n", port=port,
+            )
+            ran_deliveries = [path for path in asked if path == "/run"]
+            del asked[:]
+            self.ran(
+                self.artifact(), address, "--prompt", "--allow-prompt",
+                typed='echo "unterminated\nexit\n', port=port,
+            )
+            refused_deliveries = [path for path in asked if path == "/run"]
+
+        self.assertEqual(len(ran_deliveries), 1, "a line that ran cost a probe")
+        self.assertEqual(
+            len(refused_deliveries), 2,
+            f"a line that did not run cost {len(refused_deliveries)} deliveries, not 2",
+        )
 
 
 class TheSessionHoldsStateTests(unittest.TestCase):
@@ -1599,6 +1803,85 @@ class _ServingTarget:
 
 def executing_stub(env: dict | None = None) -> _ServingTarget:
     return _ServingTarget(env)
+
+
+class _Refusing(BaseHTTPRequestHandler):
+    """A product that runs the line, and reports a failure when the shell won't.
+
+    The shape the defect was found on. `_Target` above runs the line too, but
+    it hands back whatever the command printed whatever the shell made of it,
+    so a line the shell refuses outright is indistinguishable there from a
+    line that printed nothing -- and that distinction is the whole repair.
+    Here the command route does what the real product does: the delivery
+    throws when `/bin/sh -c` exits non-zero, and the route answers with its own
+    render error carrying the shell's own complaint. No `shell-ran` in it, so
+    the validator's verdict is NOT_OBSERVED and the lab program exits
+    non-zero -- the same exit a route that never answered gives.
+
+    `asked` records the paths, so what a line costs can be counted rather
+    than asserted.
+    """
+
+    asked: list[str] = []
+
+    def log_message(self, *_: object) -> None:
+        pass
+
+    def _ok(self, body: str, cookie: bool = False) -> None:
+        raw = body.encode("utf-8")
+        self.send_response(200)
+        if cookie:
+            self.send_header("Set-Cookie", "sid=lab-session; Path=/")
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(length)
+        type(self).asked.append(urlparse(self.path).path)
+        self._ok("ok", cookie=True)
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        type(self).asked.append(parsed.path)
+        if parsed.path != "/run":
+            self._ok("not found")
+            return
+        command = (parse_qs(parsed.query).get("cmd") or [""])[0]
+        done = subprocess.run(
+            ["/bin/sh", "-c", command], capture_output=True, text=True, timeout=30,
+        )
+        if done.returncode != 0:
+            # What the product says when the call it makes throws: its own
+            # error, with the shell's complaint about the line inside it. The
+            # operator's only real evidence, and what the repair stopped
+            # disowning.
+            self._ok(
+                "render error: Command failed: " + command + "\n" + done.stderr
+            )
+            return
+        self._ok("shell-ran " + done.stdout)
+
+
+class _ServingRefusing:
+    def __enter__(self) -> tuple[str, list]:
+        handler = type("_BoundRefusing", (_Refusing,), {"asked": []})
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.server.server_address[:2]
+        return f"{host}:{port}", handler.asked
+
+    def __exit__(self, *_: object) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+
+def refusing_stub() -> _ServingRefusing:
+    return _ServingRefusing()
 
 
 def run_fixture(

@@ -1637,6 +1637,60 @@ class ThePromptTests(unittest.TestCase):
         "    sys.exit(main())\n"
     )
 
+    #: The one-command form over something that really runs what it is sent,
+    #: with the canary a generated validator appends: the line goes to
+    #: `/bin/sh -c` with `; echo CVELAB-''<nonce>` after it and the verdict is
+    #: whether the joined canary came back. That is the whole shape the live
+    #: smoke lab has, in a stub with no socket -- and it is the only shape in
+    #: which the three answers a line can get are three:
+    #:
+    #:   * a line that runs: the canary comes back, exit 0;
+    #:   * a line that fails at runtime: the canary still comes back, because
+    #:     the status is the canary echo's, so exit 0 and an empty block;
+    #:   * a line the shell REFUSES: it takes the whole command down including
+    #:     the canary, so the delivery fails, the failure is reported with the
+    #:     shell's own complaint inside it, and the program exits non-zero.
+    #:
+    #: CVELAB_STUB_DEAD is the fourth: a route that never answered, which
+    #: exits non-zero the same way and is the reading the prompt must not give
+    #: the third. Nothing in a lab reads such a variable; it stands in for a
+    #: port with nothing behind it without making the test wait for one.
+    SHELL = (
+        "#!/usr/bin/env python3\n"
+        "import os, subprocess, sys, uuid\n"
+        "\n"
+        "def main():\n"
+        "    argv = sys.argv\n"
+        "    if len(argv) != 3:\n"
+        "        print('REPRODUCED')\n"
+        "        return 0\n"
+        "    nonce = uuid.uuid4().hex\n"
+        "    sent = argv[2] + '; echo CVELAB-' + chr(39) * 2 + nonce\n"
+        "    if os.environ.get('CVELAB_STUB_DEAD'):\n"
+        "        print('request failed: connection refused', file=sys.stderr)\n"
+        "        print('observation:')\n"
+        "        print('HTTP status: 0')\n"
+        "        print('BLOCKED')\n"
+        "        return 1\n"
+        "    done = subprocess.run(['/bin/sh', '-c', sent], capture_output=True,\n"
+        "                          text=True)\n"
+        "    if done.returncode == 0:\n"
+        "        body = done.stdout\n"
+        "    else:\n"
+        "        body = ('render error: Command failed: ' + sent + chr(10)\n"
+        "                + done.stderr)\n"
+        "    print('observation:')\n"
+        "    print(body, end='')\n"
+        "    print(\"the command's output:\")\n"
+        "    print(body, end='')\n"
+        "    ran = ('CVELAB-' + nonce) in body\n"
+        "    print('REPRODUCED' if ran else 'BLOCKED')\n"
+        "    return 0 if ran else 1\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    sys.exit(main())\n"
+    )
+
     #: The standing this mode is emitted for, and the one these tests have to
     #: use: a lab with a proved remote mode spends its one address argument
     #: there, so `prompt_standing` gives it no prompt at all.
@@ -1680,11 +1734,12 @@ class ThePromptTests(unittest.TestCase):
         )
 
     def prompted(
-        self, typed: str, where: str | None = None, **kept: Any
+        self, typed: str, where: str | None = None,
+        environment: dict[str, str] | None = None, **kept: Any
     ) -> subprocess.CompletedProcess:
         return self.ran(
             self.artifact(**kept), self.LOCAL if where is None else where,
-            "--prompt", "--allow-prompt", typed=typed,
+            "--prompt", "--allow-prompt", typed=typed, environment=environment,
         )
 
     # --- the line it builds -----------------------------------------------
@@ -1885,6 +1940,171 @@ class ThePromptTests(unittest.TestCase):
         self.assertEqual(done.stdout, "")
         self.assertIn("BLOCKED", done.stderr)
         self.assertIn("the command did not run", done.stderr)
+
+    # --- which of the three answers a line got ----------------------------
+
+    def shelled(
+        self, typed: str, dead: bool = False
+    ) -> subprocess.CompletedProcess:
+        """A line typed at a prompt over something that really runs lines."""
+        return self.prompted(
+            typed, validator=self.SHELL,
+            environment={"CVELAB_STUB_DEAD": "1"} if dead else None,
+        )
+
+    @staticmethod
+    def flat(text: str) -> str:
+        """What was said, with the wrapping taken out of the way of a test.
+
+        The reports are wrapped to a terminal's width, so a sentence an
+        operator reads as one is two lines of text. Asserting on the wrapped
+        form pins the wrapping; asserting on this pins the sentence.
+        """
+        return " ".join(text.split())
+
+    @classmethod
+    def reported(cls, text: str) -> str:
+        """What was said about the lines, without the opening banner.
+
+        The banner describes what a line that does not run looks like, in the
+        same words the report uses -- so a test about what a RUN said has to
+        start after it, or the banner answers for the run.
+        """
+        return cls.flat(text.split("`quit` leaves.", 1)[-1])
+
+    def test_a_route_that_did_not_answer_a_line_the_target_refused_and_a_silent_line_are_three(
+        self
+    ) -> None:
+        """The three answers a line can get, told apart on the screen.
+
+        A non-zero exit from the lab program covers two of them. The route may
+        never have answered -- and that is the reading this mode had for all of
+        it. Or the route answered, the weakness ran, and the target's own shell
+        refused the line: that kills the canary the lab program looks for, so
+        the exit is non-zero and the verdict is BLOCKED for a weakness that
+        demonstrably reproduced. The third is an exit of zero with nothing in
+        the block, which is a line that ran and printed nothing.
+
+        Measured as three different reports, from one stub with a real
+        `/bin/sh` behind it, because the operator's next move differs for each:
+        fix the address, fix the line, or believe the empty block.
+        """
+        refused = self.shelled('echo "unterminated\n')
+        dead = self.shelled("id\n", dead=True)
+        silent = self.shelled("true\n")
+        ran = self.shelled("echo hi\n")
+
+        # The line that ran: its output is on stdout, where output goes.
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertIn("hi", ran.stdout)
+        # The silent line ran too -- the canary came back -- so there is a
+        # verdict and no report about a line that did not run.
+        self.assertEqual(silent.returncode, 0, silent.stderr)
+        self.assertIn("REPRODUCED", silent.stdout)
+        self.assertNotIn("did not run", self.reported(silent.stderr))
+        # Neither of the two that did not run put anything on stdout.
+        self.assertEqual(refused.stdout, "")
+        self.assertEqual(dead.stdout, "")
+        # And the two reports are not the same report. The refused line is
+        # told the weakness ran; the dead route is not told that about
+        # anything, and keeps the reading it always had.
+        self.assertIn("the weakness did", self.reported(refused.stderr))
+        self.assertNotIn("the weakness did", self.reported(dead.stderr))
+        self.assertIn("the command did not run", self.reported(dead.stderr))
+        self.assertIn(
+            "nothing here shows that route running a command",
+            self.reported(dead.stderr),
+        )
+
+    def test_the_targets_own_answer_is_never_called_something_other_than_the_targets(
+        self
+    ) -> None:
+        """When the target's text is on the screen, nothing denies it is.
+
+        The refused line is the one path where the target's stderr comes back:
+        the command the weakness runs fails hard enough to throw, so the
+        product reports the failure and carries the shell's own complaint
+        inside it. The report under that block used to say "What is above is
+        that program saying so, not output from the target", which told the
+        operator to discount the only real evidence on the screen.
+
+        So: the complaint is there, and no sentence in the run says the block
+        is not the target's.
+        """
+        refused = self.shelled('echo "unterminated\n')
+        said = self.flat(refused.stderr)
+        # The shell's own complaint, under its own name, about the line as it
+        # was sent. Which shell is there decides the words after the colon, so
+        # what is asserted is that the shell spoke and about what.
+        self.assertIn("/bin/sh:", said)
+        self.assertIn('Command failed: echo "unterminated', said)
+        self.assertIsNone(
+            re.search(r"not (output|anything) from the target", said), said
+        )
+        # And said positively, where the operator reads the block: what is
+        # above has the target's own answer in it.
+        self.assertIn("the target's own answer inside it", said)
+
+    def test_a_line_the_target_refused_is_not_reported_as_a_weakness_that_did_not_reproduce(
+        self
+    ) -> None:
+        """BLOCKED under a line the shell refused is not non-reproduction.
+
+        The payload reached the weakness, the injected expression was
+        evaluated, the shell ran -- its complaint about the line is the proof
+        it got that far. What failed is the line. The lab program's own
+        verdict is kept, because it is the lab program's, and it is placed:
+        the canary it looks for went down with the line.
+        """
+        refused = self.shelled('echo "unterminated\n')
+        self.assertEqual(refused.returncode, 0, refused.stderr)
+        said = self.flat(refused.stderr)
+        # The lab program's verdict is still shown, unedited.
+        self.assertIn("BLOCKED", said)
+        # And it is read for the operator rather than left to read itself.
+        self.assertIn("your line did not run -- and the weakness did", said)
+        self.assertIn("not this weakness failing to reproduce", said)
+        # The claim is measured, not inferred from the exit code: the probe
+        # that measured it is named, so the sentence can be checked.
+        self.assertIn("halves came back joined", said)
+
+    def test_a_product_that_only_reflects_the_line_is_not_read_as_running_it(
+        self
+    ) -> None:
+        """The probe cannot be satisfied by an echo of the command.
+
+        `LAB` prints the command back at the prompt and never runs anything,
+        which is exactly the shape a one-token probe would read as a weakness
+        that works -- and the lab's own canary is built with its halves quoted
+        apart for this reason. The probe is two halves a space apart in the
+        command and adjacent only in what a shell prints, so a reflection
+        carries no join and the run keeps the honest reading.
+        """
+        done = self.prompted("boom\n")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        said = self.reported(done.stderr)
+        self.assertIn("the command did not run", said)
+        self.assertNotIn("the weakness did", said)
+        self.assertIn("nothing here shows that route running a command", said)
+
+    def test_the_banner_does_not_promise_what_a_refused_line_disproves(self) -> None:
+        """What comes back, said before the first line and true afterwards.
+
+        Only stdout comes back, and `2>&1` is the remedy -- for the ordinary
+        case. A line the shell refuses is the exception: the target's stderr
+        does come back, inside the failure the product reports. The banner
+        says both, and the run that proves the exception is run here, so the
+        sentence cannot drift from what the artifact does.
+        """
+        said = self.flat(self.prompted("", validator=self.SHELL).stderr)
+        self.assertIn("only standard output comes back", said)
+        self.assertIn("add `2>&1`", said)
+        self.assertIn("will not take at all", said)
+        self.assertIn("comes back inside that report", said)
+        refused = self.shelled('echo "unterminated\n')
+        # The exception, measured: that is the target's own stderr, on the
+        # screen, carried inside the failure the product reported.
+        self.assertIn("/bin/sh:", self.flat(refused.stderr))
 
     # --- the directory it tracks ------------------------------------------
 
