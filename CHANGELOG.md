@@ -7,6 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-15
+
+### Added (interactive sessions through the PoC)
+
+- **A generated `PoC.py` can now hold an interactive session on the target.**
+  `python3 PoC.py <address> --shell --allow-shell` opens a shell on the address
+  and runs the lines you type in it one after another, so state is real and it
+  is on the target: a variable you export, a `cd`, a key you unlock on one line
+  is still there on the next. It exists only because the lab's own weakness
+  carries it, so it proves what that weakness proves and nothing about reaching
+  the host any other way.
+- The session is a poll and not a terminal over a socket, and the product stays
+  up while a line runs. The line is written in one request and read back in
+  short ones from the operator's end, so a slow line does not hold the target's
+  single-threaded product for its duration: a `sleep 6` line answered 59 of 59
+  health probes, where waiting on the target instead took it down for about six
+  seconds. What that costs is latency and a ceiling -- past about twelve seconds
+  a line is reported unfinished, though it may still be running there.
+- Holding it writes two files on the target and leaves a detached process until
+  you leave. Leaving tears that down -- the held shell is killed and both files
+  removed -- and the two paths are printed before the first line and again at
+  teardown, so they can be audited.
+- Each line's output is bracketed by a one-use random marker the held shell is
+  asked to echo. The marker is made when the file runs and is never written into
+  it, so the emitted text stays a pure function of its inputs; its halves ride
+  the wire apart and only the target joining them proves the shell answered
+  rather than the product repeating the bytes it was sent.
+- `python3 PoC.py <address> --prompt --allow-prompt` is the line-by-line form
+  beside it: one command per line, nothing held between them.
+- Both are offered for exactly the labs that can carry them -- a published port
+  and a validator that reads a command as its second positional -- and the
+  artifact's header, its first-use banner and `LAB-POC.md` all say which case a
+  lab is and why.
+
+### Changed (the one artifact, and what it is called)
+
+- `PoC.py` takes **one positional address** and `--lab-address` is gone. Which
+  of the two programs the argument reaches is the lab's own standing and not
+  anything about the address: a proved remote mode spends it there, a published
+  port hands it to the lab program, neither refuses with the recorded reason.
+- Where a lab has no proved remote mode the route it sends is a constant in the
+  validator, so a negative verdict against another host is a finding about that
+  route. The file now prints that next to the verdict and gives the sentence to
+  report instead, because "not affected" is a claim such a run cannot carry.
+- **`--shell` is now the session and `--prompt` is the line-by-line form.** What
+  shipped before as `--shell` held nothing open, so it took the name of what it
+  is; `--allow-shell` and `--allow-prompt` follow, as does
+  `CVELAB_POC_PROMPT_PARENT`. No old spelling is accepted.
+- A lab's standing has six answers rather than four -- shipped, refused, not
+  proved, not reproduced, not requested, no record -- decided in one place, so
+  the artifact, the delivered document and `report.json` cannot disagree.
+- `GUIDE.md`'s invocation table gains a row for the prompt and one for the
+  session. They are invocations of the same lab program, so "one script, two
+  modes" still holds.
+
+### Removed
+
+- **The connect-back session**, about 2600 lines that never once reached disk:
+  no archived run had ever recorded one, its two gate conditions cannot both
+  hold by construction, a lab build cannot reach a listener on the generating
+  host, and its payloads ran the shell in the foreground and froze the delivery
+  for the life of the session.
+- **Seven subcommands that were extra doors onto `auto`** -- `build`, `all`,
+  `source`, `source-all`, `run`, `field` and `demo-target` -- none of which
+  touched code `auto` does not. Six remain: `auto`, `manual`, `closed`,
+  `closed-auto`, `upload`, `doctor`.
+- The synthetic class lab path, which no archived lab had ever used.
+
+### Fixed (telling our own failure from the finding's limit)
+
+- A recorded refusal is no longer presented as the vulnerability's own limit
+  when it was CVELab's script that failed. Eleven archived labs whose script
+  could not tell the two builds apart, and forty-two whose lab never reproduced,
+  are now said to be exactly that.
+- A validator that mentions `sys.argv` only as `sys.argv[0]` -- the name it was
+  invoked as, not an argument -- is refused, and told which of the two mistakes
+  it made.
+- A `cd` that does not take is said and left untracked. It used to advance the
+  remembered directory without asking the target, so every later line went out
+  prefixed with a directory that was never entered and came back empty in
+  silence.
+- A line the target's own shell refuses -- a syntax error, a first word that
+  reads as a flag -- is no longer reported as a route that never answered or a
+  weakness that did not reproduce. The file sends one probe of its own to the
+  same address and says which of the two happened.
+- The prompt no longer promises that only stdout comes back: where a command
+  fails hard enough to throw, the target's own complaint returns inside the
+  failure the product reports.
+- A patched build may report a blocked attack by exiting non-zero, which one
+  archived lab had been losing a clean run to.
+
+
 ### Added
 
 - A generated lab's `PoC.py` now runs the way a published PoC does:
@@ -1384,7 +1476,8 @@ Unreleased and shipped in it; the list from the earlier, unpublished 0.6.0
 - Import ordering and a small number of lint findings were normalized across
   the package. No behavior changed.
 
-[Unreleased]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.8...HEAD
+[Unreleased]: https://github.com/AndreiIonascu17/cvelab/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.8...v0.7.0
 [0.6.8]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.7...v0.6.8
 [0.6.7]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.6...v0.6.7
 [0.6.6]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.5...v0.6.6
