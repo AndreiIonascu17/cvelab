@@ -1023,6 +1023,32 @@ exit $LASTEXITCODE
 '''
 
 
+def _echoable(text: str) -> str:
+    """A lab's own value, inert inside a double-quoted shell string.
+
+    `_remote_arguments` below puts names and values the model recorded into a
+    line of `manual.sh` that reads `echo "  python3 ... --input name=value"`,
+    and double quotes do not stop a shell. Measured on the emitted line: a
+    value of `$(id)` ran when the operator ran the script, a backtick did the
+    same, and `x" ; id ; echo "y` left the echo entirely and ran `id` as its
+    own command. That is a model's text in an executable position in the one
+    file an operator runs on the strength of its name -- the premise the
+    upload gate rests on where it pins this script byte for byte.
+
+    Four characters, because those are the four a double-quoted shell string
+    still reads: a backslash first, so the escapes added after it are not
+    themselves escaped. The same text is printed in the guide as a command to
+    paste, where the escaped form is also the correct one: it is what you
+    would have to type to pass that value literally.
+    """
+    return (
+        text.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("$", "\\$")
+        .replace("`", "\\`")
+    )
+
+
 def _remote_arguments(record: dict) -> str:
     """The `--input` flags remote mode needs, with this lab's own values.
 
@@ -1040,7 +1066,7 @@ def _remote_arguments(record: dict) -> str:
     values = record.get("lab_values")
     values = values if isinstance(values, dict) else {}
     return "".join(
-        f" --input {name}={values.get(name, '...')}"
+        f" --input {_echoable(str(name))}={_echoable(str(values.get(name, '...')))}"
         for name in spec.get("inputs") or ()
     )
 

@@ -2143,6 +2143,61 @@ def generated_ports(**extra: object) -> dict:
     return {"networks": networks, "services": services}
 
 
+class TheHintCannotRunWhatTheModelWroteTests(unittest.TestCase):
+    """manual.sh prints the command to point at the address, with lab values.
+
+    `_remote_arguments` puts the input names and the values the record holds
+    into a line that reads `echo "  python3 ... --input name=value"`, and
+    double quotes do not stop a shell. Those values are a model's: the route
+    an adapter serves, the account a setup created. Measured on the emitted
+    line before this was escaped, in a real bash:
+
+      * `$(id -un)` ran, and printed the operator's own username;
+      * a backtick did the same;
+      * `x" ; id -un ; echo "y` left the echo entirely and ran `id` as its
+        own command.
+
+    That is a model's text in an executable position in the one file an
+    operator runs on the strength of its name, which is the premise the
+    upload gate rests on where it pins this script byte for byte.
+
+    Asserted through a real shell rather than by how the escape is spelled:
+    what the shell PRINTS is the test, and anything it would have run shows
+    up as extra output.
+    """
+
+    @unittest.skipUnless(POSIX, "what the line does is read off a real bash")
+    def test_a_value_the_model_wrote_is_printed_and_not_run(self) -> None:
+        for label, value in (
+            ("command substitution", "$(id -un)"),
+            ("backticks", "`id -un`"),
+            ("a quote and a second command", 'x" ; id -un ; echo "y'),
+            ("a backslash", "a\\b"),
+        ):
+            with self.subTest(label=label):
+                record = {
+                    **PROVED,
+                    "spec": {**(PROVED.get("spec") or {}), "inputs": ["target_path"]},
+                    "lab_values": {"target_path": value},
+                }
+                runner = written_kit(port=8080, record=record)["manual.sh"]
+                hint = [
+                    line for line in runner.splitlines()
+                    if "--input target_path=" in line
+                ]
+                self.assertTrue(hint, runner)
+                done = subprocess.run(
+                    ["bash", "-c", hint[0]], capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(done.returncode, 0, done.stderr)
+                # One line out, and the value in it as the model wrote it.
+                self.assertEqual(len(done.stdout.strip().splitlines()), 1, done.stdout)
+                self.assertIn(f"target_path={value}", done.stdout)
+                # And nothing the shell would have run: the username is what
+                # every one of these payloads was reaching for.
+                self.assertNotIn(os.environ.get("USER", "\0nosuchuser"), done.stdout)
+
+
 class TheRunnerRefusesAForgedComposeFileTests(unittest.TestCase):
     """manual.sh merges two of the lab's own files into `docker compose`.
 
