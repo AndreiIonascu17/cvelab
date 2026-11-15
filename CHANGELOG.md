@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-15
+
+### Fixed (a shipped Compose file is topology, not data)
+
+- `manual.sh` holds the two Compose documents a lab ships to the shape their
+  generators produce, before merging either into `docker compose`.
+
+  0.7.0 taught the script to merge `artifacts/cvelab-setup.json`, which puts
+  the product in the state the attack needs, and
+  `artifacts/cvelab-manual-ports.json`, which publishes the one port. Both
+  arrive with a second `-f`, and Compose reads JSON, so neither file is data
+  the lab reads: it is the project's topology on whatever machine runs the
+  script. A lab CVELab generated carries what `cvelab/policy.py` writes. One
+  edited afterwards could ask for a privileged container, a bind mount of
+  `/`, the host's network namespace, a device, or a second definition of the
+  `validator` that decides the verdict -- a sentence each, in a file nothing
+  looked at, read by a script the operator runs on the strength of its name.
+
+  The allowlist is rendered into the script from `policy.SETUP_OVERRIDE_KEYS`,
+  `policy.LIMIT_KEYS` and `policy.SETUP_CONFINEMENT`, so the generator and the
+  refusal cannot drift. `security_opt` and `cap_drop` are compared rather than
+  permitted: both are keys the generator writes, so allowing the key alone
+  would let a forged file keep every key legitimate and still hand the setup
+  service back what CVELab drops. A published port is accepted only on
+  `policy.MANUAL_BIND`, never `0.0.0.0`.
+
+  A refused file stops the run, naming the file, each reason, and what to do.
+  A lab that declares no seeding and publishes no port ships neither file and
+  reaches neither check, so it runs exactly as it did.
+
+  Reported against the site's upload gate, which had the same gap and fixed
+  it there first: the gate pinned `manual.sh` and `PoC.ps1` byte for byte
+  while never reading the documents those scripts hand to Compose.
+
+### Changed
+
+- `policy.setup_override` writes the confinement from `SETUP_CONFINEMENT`
+  rather than from two literals of its own, so there is one definition of it.
+
 ## [0.7.0] - 2026-11-15
 
 ### Added (interactive sessions through the PoC)
@@ -1476,7 +1515,8 @@ Unreleased and shipped in it; the list from the earlier, unpublished 0.6.0
 - Import ordering and a small number of lint findings were normalized across
   the package. No behavior changed.
 
-[Unreleased]: https://github.com/AndreiIonascu17/cvelab/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/AndreiIonascu17/cvelab/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/AndreiIonascu17/cvelab/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.8...v0.7.0
 [0.6.8]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.7...v0.6.8
 [0.6.7]: https://github.com/AndreiIonascu17/cvelab/compare/v0.6.6...v0.6.7

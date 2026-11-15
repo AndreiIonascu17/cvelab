@@ -1348,7 +1348,15 @@ class TheRunnerPublishesOnePortTests(unittest.TestCase):
             f'PORTS="$LAB_ROOT/artifacts/{core.SHIPPED_MANUAL_PORTS_FILE}"', runner
         )
         self.assertIn('SERVICE_PORT="8080"', runner)
-        self.assertIn('if [[ -n "$SERVICE_PORT" && -f "$PORTS" ]]; then\n  COMPOSE+=(-f "$PORTS")', runner)
+        # The shape check stands between the test and the merge: a file that
+        # is not the one the generator writes stops the run instead of
+        # becoming this project's topology.
+        self.assertIn(
+            'if [[ -n "$SERVICE_PORT" && -f "$PORTS" ]]; then\n'
+            '  compose_file_is_ours ports "$PORTS"\n'
+            '  COMPOSE+=(-f "$PORTS")',
+            runner,
+        )
         self.assertIn(
             'published="$("${COMPOSE[@]}" port "$variant" "$SERVICE_PORT" 2>/dev/null | tail -n 1)"',
             runner,
@@ -1955,9 +1963,19 @@ def ran_address(port: int | None, published: str) -> str | None:
         )
         (artifacts / ".manual-state").write_text("vulnerable", encoding="utf-8")
         if port is not None:
+            # From the generator rather than written out here: manual.sh now
+            # holds this file to the shape policy.manual_port_override
+            # produces before merging it, so a hand-written stub -- this was
+            # one, without the network the real file carries -- would be
+            # refused, and a fixture that can drift from the generator is the
+            # thing being guarded against.
+            model = {
+                "services": {"vulnerable": {"networks": {"lab": None}}},
+                "networks": {"lab": {"internal": True}},
+            }
+            override = policy.manual_port_override(model, "vulnerable", port)
             (artifacts / core.SHIPPED_MANUAL_PORTS_FILE).write_text(
-                json.dumps({"services": {"vulnerable": {"ports": ["127.0.0.1::8080"]}}}),
-                encoding="utf-8",
+                json.dumps(override), encoding="utf-8",
             )
         shim = lab / "bin"
         shim.mkdir()
@@ -1978,6 +1996,259 @@ def ran_address(port: int | None, published: str) -> str | None:
         if finished.returncode != 0:
             return None
         return finished.stdout.strip()
+
+
+def ran_with_shipped(documents: dict[str, object], *, port: int = 8080) -> tuple[int, str]:
+    """`bash manual.sh address vulnerable` with these files in artifacts/.
+
+    The shape checks sit at the top of the script, above the subcommand
+    dispatch, so any invocation reaches them and `address` is the one that
+    needs nothing of Docker but a `port` answer.
+    """
+    with tempfile.TemporaryDirectory() as temporary:
+        lab = Path(temporary)
+        artifacts = lab / "artifacts"
+        artifacts.mkdir()
+        (lab / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        deliverables._write_generic_manual_assets(
+            "CVE-2026-0001", lab, artifacts, False, False, port
+        )
+        (artifacts / ".manual-state").write_text("vulnerable", encoding="utf-8")
+        # `address` has nothing to print without the publication, and would
+        # exit 2 saying so -- its own refusal, not a shape check's. A test
+        # about the seeding file gets the generated ports file beside it so
+        # that a zero means the checks passed.
+        shipped = dict(documents)
+        if port is not None and core.SHIPPED_MANUAL_PORTS_FILE not in shipped:
+            shipped[core.SHIPPED_MANUAL_PORTS_FILE] = generated_ports()
+        for name, document in shipped.items():
+            (artifacts / name).write_text(json.dumps(document, indent=2), encoding="utf-8")
+        shim = lab / "bin"
+        shim.mkdir()
+        (shim / "docker").write_text(
+            "#!/usr/bin/env bash\n"
+            'for word in "$@"; do\n'
+            '  if [[ "$word" == "port" ]]; then printf "%s\\n" "127.0.0.1:49160"; exit 0; fi\n'
+            "done\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        (shim / "docker").chmod(0o755)
+        finished = subprocess.run(
+            ["bash", str(artifacts / "manual.sh"), "address", "vulnerable"],
+            capture_output=True, text=True, timeout=60,
+            env={**os.environ, "PATH": f"{shim}:{os.environ['PATH']}"},
+        )
+        return finished.returncode, finished.stderr
+
+
+LAB_MODEL = {
+    "services": {
+        "vulnerable": {"image": "p:1", "networks": {"lab": None}},
+        "patched": {"image": "p:2", "networks": {"lab": None}},
+        "validator": {"image": "v", "networks": {"lab": None},
+                      "depends_on": {"vulnerable": {"condition": "service_healthy"}}},
+    },
+    "networks": {"lab": {"internal": True}},
+}
+
+
+def generated_setup(**extra: object) -> dict:
+    """What `policy.setup_override` writes, with anything extra merged in."""
+    document = policy.setup_override(
+        LAB_MODEL, image="python:3.13-alpine", program="import urllib.request\n",
+        environment={"CVELAB_SETUP_PORT": "8080"},
+    )
+    document["services"][policy.SETUP_SERVICE].update(extra)
+    return document
+
+
+def generated_ports(**extra: object) -> dict:
+    """What `manual_port_override` writes for both builds, merged as core.py merges it."""
+    services: dict[str, object] = {}
+    networks: dict[str, object] = {}
+    for build in ("vulnerable", "patched"):
+        one = policy.manual_port_override(LAB_MODEL, build, 8080)
+        services.update(one["services"])
+        networks.update(one["networks"])
+    services["vulnerable"].update(extra)
+    return {"networks": networks, "services": services}
+
+
+class TheRunnerRefusesAForgedComposeFileTests(unittest.TestCase):
+    """manual.sh merges two of the lab's own files into `docker compose`.
+
+    Compose reads JSON, so neither file is data the lab reads: it is this
+    project's topology on whoever's machine runs the script. The gate on the
+    site pins manual.sh and PoC.ps1 byte for byte for exactly that reason --
+    a subscriber runs them on the strength of the name -- and a document
+    those scripts hand to Compose unchecked is the same trust in a place
+    nothing was watching. A lab CVELab generated carries what policy.py
+    writes; a file edited afterwards can ask for a privileged container, a
+    bind mount of the host, the host's network namespace, or a second
+    definition of the validator that decides the verdict, in a sentence each.
+
+    So the script holds both to the shape their generators produce, before
+    the merge. These tests run the generated script, not a copy of its logic.
+    """
+
+    @unittest.skipUnless(POSIX, "`bash manual.sh`, against an executable shell stub")
+    def test_what_the_generators_write_is_merged(self) -> None:
+        """The loop that matters: generator out, check in, both from policy.py."""
+        code, stderr = ran_with_shipped({
+            core.SHIPPED_SETUP_FILE: generated_setup(),
+            core.SHIPPED_MANUAL_PORTS_FILE: generated_ports(),
+        })
+        self.assertEqual(code, 0, stderr)
+
+    @unittest.skipUnless(POSIX, "`bash manual.sh`, against an executable shell stub")
+    def test_the_ceilings_limits_override_adds_are_merged(self) -> None:
+        """A seeded lab gets the same runtime limits every service gets."""
+        code, stderr = ran_with_shipped({
+            core.SHIPPED_SETUP_FILE: generated_setup(
+                mem_limit="512m", cpu_period=100000, cpu_quota=50000, pids_limit=256
+            ),
+        })
+        self.assertEqual(code, 0, stderr)
+
+    @unittest.skipUnless(POSIX, "`bash manual.sh`, against an executable shell stub")
+    def test_a_lab_shipping_neither_file_reaches_neither_check(self) -> None:
+        """Most labs declare no seeding and publish no port.
+
+        Such a lab exits 2 on `address` because there is no published port to
+        print, which is what it said before any of this existed. What matters
+        here is that it is that refusal and not a shape check's: the files
+        are absent, so neither branch is taken.
+        """
+        code, stderr = ran_with_shipped({}, port=None)
+        self.assertEqual(code, 2)
+        self.assertIn("publishes no host port", stderr)
+        self.assertNotIn("is not the Compose file CVELab writes", stderr)
+
+    @unittest.skipUnless(POSIX, "`bash manual.sh`, against an executable shell stub")
+    def test_the_escalations_are_refused_one_by_one(self) -> None:
+        for label, extra, said in (
+            ("privileged", {"privileged": True}, "a privileged"),
+            ("the host filesystem", {"volumes": ["/:/host"]}, "a volumes"),
+            ("capabilities back", {"cap_add": ["SYS_ADMIN"]}, "a cap_add"),
+            ("the host's pids", {"pid": "host"}, "a pid"),
+            ("the host's network", {"network_mode": "host"}, "a network_mode"),
+            ("a device", {"devices": ["/dev/sda:/dev/sda"]}, "a devices"),
+            ("another user", {"userns_mode": "host"}, "a userns_mode"),
+        ):
+            with self.subTest(label=label):
+                code, stderr = ran_with_shipped(
+                    {core.SHIPPED_SETUP_FILE: generated_setup(**extra)}
+                )
+                self.assertEqual(code, 2)
+                self.assertIn("is not the Compose file CVELab writes", stderr)
+                self.assertIn(said, stderr)
+
+    @unittest.skipUnless(POSIX, "`bash manual.sh`, against an executable shell stub")
+    def test_the_confinement_cannot_be_dropped_within_the_allowed_keys(self) -> None:
+        """Both keys are compared, not permitted.
+
+        security_opt and cap_drop are on the list of keys the generator
+        writes, so allowing the key alone would let a forged file keep every
+        key legitimate and still hand the setup service back what CVELab
+        drops. The generator writes them from policy.SETUP_CONFINEMENT and
+        the script compares against the same constant.
+        """
+        for label, extra in (
+            ("no capabilities dropped", {"cap_drop": []}),
+            ("seccomp unconfined", {"security_opt": ["seccomp=unconfined"]}),
+            ("new privileges allowed", {"security_opt": []}),
+        ):
+            with self.subTest(label=label):
+                code, stderr = ran_with_shipped(
+                    {core.SHIPPED_SETUP_FILE: generated_setup(**extra)}
+                )
+                self.assertEqual(code, 2)
+                self.assertIn("changes", stderr)
+
+    @unittest.skipUnless(POSIX, "`bash manual.sh`, against an executable shell stub")
+    def test_a_second_service_is_refused(self) -> None:
+        """Including the validator, which is what decides the verdict."""
+        document = generated_setup()
+        document["services"]["validator"] = {"image": "alpine", "command": ["true"]}
+        code, stderr = ran_with_shipped({core.SHIPPED_SETUP_FILE: document})
+        self.assertEqual(code, 2)
+        self.assertIn("it defines the service validator", stderr)
+
+    @unittest.skipUnless(POSIX, "`bash manual.sh`, against an executable shell stub")
+    def test_a_top_level_key_of_its_own_is_refused(self) -> None:
+        """`volumes:` beside `services:` is a named volume the lab may mount."""
+        document = {**generated_setup(), "volumes": {"host": {}}}
+        code, stderr = ran_with_shipped({core.SHIPPED_SETUP_FILE: document})
+        self.assertEqual(code, 2)
+        self.assertIn("it declares volumes at the top level", stderr)
+
+    @unittest.skipUnless(POSIX, "`bash manual.sh`, against an executable shell stub")
+    def test_a_port_published_off_loopback_is_refused(self) -> None:
+        """policy.MANUAL_BIND, and nothing else, for the reason it is written.
+
+        A build whose whole purpose is to be exploitable, on every interface
+        the machine has, including whatever network the owner is sitting on.
+        """
+        for label, published in (
+            ("every interface", ["0.0.0.0:8080:8080"]),
+            ("no address at all", ["8080:8080"]),
+            ("another host address", ["192.168.1.10::8080"]),
+        ):
+            with self.subTest(label=label):
+                code, stderr = ran_with_shipped({
+                    core.SHIPPED_MANUAL_PORTS_FILE: generated_ports(ports=published),
+                })
+                self.assertEqual(code, 2)
+                self.assertIn("somewhere other than loopback", stderr)
+
+    @unittest.skipUnless(POSIX, "`bash manual.sh`, against an executable shell stub")
+    def test_the_ports_file_may_not_smuggle_a_build(self) -> None:
+        code, stderr = ran_with_shipped({
+            core.SHIPPED_MANUAL_PORTS_FILE: generated_ports(build={"context": "."}),
+        })
+        self.assertEqual(code, 2)
+        self.assertIn("it gives vulnerable a build", stderr)
+
+    @unittest.skipUnless(POSIX, "`bash manual.sh`, against an executable shell stub")
+    def test_an_unreadable_file_is_refused_rather_than_skipped(self) -> None:
+        """A file that is there and will not parse stops the run.
+
+        Compose would refuse it too, but after the script had decided to
+        hand it over; the refusal names the file and says what to do.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            lab = Path(temporary)
+            artifacts = lab / "artifacts"
+            artifacts.mkdir()
+            (lab / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+            deliverables._write_generic_manual_assets(
+                "CVE-2026-0001", lab, artifacts, False, False, 8080
+            )
+            (artifacts / core.SHIPPED_SETUP_FILE).write_text("{", encoding="utf-8")
+            finished = subprocess.run(
+                ["bash", str(artifacts / "manual.sh"), "address", "vulnerable"],
+                capture_output=True, text=True, timeout=60,
+            )
+        self.assertEqual(finished.returncode, 2)
+        self.assertIn("not readable as JSON", finished.stderr)
+
+    def test_the_policy_travels_into_the_script(self) -> None:
+        """The allowlist is rendered from policy.py, not written twice.
+
+        A key added to SETUP_OVERRIDE_KEYS or LIMIT_KEYS appears in the
+        emitted script by the same edit, so the generator and the refusal
+        cannot drift.
+        """
+        runner = written_kit(port=8080, record=PROVED)["manual.sh"]
+        self.assertIn(
+            json.dumps(sorted(policy.SETUP_OVERRIDE_KEYS | policy.LIMIT_KEYS)), runner
+        )
+        self.assertIn(
+            json.dumps({k: list(v) for k, v in policy.SETUP_CONFINEMENT.items()}), runner
+        )
+        self.assertIn(policy.MANUAL_NETWORK, runner)
+        self.assertIn(policy.MANUAL_BIND, runner)
 
 
 if __name__ == "__main__":

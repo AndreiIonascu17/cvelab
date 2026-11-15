@@ -514,6 +514,36 @@ def limits_override(model: dict, limits: dict[str, object]) -> dict:
 #: support-service names are checked.
 SETUP_SERVICE = "cvelab-setup"
 
+#: The keys `setup_override` writes, and the only ones the shipped file may
+#: hold.
+#:
+#: Named here rather than left implicit in the function below, because
+#: `manual.sh` has to know them: it merges the shipped file into `docker
+#: compose`, Compose reads JSON, and so that document is topology on whatever
+#: machine runs the lab rather than data it reads. A lab CVELab generated
+#: carries what this names; a file edited afterwards can ask for anything
+#: Compose understands, and `privileged`, `volumes`, `pid` or a second
+#: definition of `validator` are all a sentence long. The script refuses what
+#: is not on this list instead of handing it over, and the list is here so
+#: that the refusal and the generator cannot drift apart.
+SETUP_OVERRIDE_KEYS = frozenset({
+    "image", "profiles", "networks", "environment", "command",
+    "security_opt", "cap_drop", "depends_on",
+})
+
+#: What the generator fixes rather than reads, so the script compares these
+#: instead of permitting them: with them merely allowed, a shipped file could
+#: keep every key on SETUP_OVERRIDE_KEYS and still hand the setup service back
+#: the capabilities this drops.
+SETUP_CONFINEMENT = {
+    "security_opt": ["no-new-privileges:true"],
+    "cap_drop": ["ALL"],
+}
+
+#: The ceilings `limits_override` may add to a service, which the setup
+#: service receives the same way every other service does.
+LIMIT_KEYS = frozenset({"mem_limit", "cpu_period", "cpu_quota", "pids_limit"})
+
 
 def setup_override(
     model: dict,
@@ -585,8 +615,7 @@ def setup_override(
         "networks": dict.fromkeys(attached),
         "environment": dict(environment),
         "command": ["python", "-c", program],
-        "security_opt": ["no-new-privileges:true"],
-        "cap_drop": ["ALL"],
+        **{key: list(value) for key, value in SETUP_CONFINEMENT.items()},
     }
     depends_on = alongside.get("depends_on")
     if isinstance(depends_on, dict) and depends_on:

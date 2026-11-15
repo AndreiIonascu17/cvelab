@@ -702,7 +702,101 @@ COMPOSE=(docker compose -f "$LAB_ROOT/docker-compose.yml" --project-directory "$
 # lab's network, which is where the steps below reach it either way; this is
 # what gives PoC.py an address on this machine. A lab generated before this
 # existed ships no such file, takes neither branch, and runs exactly as it did.
+
+# Both files below are merged into `docker compose` with a second -f, and
+# Compose reads JSON: whatever they hold is this project's topology on this
+# machine, not data the lab reads. A lab CVELab generated carries what
+# cvelab/policy.py writes. A file edited afterwards can ask Compose for
+# anything it understands -- a privileged container, a bind mount of /, the
+# host's network namespace, a second definition of the validator that decides
+# the verdict -- and this script, which you are running on the strength of its
+# name, would be what handed it over. So each file is held to the shape its
+# generator produces before it is merged, and one that asks for anything else
+# stops the run. A lab that declares no seeding and publishes no port ships
+# neither file and reaches neither call.
+compose_file_is_ours() {
+  python3 - "$1" "$2" <<'CVELAB_COMPOSE_CHECK' || exit 2
+import json
+import os
+import re
+import sys
+
+kind, path = sys.argv[1], sys.argv[2]
+SETUP_SERVICE = "__SETUP_SERVICE_NAME__"
+SETUP_KEYS = frozenset(__SETUP_KEYS__)
+CONFINEMENT = __CONFINEMENT__
+PORTS_KEYS = frozenset({"networks", "ports"})
+PORTS_SERVICES = frozenset({"vulnerable", "patched"})
+MANUAL_NETWORK = "__MANUAL_NETWORK__"
+PUBLISHED = re.compile("^" + re.escape("__MANUAL_BIND__") + "::[0-9]{1,5}$")
+
+
+def wrong():
+    """Why this file is not one CVELab writes, as a list of reasons."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, ValueError) as unreadable:
+        return ["it is not readable as JSON: %s" % unreadable]
+    if not isinstance(document, dict):
+        return ["it is not a JSON object"]
+    ports = kind == "ports"
+    found = []
+    for key in document:
+        if key != "services" and not (ports and key == "networks"):
+            found.append("it declares %s at the top level" % key)
+    if ports:
+        networks = document.get("networks")
+        if not isinstance(networks, dict) or list(networks) != [MANUAL_NETWORK]:
+            found.append("it declares a network other than %s" % MANUAL_NETWORK)
+        elif (networks[MANUAL_NETWORK] or {}).get("internal") is not False:
+            found.append("it does not declare %s as the published network" % MANUAL_NETWORK)
+    services = document.get("services")
+    if not isinstance(services, dict) or not services:
+        return found + ["it declares no services"]
+    for name, definition in services.items():
+        expected = PORTS_SERVICES if ports else frozenset({SETUP_SERVICE})
+        if name not in expected:
+            found.append("it defines the service %s" % name)
+            continue
+        if not isinstance(definition, dict):
+            found.append("it gives %s no definition" % name)
+            continue
+        for key in definition:
+            if key not in (PORTS_KEYS if ports else SETUP_KEYS):
+                found.append("it gives %s a %s" % (name, key))
+        if ports:
+            published = definition.get("ports")
+            if not isinstance(published, list) or not published:
+                found.append("it publishes nothing for %s" % name)
+            else:
+                for entry in published:
+                    if not isinstance(entry, str) or not PUBLISHED.match(entry):
+                        found.append("it publishes %s somewhere other than loopback" % name)
+        else:
+            for key, value in CONFINEMENT.items():
+                if definition.get(key) != value:
+                    found.append("it changes %s's %s" % (name, key))
+    return found
+
+
+reasons = wrong()
+if reasons:
+    name = os.path.basename(path)
+    sys.stderr.write("Refusing to run: artifacts/%s is not the Compose file CVELab writes.\n" % name)
+    for reason in reasons:
+        sys.stderr.write("  - %s\n" % reason)
+    sys.stderr.write(
+        "\nmanual.sh merges that file into `docker compose`, which reads JSON, so it is\n"
+        "this project's topology on this machine. Regenerate the lab rather than running\n"
+        "it this way, or delete the file and run without the state it establishes.\n"
+    )
+    raise SystemExit(1)
+CVELAB_COMPOSE_CHECK
+}
+
 if [[ -n "$SERVICE_PORT" && -f "$PORTS" ]]; then
+  compose_file_is_ours ports "$PORTS"
   COMPOSE+=(-f "$PORTS")
 fi
 
@@ -711,6 +805,7 @@ fi
 # validated this lab. A lab that declares no seeding ships none, takes
 # neither branch, and runs exactly as it did before this existed.
 if [[ -f "$SEEDING" ]]; then
+  compose_file_is_ours setup "$SEEDING"
   COMPOSE+=(-f "$SEEDING")
 elif grep -q '"setup_port"' "$LAB_ROOT/artifacts/plan.json" 2>/dev/null; then
   echo "This lab's contract declares setup steps, but artifacts/__SETUP_FILE__ is not here." >&2
@@ -1066,6 +1161,15 @@ def _write_generic_manual_assets(
     manual_runner = (
         _MANUAL_RUNNER
         .replace("__SETUP_FILE__", SHIPPED_SETUP_FILE)
+        .replace("__SETUP_SERVICE_NAME__", policy.SETUP_SERVICE)
+        # json.dumps, because every value here is a string, a list of them
+        # or a mapping of them, and for those JSON is Python literal syntax.
+        .replace("__SETUP_KEYS__", json.dumps(
+            sorted(policy.SETUP_OVERRIDE_KEYS | policy.LIMIT_KEYS)))
+        .replace("__CONFINEMENT__", json.dumps(
+            {key: list(value) for key, value in policy.SETUP_CONFINEMENT.items()}))
+        .replace("__MANUAL_NETWORK__", policy.MANUAL_NETWORK)
+        .replace("__MANUAL_BIND__", policy.MANUAL_BIND)
         .replace("__SETUP_SERVICE__", policy.SETUP_SERVICE)
         .replace("__PORTS_FILE__", SHIPPED_MANUAL_PORTS_FILE)
         .replace("__SERVICE_PORT__", "" if port is None else str(port))
